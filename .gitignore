@@ -1,6 +1,7 @@
 logs/*
 data/history/*
 */__pycache__/*
+__pycache__
 */.DS_Store
 *test*
 atom_generator.py
@@ -60,3 +61,6 @@ filtered_tasks.json
 dm_info_compression/*
 
 env_gen/*
+
+.direnv
+uv.lock
