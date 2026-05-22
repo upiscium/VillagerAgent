@@ -410,7 +410,11 @@ Please generate the JSON output based on the prompt provided.
 """
 
 def describe_map(building):
-    llm = openai_models.OpenAILanguageModel(api_key=os.environ["OPENAI_API_KEY"], api_model="gpt-4-1106-preview")
+    llm = openai_models.OpenAILanguageModel(
+        api_key=os.environ.get("OPENAI_API_KEY", "ollama"),
+        api_base=os.environ.get("OPENAI_API_BASE", "https://ollama-melchior.arc.upiscium.dev/v1"),
+        api_model=os.environ.get("OPENAI_MODEL", "qwen3.6:27b"),
+    )
     new_building = []
     for structure in building:
         if len(structure) == 0:

@@ -6,37 +6,46 @@ from env.env import VillagerBench, env_type, Agent
 from pipeline.controller import GlobalController
 from pipeline.data_manager import DataManager
 from pipeline.task_manager import TaskManager
-import json
-if __name__ == "__main__":
+from model.ollama_config import make_ollama_llm_config, configure_ollama_agent
 
+if __name__ == "__main__":
     # Set Environment
-    env = VillagerBench(env_type.none, task_id=0, _virtual_debug=False, dig_needed=False, host="10.214.180.148")
+    env = VillagerBench(
+        env_type.none,
+        task_id=0,
+        _virtual_debug=False,
+        dig_needed=False,
+        host="10.12.1.200",
+        port=40000,
+    )
 
     # Set Agent
-    api_key_list = json.load(open("API_KEY_LIST", "r"))["AGENT_KEY"] # use OPENAI as an example
-    base_url = "https://api.chatanywhere.tech/v1"
-    llm_config = {
-        "api_model": "gpt-4o-mini", # for example, "gpt-4-1106-preview"
-        "api_base": base_url, # for example, "https://api.openai.com/v1"
-        "api_key_list": api_key_list
-    }
-
-    Agent.model = "gpt-4-1106-preview"
-    Agent.base_url = base_url
-    Agent.api_key_list = api_key_list
+    llm_config = make_ollama_llm_config("gemma4:e4b")
+    configure_ollama_agent(Agent, "gemma4:e4b")
 
     # more agent tools can be added here you can refer to the agent_tool in doc/api_library.md
-    agent_tool = [Agent.talkTo, Agent.read, Agent.scanNearbyEntities, Agent.equipItem, Agent.SmeltingCooking,
-                      Agent.navigateTo, Agent.withdrawItem, Agent.craftBlock, Agent.waitForFeedback, Agent.useItemOnEntity,
-                      Agent.handoverBlock]
+    agent_tool = [
+        Agent.talkTo,
+        Agent.read,
+        Agent.scanNearbyEntities,
+        Agent.equipItem,
+        Agent.SmeltingCooking,
+        Agent.navigateTo,
+        Agent.withdrawItem,
+        Agent.craftBlock,
+        Agent.waitForFeedback,
+        Agent.useItemOnEntity,
+        Agent.handoverBlock,
+    ]
 
     # Register Agent
-    env.agent_register(agent_tool=agent_tool, agent_number=1, name_list=["Alice"]) # Attention that the agent number should be consistent with the agent_tool
+    env.agent_register(
+        agent_tool=agent_tool, agent_number=1, name_list=["Alice"]
+    )  # Attention that the agent number should be consistent with the agent_tool
     # Attention you should use /op to give the agent the permission to use the command in minecraft server for example /op Agent1
 
     # Run Environment
-    with env.run():
-        
+    with env.run(fast_api=True):
         # Set Data Manager
         dm = DataManager(silent=False)
         dm.update_database_init(env.get_init_state())

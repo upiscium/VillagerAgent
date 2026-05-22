@@ -166,6 +166,7 @@ class Agent():
     logging.basicConfig()
     logging.getLogger("langchain.retrievers.multi_query").setLevel(logging.INFO)
     model = "gpt-4-1106-preview"
+    provider = ""
     temperature = 0
     max_tokens = 1024
     api_key_list = []
@@ -1035,7 +1036,10 @@ class Agent():
         assert len(self.api_key_list) > 0, "Please set the api_key_list in Agent class."
         # dynamic api key
 
-        if 'qwen' in self.model:
+        if getattr(Agent, "provider", "") == "ollama":
+            from langchain.chat_models import ChatOpenAI
+            self.llm = ChatOpenAI(model=self.model, temperature=0, max_tokens=256, openai_api_key=random.choice(Agent.api_key_list), base_url=Agent.base_url)
+        elif 'qwen' in self.model:
             from langchain_community.chat_models.tongyi import ChatTongyi
             self.llm = ChatTongyi(model=self.model, temperature=0, max_tokens=256, dashscope_api_key=random.choice(Agent.api_key_list), base_url=Agent.base_url,model_kwargs={"enable_thinking": False})
         elif "default" in self.model:

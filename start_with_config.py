@@ -7,6 +7,7 @@ import psutil
 import time
 from env.env import VillagerBench, env_type, Agent
 from model.init_model import init_language_model
+from model.ollama_config import make_ollama_llm_config, configure_ollama_agent
 
 start_time = time.time()
 from pipeline.controller_tiny import GlobalController
@@ -34,9 +35,7 @@ def run(api_model: str, api_base: str, task_type: str, task_idx: int, agent_num:
     # Agent.api_key_list = api_key_list
 
     # Agent.base_url = "http://10.112.59.240:55049/v1"
-    Agent.base_url = "http://localhost:8269/v1/"
-    Agent.model = "default"
-    Agent.api_key_list = ["sk-VillagerTuning"]
+    configure_ollama_agent(Agent)
 
     # 设置env
     if task_type == "construction":
@@ -115,13 +114,7 @@ def run(api_model: str, api_base: str, task_type: str, task_idx: int, agent_num:
         start_time = time.time()
 
         # 设置llm
-        llm_config = {
-            "api_key": api_key_list[0],
-            "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            "api_model": "qwen3-next-80b-a3b-instruct",
-            # "api_model": "qwen-max",
-            "api_key_list": api_key_list
-        }
+        llm_config = make_ollama_llm_config()
         # llm_config = {
         #     "api_key": api_key_list[0],
         #     "api_base": "https://api.deepseek.com/v1",
@@ -162,13 +155,7 @@ def run(api_model: str, api_base: str, task_type: str, task_idx: int, agent_num:
         #     "api_model": "qwen3-next-80b-a3b-instruct",
         #     "api_key_list": api_key_list
         # }
-        base_llm_config = {
-            "api_key": "sk-VillagerTuning",
-            # "api_base": "http://10.112.59.240:50892/v1",
-            "api_base": "http://localhost:8269/v1/",
-            "api_model": "default",
-            "api_key_list": ["sk-VillagerTuning"]
-        }
+        base_llm_config = make_ollama_llm_config()
 
 
         ctrl = GlobalController(llm_config, tm, dm, env, 
@@ -231,13 +218,7 @@ if __name__ == "__main__":
 
         api_key_list = json.load(open("API_KEY_LIST", "r"))["AGENT_KEY"]
 
-        llm_config = {
-            "api_key": api_key_list[0],
-            "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            "api_model": "qwen3-next-80b-a3b-instruct",
-            # "api_model": "qwen-max",
-            "api_key_list": api_key_list
-        }
+        llm_config = make_ollama_llm_config()
 
         # llm_config = {
         #     "api_key": "sk-VillagerTuning",

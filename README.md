@@ -138,6 +138,7 @@ Customize your private tasks in your Minecraft server with our VillagerAgent mul
   - OpenAI (for access to models like GPT-4)
   - Google Cloud (for access to models like Gemini)
   - Zhipu AI (for access to GLM models)
+  - Ollama-compatible OpenAI API (for local or private deployments)
 - **NPM Package**: Node Package Manager (npm) installed, which is typically included with Node.js：
   ```python
   python js_setup.py
@@ -164,7 +165,7 @@ Customize your private tasks in your Minecraft server with our VillagerAgent mul
    pip install -r requirements.txt
    ```
 4. Set up your API key 🗝️:
-   - Craft a file named `API_KEY_LIST` and inscribe your API key in this way:
+    - Craft a file named `API_KEY_LIST` and inscribe your API key in this way:
    ```json
    {
       "OPENAI":["put your openai key here", ...],
@@ -173,8 +174,15 @@ Customize your private tasks in your Minecraft server with our VillagerAgent mul
       ...
    }
    ```
-   - We might try calling multiple available APIs to break through the access limit.
-   - Place this file in the root of the project directory.
+    - We might try calling multiple available APIs to break through the access limit.
+    - Place this file in the root of the project directory.
+
+### Ollama setup
+- Set `api_base` to your Ollama OpenAI-compatible endpoint and keep the defaults in `model/ollama_config.py` in sync.
+- Use an Ollama model name such as `qwen3.6:27b`, `gemma4:26b`, or `gemma4:e4b` for `api_model`.
+- Set `provider` to `ollama` so the code path is selected explicitly.
+- Set `OPENAI_API_KEY` or `API_KEY_LIST` to a dummy value such as `ollama` if you only use Ollama.
+- For embeddings, use `embeddinggemma:latest` through the same OpenAI-compatible endpoint.
 
 ## QuickStart 🚀
 
