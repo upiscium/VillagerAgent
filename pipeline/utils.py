@@ -15,11 +15,16 @@ from langchain.retrievers import ParentDocumentRetriever
 from langchain.retrievers.self_query.base import SelfQueryRetriever
 from langchain.chains.query_constructor.base import AttributeInfo
 from langchain.storage import InMemoryStore
+from model.ollama_config import OLLAMA_API_BASE, OLLAMA_API_KEY, OLLAMA_MODEL
 
 from typing import Union
 
 import functools
 import time
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", OLLAMA_API_KEY)
+OPENAI_API_BASE = os.environ.get("OPENAI_API_BASE", OLLAMA_API_BASE)
+OPENAI_EMBEDDING_MODEL = os.environ.get("OPENAI_EMBEDDING_MODEL", OLLAMA_MODEL)
 
 def timed_cache(max_age):
     def decorator(func):
@@ -362,7 +367,7 @@ def load_db_name(db_name, update=False, verbose=False, json_path="", query_type=
     else:
         if os.path.exists(f"db_{db_name}/") and not update:
             vectordb = Chroma(persist_directory=f"db_{db_name}/",
-                              embedding_function=OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY))
+                              embedding_function=OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY, openai_api_base=OPENAI_API_BASE, model=OPENAI_EMBEDDING_MODEL))
         else:
             if verbose:
                 print(f"Loading {db_name}...")
@@ -376,7 +381,7 @@ def load_db_name(db_name, update=False, verbose=False, json_path="", query_type=
             splits = text_splitter.split_documents(documents)
 
             # VectorDB
-            embedding = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+            embedding = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY, openai_api_base=OPENAI_API_BASE, model=OPENAI_EMBEDDING_MODEL)
             vectordb = Chroma.from_documents(documents=splits, embedding=embedding,
                                              persist_directory=f"db_{db_name}/")
     return vectordb
@@ -408,7 +413,7 @@ def query_from_db(llm, db_dict, db_name, query="", verbose=False, query_type="")
         child_splitter = RecursiveCharacterTextSplitter(chunk_size=400)
         # The vectorstore to use to index the child chunks
         vectorstore = Chroma(
-            collection_name="full_documents", embedding_function=OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+            collection_name="full_documents", embedding_function=OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY, openai_api_base=OPENAI_API_BASE, model=OPENAI_EMBEDDING_MODEL)
         )
         # The storage layer for the parent documents
         store = InMemoryStore()
