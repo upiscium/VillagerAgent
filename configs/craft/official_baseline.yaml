@@ -1,0 +1,32 @@
+run:
+  name: "craft_official_baseline"
+  seed: 3
+  output_dir: "result/craft"
+  structures: [0]
+  turns: 5
+
+craft:
+  repo_path: "external/CRAFT"
+  dataset_path: "external/CRAFT/data/structures_dataset_20.json"
+  use_oracle: true
+  oracle_n: 5
+  builder_tool_use: false
+
+villageragent:
+  enabled: false
+
+models:
+  director:
+    provider: "openai_compatible"
+    model: "qwen3.5:9b"
+    base_url: "https://ollama-melchior.arc.upiscium.dev/v1"
+    api_key: "ollama"
+    temperature: 0.2
+    max_tokens: 2000
+  builder:
+    provider: "openai_compatible"
+    model: "gpt-4o-mini"
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "OPENAI_API_KEY"
+    temperature: 0.0
+    max_tokens: 1000
