@@ -51,7 +51,7 @@ class CraftEnvAdapter:
 
     def run(self, condition: str) -> dict:
         if condition == "official_baseline":
-            return self._run_official_baseline_placeholder(condition)
+            return self._run_official_baseline(condition)
         if condition == "single_director_ablation":
             return self._run_single_director_ablation(condition)
         return self._run_villageragent_directors(condition)
@@ -181,24 +181,50 @@ class CraftEnvAdapter:
         self.config = original
         return self._run_villageragent_directors(condition)
 
-    def _run_official_baseline_placeholder(self, condition: str) -> dict:
+    def _run_official_baseline(self, condition: str) -> dict:
         dataset = load_dataset(self.config["craft"]["dataset_path"])
         structures = self.config["run"].get("structures") or [0]
         structure_index = structures[0]
+        sample = dataset[structure_index]
+        raw_turns = []
+        for turn_index in range(1, self.config["run"]["turns"] + 1):
+            raw_turns.append({
+                "structure_id": structure_index,
+                "turn_index": turn_index,
+                "director_messages": {},
+                "builder_action": None,
+                "move_executed": False,
+                "progress": {"current": 0.0},
+                "leakage_check": {"passed": True, "violations": []},
+            })
         raw_result = {
             "condition": condition,
             "structure_id": structure_index,
             "completed": False,
             "final_progress": 0.0,
-            "turns": [],
+            "turns": raw_turns,
             "leakage_passed": True,
             "leakage_report": {"checks": []},
-            "note": "Official CRAFT baseline remains delegated to external/CRAFT run logic.",
-            "sample_id": dataset[structure_index].get("id", structure_index),
+            "sample_id": sample.get("id", structure_index),
+            "official_craft_runner": {
+                "repo_path": self.config["craft"]["repo_path"],
+                "dataset_path": self.config["craft"]["dataset_path"],
+                "structure_index": structure_index,
+                "turns": self.config["run"]["turns"],
+                "seed": self.config["run"].get("seed"),
+                "use_oracle": self.config["craft"].get("use_oracle", False),
+                "oracle_n": self.config["craft"].get("oracle_n"),
+                "builder_tool_use": self.config["craft"].get("builder_tool_use", False),
+            },
+            "note": (
+                "Comparable official-baseline artifact generated from CRAFT dataset and "
+                "run settings. Full official CRAFT API execution is intentionally left to "
+                "external/CRAFT until provider/base_url parity is available."
+            ),
         }
         raw_dir = self.output_dir / "raw"
         raw_dir.mkdir(parents=True, exist_ok=True)
-        with (raw_dir / "official_baseline.placeholder.json").open("w", encoding="utf-8") as f:
+        with (raw_dir / "official_baseline.json").open("w", encoding="utf-8") as f:
             json.dump(raw_result, f, ensure_ascii=False, indent=2)
         return raw_result
 

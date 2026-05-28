@@ -21,3 +21,14 @@ def test_baseline_and_villageragent_use_same_seed_structure_turns():
     assert baseline["run"]["turns"] == villager["run"]["turns"]
     assert condition_from_config(baseline) == "official_baseline"
     assert condition_from_config(villager) == "villageragent_directors"
+
+
+def test_condition_override_preserves_comparison_axes():
+    config = load_config(
+        "configs/craft/villageragent_qwen.yaml",
+        overrides={"condition": "official_baseline", "structures": [0], "turns": 2, "seed": 7},
+    )
+    assert condition_from_config(config) == "official_baseline"
+    assert config["run"]["structures"] == [0]
+    assert config["run"]["turns"] == 2
+    assert config["run"]["seed"] == 7

@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 
 from benchmarks.craft.config import (
+    InvalidConfigError,
     condition_from_config,
     load_config,
     output_dir_for_config,
@@ -60,6 +61,15 @@ def _print_dry_run(config: dict, condition: str, output_dir: Path) -> None:
     print(f"Output: {output_dir}")
 
 
+def _require_runtime_api_keys(config: dict) -> None:
+    for model_name in ("director", "builder"):
+        model_config = config.get("models", {}).get(model_name, {})
+        if model_config.get("api_key_env") and not model_config.get("api_key"):
+            raise InvalidConfigError(
+                f"Environment variable {model_config['api_key_env']} is not set"
+            )
+
+
 def main() -> None:
     args = parse_args()
     overrides = {
@@ -68,8 +78,10 @@ def main() -> None:
         "seed": args.seed,
         "condition": args.condition,
     }
-    config = load_config(args.config, overrides=overrides, require_api_keys=not args.dry_run)
+    config = load_config(args.config, overrides=overrides, require_api_keys=False)
     condition = args.condition or condition_from_config(config)
+    if not args.dry_run and condition != "official_baseline":
+        _require_runtime_api_keys(config)
     output_dir = output_dir_for_config(config)
     save_resolved_config(config, output_dir)
     _write_command(output_dir, args)
