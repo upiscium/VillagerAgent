@@ -8,7 +8,16 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
     normalized_dir.mkdir(parents=True, exist_ok=True)
 
     turns = raw_result.get("turns", [])
-    final_progress = raw_result.get("final_progress", 0.0)
+    games = raw_result.get("games") or [raw_result]
+    final_progress_values = [game.get("final_progress", 0.0) for game in games]
+    mean_final_progress = (
+        sum(final_progress_values) / len(final_progress_values)
+        if final_progress_values else 0.0
+    )
+    completion_rate = (
+        sum(1 for game in games if game.get("completed", False)) / len(games)
+        if games else 0.0
+    )
     summary = {
         "benchmark": "CRAFT",
         "condition": condition,
@@ -16,9 +25,9 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
         "seed": config["run"].get("seed"),
         "structures": config["run"].get("structures"),
         "turns": config["run"].get("turns"),
-        "num_games": len(config["run"].get("structures") or []),
-        "mean_final_progress": final_progress,
-        "completion_rate": 1.0 if raw_result.get("completed") else 0.0,
+        "num_games": len(games),
+        "mean_final_progress": mean_final_progress,
+        "completion_rate": completion_rate,
         "models": {
             "director": config["models"]["director"]["model"],
             "builder": config["models"]["builder"]["model"],
@@ -62,22 +71,23 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
     with metrics_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerow({
-            "run_name": config["run"]["name"],
-            "condition": condition,
-            "structure_id": raw_result.get("structure_id"),
-            "seed": config["run"].get("seed"),
-            "turns": config["run"].get("turns"),
-            "completed": raw_result.get("completed", False),
-            "final_progress": final_progress,
-            "completion_rate": 1.0 if raw_result.get("completed") else 0.0,
-            "director_model": config["models"]["director"]["model"],
-            "builder_model": config["models"]["builder"]["model"],
-            "use_task_decomposer": config.get("villageragent", {}).get("use_task_decomposer", False),
-            "use_agent_controller": config.get("villageragent", {}).get("use_agent_controller", False),
-            "use_state_manager": config.get("villageragent", {}).get("use_state_manager", False),
-            "leakage_passed": raw_result.get("leakage_passed", True),
-        })
+        for game in games:
+            writer.writerow({
+                "run_name": config["run"]["name"],
+                "condition": condition,
+                "structure_id": game.get("structure_id"),
+                "seed": config["run"].get("seed"),
+                "turns": config["run"].get("turns"),
+                "completed": game.get("completed", False),
+                "final_progress": game.get("final_progress", 0.0),
+                "completion_rate": 1.0 if game.get("completed", False) else 0.0,
+                "director_model": config["models"]["director"]["model"],
+                "builder_model": config["models"]["builder"]["model"],
+                "use_task_decomposer": config.get("villageragent", {}).get("use_task_decomposer", False),
+                "use_agent_controller": config.get("villageragent", {}).get("use_agent_controller", False),
+                "use_state_manager": config.get("villageragent", {}).get("use_state_manager", False),
+                "leakage_passed": game.get("leakage_passed", raw_result.get("leakage_passed", True)),
+            })
 
     leakage_report = raw_result.get("leakage_report", {"checks": []})
     with (normalized_dir / "leakage_report.json").open("w", encoding="utf-8") as f:

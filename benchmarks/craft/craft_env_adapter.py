@@ -68,9 +68,31 @@ class CraftEnvAdapter:
     def _run_villageragent_directors(self, condition: str) -> dict:
         dataset = load_dataset(self.config["craft"]["dataset_path"])
         structures = self.config["run"].get("structures") or list(range(len(dataset)))
-        structure_index = structures[0]
-        sample = dataset[structure_index]
         random.seed(self.config["run"].get("seed", 0))
+
+        games = [
+            self._run_villageragent_structure(
+                condition=condition,
+                dataset=dataset,
+                structure_index=structure_index,
+            )
+            for structure_index in structures
+        ]
+        raw_result = _aggregate_games(condition, games)
+        raw_dir = self.output_dir / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        with (raw_dir / "villageragent_directors.json").open("w", encoding="utf-8") as f:
+            json.dump(raw_result, f, ensure_ascii=False, indent=2)
+        return raw_result
+
+    def _run_villageragent_structure(
+        self,
+        *,
+        condition: str,
+        dataset: list[dict],
+        structure_index: int,
+    ) -> dict:
+        sample = dataset[structure_index]
 
         game_state = self._init_game_state(sample)
         director_group = VillagerCraftDirectorGroup(
@@ -87,9 +109,6 @@ class CraftEnvAdapter:
         public_messages = []
         builder_actions = []
         turns = []
-        raw_dir = self.output_dir / "raw"
-        raw_dir.mkdir(parents=True, exist_ok=True)
-
         for turn_index in range(1, self.config["run"]["turns"] + 1):
             game_state.increment_turn()
             private_views = _make_private_views(sample)
@@ -152,18 +171,16 @@ class CraftEnvAdapter:
                 },
             })
 
-        raw_result = {
+        return {
             "condition": condition,
             "structure_id": structure_index,
+            "sample_id": sample.get("id", structure_index),
             "completed": game_state.is_complete(),
             "final_progress": _extract_progress(_safe_progress_summary(game_state)),
             "turns": turns,
             "leakage_passed": True,
             "leakage_report": {"checks": leakage_guard.reports},
         }
-        with (raw_dir / "villageragent_directors.json").open("w", encoding="utf-8") as f:
-            json.dump(raw_result, f, ensure_ascii=False, indent=2)
-        return raw_result
 
     def _run_single_director_ablation(self, condition: str) -> dict:
         original = copy.deepcopy(self.config)
@@ -183,8 +200,44 @@ class CraftEnvAdapter:
 
     def _run_official_baseline(self, condition: str) -> dict:
         dataset = load_dataset(self.config["craft"]["dataset_path"])
-        structures = self.config["run"].get("structures") or [0]
-        structure_index = structures[0]
+        structures = self.config["run"].get("structures") or list(range(len(dataset)))
+        games = [
+            self._official_baseline_game(
+                condition=condition,
+                dataset=dataset,
+                structure_index=structure_index,
+            )
+            for structure_index in structures
+        ]
+        raw_result = _aggregate_games(condition, games)
+        raw_result["official_craft_runner"] = {
+            "repo_path": self.config["craft"]["repo_path"],
+            "dataset_path": self.config["craft"]["dataset_path"],
+            "structure_indices": structures,
+            "turns": self.config["run"]["turns"],
+            "seed": self.config["run"].get("seed"),
+            "use_oracle": self.config["craft"].get("use_oracle", False),
+            "oracle_n": self.config["craft"].get("oracle_n"),
+            "builder_tool_use": self.config["craft"].get("builder_tool_use", False),
+        }
+        raw_result["note"] = (
+            "Comparable official-baseline artifact generated from CRAFT dataset and "
+            "run settings. Full official CRAFT API execution is intentionally left to "
+            "external/CRAFT until provider/base_url parity is available."
+        )
+        raw_dir = self.output_dir / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        with (raw_dir / "official_baseline.json").open("w", encoding="utf-8") as f:
+            json.dump(raw_result, f, ensure_ascii=False, indent=2)
+        return raw_result
+
+    def _official_baseline_game(
+        self,
+        *,
+        condition: str,
+        dataset: list[dict],
+        structure_index: int,
+    ) -> dict:
         sample = dataset[structure_index]
         raw_turns = []
         for turn_index in range(1, self.config["run"]["turns"] + 1):
@@ -197,7 +250,7 @@ class CraftEnvAdapter:
                 "progress": {"current": 0.0},
                 "leakage_check": {"passed": True, "violations": []},
             })
-        raw_result = {
+        return {
             "condition": condition,
             "structure_id": structure_index,
             "completed": False,
@@ -206,27 +259,7 @@ class CraftEnvAdapter:
             "leakage_passed": True,
             "leakage_report": {"checks": []},
             "sample_id": sample.get("id", structure_index),
-            "official_craft_runner": {
-                "repo_path": self.config["craft"]["repo_path"],
-                "dataset_path": self.config["craft"]["dataset_path"],
-                "structure_index": structure_index,
-                "turns": self.config["run"]["turns"],
-                "seed": self.config["run"].get("seed"),
-                "use_oracle": self.config["craft"].get("use_oracle", False),
-                "oracle_n": self.config["craft"].get("oracle_n"),
-                "builder_tool_use": self.config["craft"].get("builder_tool_use", False),
-            },
-            "note": (
-                "Comparable official-baseline artifact generated from CRAFT dataset and "
-                "run settings. Full official CRAFT API execution is intentionally left to "
-                "external/CRAFT until provider/base_url parity is available."
-            ),
         }
-        raw_dir = self.output_dir / "raw"
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        with (raw_dir / "official_baseline.json").open("w", encoding="utf-8") as f:
-            json.dump(raw_result, f, ensure_ascii=False, indent=2)
-        return raw_result
 
     def _builder_action(self, *, game_state, director_messages: dict[str, str]) -> dict:
         from agents.builder_agent import BuilderAgent
@@ -298,3 +331,28 @@ def _extract_progress(progress: Any) -> float:
         if isinstance(metrics, dict) and "overall_progress" in metrics:
             return float(metrics["overall_progress"])
     return 0.0
+
+
+def _aggregate_games(condition: str, games: list[dict]) -> dict:
+    turns = [turn for game in games for turn in game.get("turns", [])]
+    final_progress_values = [game.get("final_progress", 0.0) for game in games]
+    completed_count = sum(1 for game in games if game.get("completed", False))
+    leakage_checks = [
+        check
+        for game in games
+        for check in game.get("leakage_report", {}).get("checks", [])
+    ]
+    return {
+        "condition": condition,
+        "structure_id": games[0].get("structure_id") if games else None,
+        "structure_ids": [game.get("structure_id") for game in games],
+        "completed": completed_count == len(games) if games else False,
+        "final_progress": (
+            sum(final_progress_values) / len(final_progress_values)
+            if final_progress_values else 0.0
+        ),
+        "turns": turns,
+        "games": games,
+        "leakage_passed": all(game.get("leakage_passed", True) for game in games),
+        "leakage_report": {"checks": leakage_checks},
+    }

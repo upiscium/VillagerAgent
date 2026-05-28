@@ -26,3 +26,17 @@ def test_official_baseline_generates_comparable_turn_artifacts(tmp_path):
     turns = (tmp_path / "normalized" / "turns.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(turns) == config["run"]["turns"]
     assert json.loads(turns[0])["leakage_check"]["passed"] is True
+
+
+def test_official_baseline_runs_all_requested_structures(tmp_path):
+    config = load_config(
+        "configs/craft/official_baseline.yaml",
+        overrides={"structures": [0, 1], "turns": 2},
+    )
+    adapter = CraftEnvAdapter(config, tmp_path)
+    raw_result = adapter.run("official_baseline")
+
+    assert raw_result["structure_ids"] == [0, 1]
+    assert len(raw_result["games"]) == 2
+    assert len(raw_result["turns"]) == 4
+    assert raw_result["official_craft_runner"]["structure_indices"] == [0, 1]
