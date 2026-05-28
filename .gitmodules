@@ -1,0 +1,3 @@
+[submodule "external/CRAFT"]
+	path = external/CRAFT
+	url = https://github.com/csu-signal/CRAFT

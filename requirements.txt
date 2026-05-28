@@ -21,3 +21,4 @@ Levenshtein
 optimum
 auto-gptq
 dashscope
+pytest==8.3.5
