@@ -126,6 +126,14 @@ class CraftEnvAdapter:
             )
             leakage_reports = []
             for director_id, prompt_messages in director_group.controller.prompts_by_director.items():
+                if self.config.get("logging", {}).get("save_prompts", False):
+                    _save_prompt_messages(
+                        output_dir=self.output_dir,
+                        structure_index=structure_index,
+                        director_id=director_id,
+                        turn_index=turn_index,
+                        prompt_messages=prompt_messages,
+                    )
                 forbidden = {
                     "target_structure": sample.get("structure"),
                     "oracle_moves": _oracle_moves_for_guard(game_state, self.config),
@@ -356,3 +364,28 @@ def _aggregate_games(condition: str, games: list[dict]) -> dict:
         "leakage_passed": all(game.get("leakage_passed", True) for game in games),
         "leakage_report": {"checks": leakage_checks},
     }
+
+
+def _save_prompt_messages(
+    *,
+    output_dir: Path,
+    structure_index: int,
+    director_id: str,
+    turn_index: int,
+    prompt_messages: list[dict],
+) -> None:
+    prompt_dir = output_dir / "raw" / "prompts" / f"structure_{structure_index}"
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = prompt_dir / f"{director_id}_turn_{turn_index:03d}.json"
+    with prompt_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "structure_id": structure_index,
+                "director_id": director_id,
+                "turn_index": turn_index,
+                "prompt_messages": prompt_messages,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )

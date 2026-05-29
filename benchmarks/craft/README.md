@@ -36,6 +36,16 @@ This condition maps CRAFT Directors to VillagerAgent-side Director adapters:
 - `D2` -> VillagerAgent BaseAgent-style Director D2
 - `D3` -> VillagerAgent BaseAgent-style Director D3
 
+The current runtime is `villageragent_director_runtime_v1`. It provides a CRAFT-specific VillagerAgent adapter with explicit private/public state separation, Controller-style three-director turn production, and metadata indicating which VillagerAgent components are enabled for the run. It is not the Minecraft task pipeline.
+
+When `logging.save_prompts=true`, Director prompts are saved under:
+
+```text
+result/craft/{run_name}/raw/prompts/structure_{id}/{director}_turn_{nnn}.json
+```
+
+These prompt files contain only the messages sent to the Director LLM. They do not include forbidden leakage guard payloads such as `target_structure`, oracle moves, or other Directors' raw private views.
+
 ## Single Director Ablation
 
 ```bash
@@ -77,9 +87,13 @@ Director prompts must not include:
 
 `LeakageGuard` inspects prompts and raises on violations.
 
+The runtime also uses `CraftStateManagerAdapter` to keep each `PrivateAgentState` keyed by Director and separated from `PublicCoordinationState`. The state manager rejects forbidden hidden keys such as `target_structure`, `oracle_moves`, `all_private_views`, `hidden_spans`, and `hidden_labels`.
+
 ## Known Limitations
 
 - The initial implementation does not replace the Builder with VillagerAgent.
 - Minecraft server integration is not performed.
 - Full CRAFT judge script integration is a follow-up task.
 - CRAFT environment and metric logic are not modified.
+- The Director side is a CRAFT-specific VillagerAgent adapter runtime, not the full Minecraft-oriented task pipeline.
+- The official baseline artifact path is comparable by seed/structure/turn settings, but full official CRAFT API execution remains follow-up work.

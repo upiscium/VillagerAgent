@@ -4,8 +4,11 @@ from benchmarks.craft.craft_protocol import (
     CraftPrivateView,
     CraftPublicState,
     DirectorTurnOutput,
+    PrivateAgentState,
+    PublicCoordinationState,
 )
 from benchmarks.craft.villager.prompt_builder import build_director_prompt
+from benchmarks.craft.villager.state_manager_adapter import CraftStateManagerAdapter
 from benchmarks.craft.villager.state_translator import craft_private_view_to_agent_state
 from benchmarks.craft.villager.task_translator import craft_task_to_villager_objective
 
@@ -17,6 +20,7 @@ class VillagerCraftControllerAdapter:
         self.director_ids = villager_config.get("director_ids", ["D1", "D2", "D3"])
         self.own_message_history = {director_id: [] for director_id in self.director_ids}
         self.prompts_by_director = {}
+        self.state_manager = CraftStateManagerAdapter(self.director_ids)
         self.llm_client = self._make_llm_client(llm_config)
 
     def _make_llm_client(self, llm_config: dict):
@@ -34,6 +38,7 @@ class VillagerCraftControllerAdapter:
         self.craft_task_info = dict(craft_task_info)
         self.own_message_history = {director_id: [] for director_id in self.director_ids}
         self.prompts_by_director = {}
+        self.state_manager.reset()
 
     def step(
         self,
@@ -41,8 +46,21 @@ class VillagerCraftControllerAdapter:
         public_state: CraftPublicState,
     ) -> list[DirectorTurnOutput]:
         outputs = []
+        self.state_manager.update_public_state(PublicCoordinationState(
+            turn_index=public_state.turn_index,
+            public_messages=list(public_state.public_messages),
+            builder_actions=list(public_state.builder_actions),
+            visible_constructed_structure=public_state.visible_constructed_structure,
+            progress_summary=public_state.progress_summary,
+        ))
         for director_id in self.director_ids:
             private_view = private_views[director_id]
+            self.state_manager.update_private_state(PrivateAgentState(
+                agent_id=director_id,
+                private_view_text=private_view.text_view,
+                private_view_structured=private_view.structured_view,
+                own_message_history=self.own_message_history[director_id],
+            ))
             private_agent_state = craft_private_view_to_agent_state(
                 director_id=director_id,
                 private_view=private_view,
@@ -80,6 +98,8 @@ class VillagerCraftControllerAdapter:
                         "agent_controller": self.villager_config.get("use_agent_controller", False),
                         "state_manager": self.villager_config.get("use_state_manager", False),
                     },
+                    "runtime_adapter": "villageragent_director_runtime_v1",
+                    "state_manager_snapshot": self.state_manager.snapshot_for_metadata(),
                 },
             )
             self.own_message_history[director_id].append(

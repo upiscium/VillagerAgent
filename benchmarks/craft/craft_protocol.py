@@ -21,6 +21,23 @@ class CraftPublicState:
 
 
 @dataclass
+class PrivateAgentState:
+    agent_id: str
+    private_view_text: str
+    private_view_structured: dict
+    own_message_history: list[dict]
+
+
+@dataclass
+class PublicCoordinationState:
+    turn_index: int
+    public_messages: list[dict]
+    builder_actions: list[dict]
+    visible_constructed_structure: dict
+    progress_summary: dict | None
+
+
+@dataclass
 class DirectorTurnOutput:
     director_id: str
     public_message: str
