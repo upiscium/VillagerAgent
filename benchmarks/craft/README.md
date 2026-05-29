@@ -67,6 +67,19 @@ Runs write to `result/craft/{run_name}/`:
 - `normalized/leakage_report.json`
 - `logs/run.log`
 
+## Compare Runs
+
+Use `benchmarks.craft.report` to summarize one or more normalized CRAFT runs:
+
+```bash
+python -m benchmarks.craft.report \
+  --runs craft_official_baseline craft_smoke_test \
+  --output result/craft/comparison_summary.csv \
+  --json-output result/craft/comparison_summary.json
+```
+
+The comparison report includes run condition, number of games, turns, final progress, completion rate, models, VillagerAgent component flags, and leakage status.
+
 ## Partial-Information Guard
 
 The adapter separates each Director's private state from public coordination state. Director prompts may include only:
