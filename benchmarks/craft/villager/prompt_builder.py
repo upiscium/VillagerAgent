@@ -7,6 +7,20 @@ def _json_text(value) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
 
 
+def _craft_coordinate_guide(director_id: str) -> str:
+    return "\n".join([
+        "CRAFT coordinate and view guide:",
+        "- Your private view is a 2D projection of one wall of the hidden 3D target.",
+        "- row_0, row_1, row_2 are vertical stack layers from bottom to top in your view.",
+        "- Each row has three visible cells from your left to your right.",
+        "- Describe visible cells using relative terms such as bottom/middle/top and left/middle/right.",
+        "- Mention block color and size when visible; size 1 means small, size 2 means large.",
+        "- Do not claim coordinates or cells outside your own projection unless they are public builder actions.",
+        "- D1 sees the left wall; D2 sees the back/top wall; D3 sees the right wall.",
+        f"- You are {director_id}; speak only from {director_id}'s private projection and public history.",
+    ])
+
+
 def build_director_prompt(
     *,
     director_id: str,
@@ -28,6 +42,8 @@ def build_director_prompt(
         f"Director ID: {director_id}",
         f"Current turn index: {public_state.turn_index}",
         "",
+        _craft_coordinate_guide(director_id),
+        "",
         "Own private view text:",
         private_observation.get("text", ""),
         "",
@@ -46,7 +62,7 @@ def build_director_prompt(
         "Visible progress summary:",
         _json_text(public_state.progress_summary),
         "",
-        "Write only your next public message to the Builder.",
+        "Write only your next public message to the Builder. Prefer concise, grounded instructions that name visible block color, size, relative cell, and whether you are uncertain.",
     ])
     return [
         {"role": "system", "content": system},

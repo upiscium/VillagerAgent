@@ -295,10 +295,11 @@ class CraftEnvAdapter:
             use_tools=self.config["craft"].get("builder_tool_use", False),
             oracle_moves=oracle_moves,
         )
+        prompt = _append_builder_action_contract(prompt, oracle_moves)
         client = _make_chat_client(builder_model)
         response = client.chat(
             [
-                {"role": "system", "content": "You are the CRAFT Builder. Respond with one valid move line."},
+                {"role": "system", "content": _builder_system_prompt(oracle_moves)},
                 {"role": "user", "content": prompt},
             ],
             model=builder_model["model"],
@@ -339,6 +340,56 @@ def _make_chat_client(model_config: dict):
             api_key=model_config.get("api_key", ""),
         )
     raise ValueError(f"Unsupported builder LLM provider: {provider}")
+
+
+def _builder_system_prompt(oracle_moves: list[dict] | None) -> str:
+    if oracle_moves:
+        return (
+            "You are the CRAFT Builder. Candidate moves are verified valid. "
+            "Respond with exactly one line copied from the CANDIDATE RESPONSE LINES section. "
+            "Do not write markdown, bullets, analysis, or any text before or after the chosen line."
+        )
+    return (
+        "You are the CRAFT Builder. Respond with exactly one valid move line in the requested "
+        "PLACE, REMOVE, or CLARIFY format. Do not write markdown, bullets, analysis, or extra text."
+    )
+
+
+def _append_builder_action_contract(prompt: str, oracle_moves: list[dict] | None) -> str:
+    if not oracle_moves:
+        return prompt + "\n\nSTRICT FINAL ANSWER:\nReturn exactly one PLACE, REMOVE, or CLARIFY line and nothing else."
+
+    candidate_lines = [
+        _format_candidate_response_line(move)
+        for move in oracle_moves
+    ]
+    return prompt + "\n\n" + "\n".join([
+        "STRICT FINAL ANSWER:",
+        "You must choose exactly one verified candidate move.",
+        "Copy one line from CANDIDATE RESPONSE LINES exactly except the CONFIRM text may be shortened.",
+        "Do not output natural-language candidate descriptions such as 'PLACE blue at ...'.",
+        "Do not output any text before or after the chosen line.",
+        "",
+        "CANDIDATE RESPONSE LINES:",
+        *candidate_lines,
+    ])
+
+
+def _format_candidate_response_line(move: dict) -> str:
+    action = move.get("action")
+    position = move.get("position")
+    layer = move.get("layer")
+    span_to = move.get("span_to")
+    if action == "place":
+        block = move.get("block")
+        if span_to:
+            return f"PLACE:{block}:{position}:{layer}:{span_to}:CONFIRM:Choosing this verified candidate."
+        return f"PLACE:{block}:{position}:{layer}:CONFIRM:Choosing this verified candidate."
+    if action == "remove":
+        if span_to:
+            return f"REMOVE:{position}:{layer}:{span_to}:CONFIRM:Choosing this verified candidate."
+        return f"REMOVE:{position}:{layer}:CONFIRM:Choosing this verified candidate."
+    return "CLARIFY:No verified candidate can be matched to the directors' messages."
 
 
 def _matches_oracle_candidate(action: dict, oracle_moves: list[dict]) -> bool:
