@@ -205,6 +205,7 @@ class CraftEnvAdapter:
             "enabled": True,
             "num_agents": 3,
             "director_ids": ["D1", "D2", "D3"],
+            "active_director_ids": ["D1"],
             "use_task_decomposer": False,
             "use_agent_controller": False,
             "use_state_manager": False,

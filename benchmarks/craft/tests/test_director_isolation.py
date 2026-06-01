@@ -5,7 +5,11 @@ from benchmarks.craft.villager.villager_craft_agent import VillagerCraftDirector
 
 
 class StubClient:
+    def __init__(self):
+        self.calls = 0
+
     def chat(self, messages, *, model, temperature=0.0, max_tokens=None, stop=None):
+        self.calls += 1
         return "Builder, I can only speak from my own view."
 
 
@@ -52,3 +56,29 @@ def test_controller_returns_three_director_messages():
     assert snapshot["stores_target_structure"] is False
     assert snapshot["stores_oracle_moves"] is False
     assert snapshot["private_state_agents"] == ["D1", "D2", "D3"]
+
+
+def test_single_director_ablation_only_calls_d1():
+    group = VillagerCraftDirectorGroup(
+        villager_config={"director_ids": ["D1", "D2", "D3"], "active_director_ids": ["D1"]},
+        llm_config={"provider": "openai_compatible", "base_url": "http://unused", "api_key": "test", "model": "test"},
+    )
+    stub = StubClient()
+    group.controller.llm_client = stub
+    public = CraftPublicState(1, [], [], {}, None)
+    private_views = {
+        did: CraftPrivateView(did, did, {}, f"{did} private", {})
+        for did in ["D1", "D2", "D3"]
+    }
+    messages = group.generate_director_messages(
+        private_views=private_views,
+        public_state=public,
+        turn_index=1,
+    )
+    assert messages == {
+        "D1": "Builder, I can only speak from my own view.",
+        "D2": "",
+        "D3": "",
+    }
+    assert stub.calls == 1
+    assert set(group.controller.prompts_by_director) == {"D1"}

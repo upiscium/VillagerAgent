@@ -57,6 +57,12 @@ These prompt files contain only the messages sent to the Director LLM. They do n
 
 For qwen3-style OpenAI-compatible endpoints, the CRAFT adapter records response diagnostics in raw turn metadata. If a response returns reasoning but empty public `content`, the adapter retries once with a stricter final-answer instruction and larger token budget. This is intended to make qwen smoke runs diagnosable without exposing hidden CRAFT state.
 
+For a small qwen/Ollama batch evaluation across structures `0, 1, 2` and five turns, use:
+
+```bash
+python -m benchmarks.craft.run --config configs/craft/eval_qwen_ollama.yaml
+```
+
 ## Single Director Ablation
 
 ```bash
@@ -64,6 +70,12 @@ python -m benchmarks.craft.run --config configs/craft/single_director_ablation.y
 ```
 
 This mode is intended to compare multi-agent coordination against a reduced single-director-style condition under the same seed, structures, and turns.
+
+The qwen/Ollama version uses D1 as the only active Director while preserving the three-Director CRAFT message shape with empty inactive D2/D3 messages:
+
+```bash
+python -m benchmarks.craft.run --config configs/craft/single_director_qwen_ollama.yaml
+```
 
 ## Results
 
@@ -84,7 +96,7 @@ Use `benchmarks.craft.report` to summarize one or more normalized CRAFT runs:
 
 ```bash
 python -m benchmarks.craft.report \
-  --runs craft_official_baseline craft_smoke_test \
+  --runs craft_eval_qwen_ollama craft_single_director_qwen_ollama craft_official_baseline \
   --output result/craft/comparison_summary.csv \
   --json-output result/craft/comparison_summary.json
 ```
