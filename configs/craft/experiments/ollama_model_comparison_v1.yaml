@@ -1,0 +1,12 @@
+experiment:
+  name: "craft_ollama_model_comparison_v1"
+  result_root: "result/craft"
+  runs:
+    - "configs/craft/eval_qwen_ollama.yaml"
+    - "configs/craft/eval_qwen35_4b_ollama.yaml"
+    - "configs/craft/eval_qwen36_27b_ollama.yaml"
+    - "configs/craft/eval_gemma4_26b_ollama.yaml"
+    - "configs/craft/eval_gemma4_e4b_ollama.yaml"
+  report:
+    output: "result/craft/comparison_ollama_models_v1.csv"
+    json_output: "result/craft/comparison_ollama_models_v1.json"

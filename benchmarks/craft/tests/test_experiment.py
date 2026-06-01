@@ -16,6 +16,19 @@ def test_load_experiment_manifest():
     ]
 
 
+def test_load_ollama_model_comparison_manifest():
+    manifest = load_experiment("configs/craft/experiments/ollama_model_comparison_v1.yaml")
+    experiment = manifest["experiment"]
+    assert experiment["name"] == "craft_ollama_model_comparison_v1"
+    assert experiment["runs"] == [
+        "configs/craft/eval_qwen_ollama.yaml",
+        "configs/craft/eval_qwen35_4b_ollama.yaml",
+        "configs/craft/eval_qwen36_27b_ollama.yaml",
+        "configs/craft/eval_gemma4_26b_ollama.yaml",
+        "configs/craft/eval_gemma4_e4b_ollama.yaml",
+    ]
+
+
 def test_load_experiment_rejects_empty_runs(tmp_path):
     manifest_path = tmp_path / "empty.yaml"
     manifest_path.write_text(yaml.safe_dump({"experiment": {"runs": []}}), encoding="utf-8")

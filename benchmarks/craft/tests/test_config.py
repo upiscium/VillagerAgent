@@ -64,3 +64,24 @@ def test_official_baseline_matches_qwen_batch_eval_axis():
     assert baseline["run"]["seed"] == batch["run"]["seed"]
     assert baseline["run"]["structures"] == batch["run"]["structures"]
     assert baseline["run"]["turns"] == batch["run"]["turns"]
+
+
+def test_ollama_model_comparison_configs_share_eval_axis():
+    expected_models = {
+        "configs/craft/eval_qwen_ollama.yaml": "qwen3.5:9b",
+        "configs/craft/eval_qwen35_4b_ollama.yaml": "qwen3.5:4b",
+        "configs/craft/eval_qwen36_27b_ollama.yaml": "qwen3.6:27b",
+        "configs/craft/eval_gemma4_26b_ollama.yaml": "gemma4:26b",
+        "configs/craft/eval_gemma4_e4b_ollama.yaml": "gemma4:e4b",
+    }
+    for config_path, model in expected_models.items():
+        config = load_config(config_path)
+        assert condition_from_config(config) == "villageragent_directors"
+        assert config["run"]["structures"] == [0, 1, 2]
+        assert config["run"]["turns"] == 5
+        assert config["models"]["director"]["provider"] == "ollama_native"
+        assert config["models"]["builder"]["provider"] == "ollama_native"
+        assert config["models"]["director"]["model"] == model
+        assert config["models"]["builder"]["model"] == model
+        assert config["models"]["director"]["think"] is False
+        assert config["models"]["builder"]["think"] is False
