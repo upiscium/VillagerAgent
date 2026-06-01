@@ -18,6 +18,7 @@ class VillagerCraftControllerAdapter:
         self.villager_config = villager_config
         self.llm_config = llm_config
         self.director_ids = villager_config.get("director_ids", ["D1", "D2", "D3"])
+        self.active_director_ids = set(villager_config.get("active_director_ids", self.director_ids))
         self.own_message_history = {director_id: [] for director_id in self.director_ids}
         self.prompts_by_director = {}
         self.state_manager = CraftStateManagerAdapter(self.director_ids)
@@ -57,6 +58,17 @@ class VillagerCraftControllerAdapter:
             progress_summary=public_state.progress_summary,
         ))
         for director_id in self.director_ids:
+            if director_id not in self.active_director_ids:
+                outputs.append(DirectorTurnOutput(
+                    director_id=director_id,
+                    public_message="",
+                    metadata={
+                        "runtime_adapter": "villageragent_director_runtime_v1",
+                        "inactive_director": True,
+                    },
+                ))
+                continue
+
             private_view = private_views[director_id]
             self.state_manager.update_private_state(PrivateAgentState(
                 agent_id=director_id,

@@ -39,3 +39,20 @@ def test_qwen_ollama_config_uses_native_provider_without_openai_key():
     assert config["models"]["director"]["provider"] == "ollama_native"
     assert config["models"]["builder"]["provider"] == "ollama_native"
     assert config["models"]["director"]["think"] is False
+
+
+def test_batch_qwen_ollama_config_uses_three_structure_eval_axis():
+    config = load_config("configs/craft/eval_qwen_ollama.yaml")
+    assert config["run"]["structures"] == [0, 1, 2]
+    assert config["run"]["turns"] == 5
+    assert config["models"]["director"]["provider"] == "ollama_native"
+    assert config["models"]["builder"]["provider"] == "ollama_native"
+
+
+def test_single_director_qwen_ollama_config_uses_native_provider():
+    config = load_config("configs/craft/single_director_qwen_ollama.yaml")
+    assert condition_from_config(config) == "single_director_ablation"
+    assert config["run"]["structures"] == [0, 1, 2]
+    assert config["run"]["turns"] == 5
+    assert config["models"]["director"]["provider"] == "ollama_native"
+    assert config["models"]["builder"]["provider"] == "ollama_native"
