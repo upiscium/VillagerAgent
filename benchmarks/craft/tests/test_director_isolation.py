@@ -30,6 +30,9 @@ def test_each_director_receives_only_own_private_view():
     )
     prompt_text = "\n".join(m["content"] for m in prompt)
     assert "D1_PRIVATE_TEXT" in prompt_text
+    assert "CRAFT coordinate and view guide" in prompt_text
+    assert "row_0, row_1, row_2 are vertical stack layers" in prompt_text
+    assert "You are D1; speak only from D1's private projection" in prompt_text
     assert "D2_RAW_PRIVATE" not in prompt_text
     assert "D3_RAW_PRIVATE" not in prompt_text
 
