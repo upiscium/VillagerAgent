@@ -27,7 +27,7 @@ def test_candidate_supports_matching_claim_keywords():
         },
         "D2": {
             "node_id": "claim:D2:1",
-            "content": {"keywords": ["blue"]},
+            "content": {"keywords": ["blue", "bottom", "left"]},
         },
     }
     candidates = action_candidates_from_moves(
@@ -39,6 +39,55 @@ def test_candidate_supports_matching_claim_keywords():
     assert candidates[0].supported_by == ["claim:D1:1"]
     assert candidates[0].conflicts_with == ["claim:D2:1"]
     assert 0.0 <= candidates[0].confidence <= 1.0
+    assert candidates[0].metadata["location_keywords"] == ["bottom", "left"]
+
+
+def test_candidate_ignores_unrelated_location_color_conflict():
+    claims = {
+        "D1": {
+            "node_id": "claim:D1:1",
+            "content": {"keywords": ["blue", "top", "right"]},
+        },
+    }
+    candidates = action_candidates_from_moves(
+        moves=[{"action": "place", "block": "ys", "position": "(0,0)", "layer": 0, "span_to": None}],
+        reported_claims=claims,
+        turn_index=1,
+    )
+
+    assert candidates[0].conflicts_with == []
+
+
+def test_candidate_ignores_color_only_conflict():
+    claims = {
+        "D1": {
+            "node_id": "claim:D1:1",
+            "content": {"keywords": ["blue"]},
+        },
+    }
+    candidates = action_candidates_from_moves(
+        moves=[{"action": "place", "block": "ys", "position": "(0,0)", "layer": 0, "span_to": None}],
+        reported_claims=claims,
+        turn_index=1,
+    )
+
+    assert candidates[0].conflicts_with == []
+
+
+def test_candidate_support_requires_location_overlap_when_claim_has_location():
+    claims = {
+        "D1": {
+            "node_id": "claim:D1:1",
+            "content": {"keywords": ["yellow", "top", "right"]},
+        },
+    }
+    candidates = action_candidates_from_moves(
+        moves=[{"action": "place", "block": "ys", "position": "(0,0)", "layer": 0, "span_to": None}],
+        reported_claims=claims,
+        turn_index=1,
+    )
+
+    assert candidates[0].supported_by == []
 
 
 def test_candidate_does_not_support_generic_action_keywords_only():
