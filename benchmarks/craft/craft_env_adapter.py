@@ -14,6 +14,7 @@ from benchmarks.craft.dual_dag.action_candidates import (
     build_action_candidate_metadata,
 )
 from benchmarks.craft.dual_dag.epistemic_extractor import reported_claim_from_message
+from benchmarks.craft.dual_dag.gating import should_clarify
 from benchmarks.craft.leakage_guard import LeakageGuard
 from benchmarks.craft.villager.villager_craft_agent import VillagerCraftDirectorGroup
 
@@ -347,7 +348,7 @@ class CraftEnvAdapter:
                 turn_index=turn_index,
             )]
         if parsed.get("action") == "clarify" and oracle_moves:
-            return _oracle_fallback_action(
+            fallback = _oracle_fallback_action(
                 oracle_moves=oracle_moves,
                 response_info=getattr(client, "last_response_info", {}),
                 first_line=first_line,
@@ -358,8 +359,9 @@ class CraftEnvAdapter:
                     chosen_by="oracle_fallback",
                 ),
             )
+            return _apply_clarification_gate(fallback, self.config)
         if oracle_moves and not _matches_oracle_candidate(parsed, oracle_moves):
-            return _oracle_fallback_action(
+            fallback = _oracle_fallback_action(
                 oracle_moves=oracle_moves,
                 response_info=getattr(client, "last_response_info", {}),
                 first_line=first_line,
@@ -370,12 +372,13 @@ class CraftEnvAdapter:
                     chosen_by="oracle_fallback",
                 ),
             )
+            return _apply_clarification_gate(fallback, self.config)
         parsed["_action_candidate_metadata"] = build_action_candidate_metadata(
             candidates=action_candidates,
             chosen_action=parsed,
             chosen_by="builder_response",
         )
-        return parsed
+        return _apply_clarification_gate(parsed, self.config)
 
 
 def _make_chat_client(model_config: dict):
@@ -470,6 +473,22 @@ def _oracle_fallback_action(
     if action_candidate_metadata is not None:
         fallback["_action_candidate_metadata"] = action_candidate_metadata
     return fallback
+
+
+def _apply_clarification_gate(action: dict, config: dict) -> dict:
+    candidate_metadata = action.get("_action_candidate_metadata", {})
+    should_gate, gate_metadata = should_clarify(
+        candidate_metadata=candidate_metadata,
+        config=config,
+    )
+    if not should_gate:
+        return action
+    return {
+        "action": "clarify",
+        "clarification": "The candidate action is ambiguous. Please clarify the block color, coordinate, layer, or span before building.",
+        "_gated_clarification": gate_metadata,
+        "_action_candidate_metadata": candidate_metadata,
+    }
 
 
 def _oracle_moves_for_builder(game_state, config: dict) -> list[dict] | None:

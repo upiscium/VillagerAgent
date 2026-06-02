@@ -1,0 +1,51 @@
+run:
+  name: "craft_single_director_qwen_ollama_dual_dag"
+  seed: 3
+  output_dir: "result/craft"
+  structures: [0, 1, 2]
+  turns: 5
+
+craft:
+  repo_path: "external/CRAFT"
+  dataset_path: "external/CRAFT/data/structures_dataset_20.json"
+  use_oracle: true
+  oracle_n: 1
+  builder_tool_use: false
+  preserve_partial_observation: true
+  use_common_ground: false
+
+dual_dag:
+  enabled: true
+  gated_clarification:
+    enabled: true
+    min_action_confidence: 0.65
+    max_conflict_count: 0
+    clarify_on_large_block_span_uncertainty: true
+    clarification_cost: 0.15
+    mistake_cost_weight: 1.0
+
+villageragent:
+  enabled: false
+  ablation: "single_director"
+
+models:
+  director:
+    provider: "ollama_native"
+    model: "qwen3.5:9b"
+    base_url: "https://ollama-melchior.arc.upiscium.dev"
+    think: false
+    temperature: 0.2
+    max_tokens: 4096
+  builder:
+    provider: "ollama_native"
+    model: "qwen3.5:9b"
+    base_url: "https://ollama-melchior.arc.upiscium.dev"
+    think: false
+    temperature: 0.0
+    max_tokens: 4096
+
+logging:
+  save_prompts: true
+  save_internal_reasoning: false
+  save_raw_craft_outputs: true
+  save_leakage_report: true

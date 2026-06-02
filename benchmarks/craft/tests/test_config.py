@@ -85,3 +85,18 @@ def test_ollama_model_comparison_configs_share_eval_axis():
         assert config["models"]["builder"]["model"] == model
         assert config["models"]["director"]["think"] is False
         assert config["models"]["builder"]["think"] is False
+
+
+def test_dual_dag_qwen_configs_share_eval_axis():
+    baseline = load_config("configs/craft/eval_qwen_ollama.yaml")
+    for config_path in (
+        "configs/craft/eval_qwen_ollama_dual_dag.yaml",
+        "configs/craft/single_director_qwen_ollama_dual_dag.yaml",
+    ):
+        config = load_config(config_path)
+        assert config["run"]["structures"] == baseline["run"]["structures"]
+        assert config["run"]["turns"] == baseline["run"]["turns"]
+        assert config["dual_dag"]["enabled"] is True
+        assert config["dual_dag"]["gated_clarification"]["enabled"] is True
+        assert config["models"]["director"]["provider"] == "ollama_native"
+        assert config["models"]["builder"]["provider"] == "ollama_native"

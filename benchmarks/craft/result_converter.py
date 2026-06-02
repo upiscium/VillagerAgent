@@ -24,6 +24,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
     active_directors = _active_directors(config, condition)
     epistemic_counts = _epistemic_counts(turns)
     action_candidate_metrics = _action_candidate_metrics(turns)
+    clarification_metrics = _clarification_metrics(turns)
     summary = {
         "benchmark": "CRAFT",
         "condition": condition,
@@ -50,6 +51,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
             "baseline_type": _baseline_type(condition),
             **epistemic_counts,
             **action_candidate_metrics,
+            **clarification_metrics,
         },
         "villageragent": {
             "enabled": config.get("villageragent", {}).get("enabled", False),
@@ -95,6 +97,12 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
         "claim_support_count",
         "claim_conflict_count",
         "candidate_count",
+        "clarification_count",
+        "gated_clarification_count",
+        "gated_clarification_rate",
+        "mean_risk_score",
+        "low_confidence_gate_count",
+        "conflict_gate_count",
         "baseline_type",
         "use_task_decomposer",
         "use_agent_controller",
@@ -107,6 +115,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
         for game in games:
             game_epistemic_counts = _epistemic_counts(game.get("turns", []))
             game_action_candidate_metrics = _action_candidate_metrics(game.get("turns", []))
+            game_clarification_metrics = _clarification_metrics(game.get("turns", []))
             writer.writerow({
                 "run_name": config["run"]["name"],
                 "condition": condition,
@@ -134,6 +143,12 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
                 "claim_support_count": game_action_candidate_metrics["claim_support_count"],
                 "claim_conflict_count": game_action_candidate_metrics["claim_conflict_count"],
                 "candidate_count": game_action_candidate_metrics["candidate_count"],
+                "clarification_count": game_clarification_metrics["clarification_count"],
+                "gated_clarification_count": game_clarification_metrics["gated_clarification_count"],
+                "gated_clarification_rate": game_clarification_metrics["gated_clarification_rate"],
+                "mean_risk_score": game_clarification_metrics["mean_risk_score"],
+                "low_confidence_gate_count": game_clarification_metrics["low_confidence_gate_count"],
+                "conflict_gate_count": game_clarification_metrics["conflict_gate_count"],
                 "baseline_type": _baseline_type(condition),
                 "use_task_decomposer": config.get("villageragent", {}).get("use_task_decomposer", False),
                 "use_agent_controller": config.get("villageragent", {}).get("use_agent_controller", False),
@@ -210,4 +225,36 @@ def _action_candidate_metrics(turns: list[dict]) -> dict:
         "claim_support_count": claim_support_count,
         "claim_conflict_count": claim_conflict_count,
         "candidate_count": candidate_count,
+    }
+
+
+def _clarification_metrics(turns: list[dict]) -> dict:
+    clarification_count = 0
+    gated_clarification_count = 0
+    low_confidence_gate_count = 0
+    conflict_gate_count = 0
+    risk_scores = []
+    for turn in turns:
+        action = turn.get("builder_action") or {}
+        if action.get("action") == "clarify":
+            clarification_count += 1
+        gate = action.get("_gated_clarification")
+        if not gate:
+            continue
+        gated_clarification_count += 1
+        reasons = gate.get("reasons", [])
+        if "low_action_confidence" in reasons:
+            low_confidence_gate_count += 1
+        if "claim_conflict" in reasons:
+            conflict_gate_count += 1
+        risk_score = gate.get("risk_score")
+        if risk_score is not None:
+            risk_scores.append(float(risk_score))
+    return {
+        "clarification_count": clarification_count,
+        "gated_clarification_count": gated_clarification_count,
+        "gated_clarification_rate": gated_clarification_count / len(turns) if turns else 0.0,
+        "mean_risk_score": sum(risk_scores) / len(risk_scores) if risk_scores else 0.0,
+        "low_confidence_gate_count": low_confidence_gate_count,
+        "conflict_gate_count": conflict_gate_count,
     }

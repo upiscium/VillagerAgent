@@ -46,6 +46,8 @@ def test_report_aggregates_multiple_runs(tmp_path):
     assert rows[1]["builder_fallback_rate"] == 1.0
     assert rows[1]["mean_action_confidence"] == 0.6
     assert rows[1]["claim_support_count"] == 2
+    assert rows[1]["gated_clarification_count"] == 1
+    assert rows[1]["mean_risk_score"] == 0.4
 
     csv_path = tmp_path / "comparison_summary.csv"
     json_path = tmp_path / "comparison_summary.json"
@@ -94,7 +96,13 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
     with (normalized / "metrics.csv").open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["leakage_passed", "mean_action_confidence", "claim_support_count"],
+            fieldnames=[
+                "leakage_passed",
+                "mean_action_confidence",
+                "claim_support_count",
+                "gated_clarification_count",
+                "mean_risk_score",
+            ],
         )
         writer.writeheader()
         for value in leakage_values:
@@ -102,4 +110,6 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "leakage_passed": value,
                 "mean_action_confidence": "0.6",
                 "claim_support_count": "2",
+                "gated_clarification_count": "1",
+                "mean_risk_score": "0.4",
             })

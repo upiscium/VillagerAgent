@@ -32,6 +32,12 @@ REPORT_FIELDS = [
     "claim_support_count",
     "claim_conflict_count",
     "candidate_count",
+    "clarification_count",
+    "gated_clarification_count",
+    "gated_clarification_rate",
+    "mean_risk_score",
+    "low_confidence_gate_count",
+    "conflict_gate_count",
     "baseline_type",
     "use_task_decomposer",
     "use_agent_controller",
@@ -116,6 +122,30 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
         "candidate_count": runtime.get(
             "candidate_count",
             _sum_metric_rows(metrics_rows, "candidate_count"),
+        ),
+        "clarification_count": runtime.get(
+            "clarification_count",
+            _sum_metric_rows(metrics_rows, "clarification_count"),
+        ),
+        "gated_clarification_count": runtime.get(
+            "gated_clarification_count",
+            _sum_metric_rows(metrics_rows, "gated_clarification_count"),
+        ),
+        "gated_clarification_rate": runtime.get(
+            "gated_clarification_rate",
+            _mean_metric_rows(metrics_rows, "gated_clarification_rate"),
+        ),
+        "mean_risk_score": runtime.get(
+            "mean_risk_score",
+            _mean_metric_rows(metrics_rows, "mean_risk_score"),
+        ),
+        "low_confidence_gate_count": runtime.get(
+            "low_confidence_gate_count",
+            _sum_metric_rows(metrics_rows, "low_confidence_gate_count"),
+        ),
+        "conflict_gate_count": runtime.get(
+            "conflict_gate_count",
+            _sum_metric_rows(metrics_rows, "conflict_gate_count"),
         ),
         "baseline_type": runtime.get("baseline_type", _baseline_type(condition)),
         "use_task_decomposer": summary.get("villageragent", {}).get("use_task_decomposer", False),

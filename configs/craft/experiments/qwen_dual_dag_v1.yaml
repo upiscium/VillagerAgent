@@ -1,0 +1,11 @@
+experiment:
+  name: "craft_qwen_dual_dag_v1"
+  result_root: "result/craft"
+  runs:
+    - "configs/craft/eval_qwen_ollama.yaml"
+    - "configs/craft/eval_qwen_ollama_dual_dag.yaml"
+    - "configs/craft/single_director_qwen_ollama_dual_dag.yaml"
+    - "configs/craft/official_baseline.yaml"
+  report:
+    output: "result/craft/comparison_qwen_dual_dag_v1.csv"
+    json_output: "result/craft/comparison_qwen_dual_dag_v1.json"

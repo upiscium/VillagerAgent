@@ -145,3 +145,39 @@ def test_result_converter_counts_action_candidate_metadata(tmp_path):
     assert summary["runtime"]["claim_conflict_count"] == 1
     assert summary["runtime"]["candidate_count"] == 2
     assert "mean_action_confidence" in metrics_text
+
+
+def test_result_converter_counts_gated_clarification_metadata(tmp_path):
+    config = {
+        "run": {"name": "test", "seed": 3, "structures": [0], "turns": 1},
+        "models": {"director": {"model": "d"}, "builder": {"model": "b"}},
+        "villageragent": {"enabled": True},
+    }
+    normalize_results(
+        config=config,
+        condition="villageragent_directors",
+        raw_result={
+            "structure_id": 0,
+            "turns": [{
+                "builder_action": {
+                    "action": "clarify",
+                    "_gated_clarification": {
+                        "risk_score": 0.4,
+                        "reasons": ["low_action_confidence", "claim_conflict"],
+                    },
+                },
+            }],
+            "final_progress": 0.0,
+            "completed": False,
+        },
+        output_dir=tmp_path,
+    )
+    summary = json.loads((tmp_path / "normalized" / "summary.json").read_text())
+    metrics_text = (tmp_path / "normalized" / "metrics.csv").read_text()
+    assert summary["runtime"]["clarification_count"] == 1
+    assert summary["runtime"]["gated_clarification_count"] == 1
+    assert summary["runtime"]["gated_clarification_rate"] == 1.0
+    assert summary["runtime"]["mean_risk_score"] == 0.4
+    assert summary["runtime"]["low_confidence_gate_count"] == 1
+    assert summary["runtime"]["conflict_gate_count"] == 1
+    assert "gated_clarification_count" in metrics_text

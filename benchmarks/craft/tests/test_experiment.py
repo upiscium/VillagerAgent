@@ -29,6 +29,18 @@ def test_load_ollama_model_comparison_manifest():
     ]
 
 
+def test_load_qwen_dual_dag_manifest():
+    manifest = load_experiment("configs/craft/experiments/qwen_dual_dag_v1.yaml")
+    experiment = manifest["experiment"]
+    assert experiment["name"] == "craft_qwen_dual_dag_v1"
+    assert experiment["runs"] == [
+        "configs/craft/eval_qwen_ollama.yaml",
+        "configs/craft/eval_qwen_ollama_dual_dag.yaml",
+        "configs/craft/single_director_qwen_ollama_dual_dag.yaml",
+        "configs/craft/official_baseline.yaml",
+    ]
+
+
 def test_load_experiment_rejects_empty_runs(tmp_path):
     manifest_path = tmp_path / "empty.yaml"
     manifest_path.write_text(yaml.safe_dump({"experiment": {"runs": []}}), encoding="utf-8")
