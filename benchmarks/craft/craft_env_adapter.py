@@ -13,8 +13,8 @@ from benchmarks.craft.dual_dag.action_candidates import (
     action_candidates_from_moves,
     build_action_candidate_metadata,
 )
-from benchmarks.craft.dual_dag.epistemic_extractor import reported_claim_from_message
 from benchmarks.craft.dual_dag.gating import should_clarify
+from benchmarks.craft.dual_dag.runtime import DualDAGRuntime
 from benchmarks.craft.leakage_guard import LeakageGuard
 from benchmarks.craft.villager.villager_craft_agent import VillagerCraftDirectorGroup
 
@@ -117,6 +117,10 @@ class CraftEnvAdapter:
         public_messages = []
         builder_actions = []
         turns = []
+        dual_dag_runtime = DualDAGRuntime(
+            director_ids=self.config.get("villageragent", {}).get("director_ids", ["D1", "D2", "D3"]),
+            config=self.config,
+        )
         for turn_index in range(1, self.config["run"]["turns"] + 1):
             game_state.increment_turn()
             private_views = _make_private_views(sample)
@@ -127,6 +131,7 @@ class CraftEnvAdapter:
                 visible_constructed_structure=copy.deepcopy(game_state.current_structure),
                 progress_summary=_safe_progress_summary(game_state),
             )
+            dual_dag_runtime.update_public_state(turn_index=turn_index, public_state=public_state)
             outputs = director_group.controller.step(
                 private_views=private_views,
                 public_state=public_state,
@@ -136,7 +141,7 @@ class CraftEnvAdapter:
                 for output in outputs
             }
             epistemic_claims = {
-                director_id: reported_claim_from_message(
+                director_id: dual_dag_runtime.add_reported_claim(
                     director_id=director_id,
                     turn_index=turn_index,
                     message=message,
@@ -144,6 +149,14 @@ class CraftEnvAdapter:
                 for director_id, message in messages.items()
                 if message.strip()
             }
+            for output in outputs:
+                private_view = private_views.get(output.director_id)
+                if private_view is not None:
+                    dual_dag_runtime.update_private_observation(
+                        director_id=output.director_id,
+                        turn_index=turn_index,
+                        private_view=private_view,
+                    )
             director_metadata = {
                 output.director_id: _safe_turn_metadata(output.metadata)
                 for output in outputs
@@ -184,6 +197,10 @@ class CraftEnvAdapter:
                 epistemic_claims=epistemic_claims,
                 turn_index=turn_index,
             )
+            dual_dag_runtime.add_action_candidates(
+                turn_index=turn_index,
+                candidates=(builder_action.get("_action_candidate_metadata", {}) or {}).get("candidates", []),
+            )
             builder_actions.append(builder_action)
             move_executed = False
             progress = _safe_progress_summary(game_state)
@@ -191,6 +208,7 @@ class CraftEnvAdapter:
                 success, progress_data, *_ = game_state.execute_move(builder_action)
                 move_executed = bool(success)
                 progress = progress_data
+            dual_dag_runtime.add_public_builder_action(turn_index=turn_index, action=builder_action)
 
             turns.append({
                 "structure_id": structure_index,
@@ -201,6 +219,7 @@ class CraftEnvAdapter:
                 "builder_action": builder_action,
                 "move_executed": move_executed,
                 "progress": progress,
+                "dual_dag_snapshot": dual_dag_runtime.snapshot_summary(),
                 "leakage_check": {
                     "passed": all(report["passed"] for report in leakage_reports),
                     "violations": [v for r in leakage_reports for v in r["violations"]],
@@ -214,6 +233,7 @@ class CraftEnvAdapter:
             "completed": game_state.is_complete(),
             "final_progress": _extract_progress(_safe_progress_summary(game_state)),
             "turns": turns,
+            "dual_dag": dual_dag_runtime.serialized_snapshot(),
             "leakage_passed": True,
             "leakage_report": {"checks": leakage_guard.reports},
         }

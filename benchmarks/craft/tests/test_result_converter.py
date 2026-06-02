@@ -181,3 +181,39 @@ def test_result_converter_counts_gated_clarification_metadata(tmp_path):
     assert summary["runtime"]["low_confidence_gate_count"] == 1
     assert summary["runtime"]["conflict_gate_count"] == 1
     assert "gated_clarification_count" in metrics_text
+
+
+def test_result_converter_writes_dual_dag_artifacts(tmp_path):
+    config = {
+        "run": {"name": "test", "seed": 3, "structures": [0], "turns": 1},
+        "models": {"director": {"model": "d"}, "builder": {"model": "b"}},
+        "villageragent": {"enabled": True},
+    }
+    normalize_results(
+        config=config,
+        condition="villageragent_directors",
+        raw_result={
+            "structure_id": 0,
+            "turns": [],
+            "dual_dag": {
+                "summary": {"epistemic_node_count": 1},
+                "epistemic_nodes": [{"node_id": "claim:D1:1", "node_type": "reported_claim"}],
+                "epistemic_edges": [],
+                "action_nodes": [{"node_id": "action:1:0"}],
+                "action_edges": [{"source_id": "claim:D1:1", "target_id": "action:1:0"}],
+            },
+            "final_progress": 0.0,
+            "completed": False,
+        },
+        output_dir=tmp_path,
+    )
+
+    summary = json.loads((tmp_path / "normalized" / "summary.json").read_text())
+    dag_summary = json.loads((tmp_path / "normalized" / "dual_dag_summary.json").read_text())
+    nodes_text = (tmp_path / "normalized" / "dual_dag_nodes.jsonl").read_text()
+    edges_text = (tmp_path / "normalized" / "dual_dag_edges.jsonl").read_text()
+    assert summary["runtime"]["dual_dag_node_count"] == 2
+    assert summary["runtime"]["dual_dag_edge_count"] == 1
+    assert dag_summary["node_count"] == 2
+    assert "claim:D1:1" in nodes_text
+    assert "action:1:0" in edges_text

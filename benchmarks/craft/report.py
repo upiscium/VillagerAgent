@@ -38,6 +38,8 @@ REPORT_FIELDS = [
     "mean_risk_score",
     "low_confidence_gate_count",
     "conflict_gate_count",
+    "dual_dag_node_count",
+    "dual_dag_edge_count",
     "baseline_type",
     "use_task_decomposer",
     "use_agent_controller",
@@ -146,6 +148,14 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
         "conflict_gate_count": runtime.get(
             "conflict_gate_count",
             _sum_metric_rows(metrics_rows, "conflict_gate_count"),
+        ),
+        "dual_dag_node_count": runtime.get(
+            "dual_dag_node_count",
+            _sum_metric_rows(metrics_rows, "dual_dag_node_count"),
+        ),
+        "dual_dag_edge_count": runtime.get(
+            "dual_dag_edge_count",
+            _sum_metric_rows(metrics_rows, "dual_dag_edge_count"),
         ),
         "baseline_type": runtime.get("baseline_type", _baseline_type(condition)),
         "use_task_decomposer": summary.get("villageragent", {}).get("use_task_decomposer", False),

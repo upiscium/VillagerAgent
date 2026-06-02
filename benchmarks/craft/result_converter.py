@@ -25,6 +25,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
     epistemic_counts = _epistemic_counts(turns)
     action_candidate_metrics = _action_candidate_metrics(turns)
     clarification_metrics = _clarification_metrics(turns)
+    dual_dag_metrics = _dual_dag_metrics(games)
     summary = {
         "benchmark": "CRAFT",
         "condition": condition,
@@ -52,6 +53,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
             **epistemic_counts,
             **action_candidate_metrics,
             **clarification_metrics,
+            **dual_dag_metrics,
         },
         "villageragent": {
             "enabled": config.get("villageragent", {}).get("enabled", False),
@@ -103,6 +105,8 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
         "mean_risk_score",
         "low_confidence_gate_count",
         "conflict_gate_count",
+        "dual_dag_node_count",
+        "dual_dag_edge_count",
         "baseline_type",
         "use_task_decomposer",
         "use_agent_controller",
@@ -116,6 +120,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
             game_epistemic_counts = _epistemic_counts(game.get("turns", []))
             game_action_candidate_metrics = _action_candidate_metrics(game.get("turns", []))
             game_clarification_metrics = _clarification_metrics(game.get("turns", []))
+            game_dual_dag_metrics = _dual_dag_metrics([game])
             writer.writerow({
                 "run_name": config["run"]["name"],
                 "condition": condition,
@@ -149,6 +154,8 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
                 "mean_risk_score": game_clarification_metrics["mean_risk_score"],
                 "low_confidence_gate_count": game_clarification_metrics["low_confidence_gate_count"],
                 "conflict_gate_count": game_clarification_metrics["conflict_gate_count"],
+                "dual_dag_node_count": game_dual_dag_metrics["dual_dag_node_count"],
+                "dual_dag_edge_count": game_dual_dag_metrics["dual_dag_edge_count"],
                 "baseline_type": _baseline_type(condition),
                 "use_task_decomposer": config.get("villageragent", {}).get("use_task_decomposer", False),
                 "use_agent_controller": config.get("villageragent", {}).get("use_agent_controller", False),
@@ -159,6 +166,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
     leakage_report = raw_result.get("leakage_report", {"checks": []})
     with (normalized_dir / "leakage_report.json").open("w", encoding="utf-8") as f:
         json.dump(leakage_report, f, ensure_ascii=False, indent=2)
+    _write_dual_dag_artifacts(normalized_dir=normalized_dir, games=games)
 
 
 def _active_directors(config: dict, condition: str) -> list[str]:
@@ -258,3 +266,46 @@ def _clarification_metrics(turns: list[dict]) -> dict:
         "low_confidence_gate_count": low_confidence_gate_count,
         "conflict_gate_count": conflict_gate_count,
     }
+
+
+def _dual_dag_metrics(games: list[dict]) -> dict:
+    node_count = 0
+    edge_count = 0
+    for game in games:
+        dual_dag = game.get("dual_dag", {})
+        node_count += len(dual_dag.get("epistemic_nodes", []))
+        node_count += len(dual_dag.get("action_nodes", []))
+        edge_count += len(dual_dag.get("epistemic_edges", []))
+        edge_count += len(dual_dag.get("action_edges", []))
+    return {
+        "dual_dag_node_count": node_count,
+        "dual_dag_edge_count": edge_count,
+    }
+
+
+def _write_dual_dag_artifacts(*, normalized_dir: Path, games: list[dict]) -> None:
+    summary = {
+        "game_count": len(games),
+        "node_count": 0,
+        "edge_count": 0,
+        "games": [],
+    }
+    nodes_path = normalized_dir / "dual_dag_nodes.jsonl"
+    edges_path = normalized_dir / "dual_dag_edges.jsonl"
+    with nodes_path.open("w", encoding="utf-8") as nodes_file, edges_path.open("w", encoding="utf-8") as edges_file:
+        for game in games:
+            dual_dag = game.get("dual_dag", {})
+            nodes = list(dual_dag.get("epistemic_nodes", [])) + list(dual_dag.get("action_nodes", []))
+            edges = list(dual_dag.get("epistemic_edges", [])) + list(dual_dag.get("action_edges", []))
+            summary["node_count"] += len(nodes)
+            summary["edge_count"] += len(edges)
+            summary["games"].append({
+                "structure_id": game.get("structure_id"),
+                "summary": dual_dag.get("summary", {}),
+            })
+            for node in nodes:
+                nodes_file.write(json.dumps({"structure_id": game.get("structure_id"), **node}, ensure_ascii=False) + "\n")
+            for edge in edges:
+                edges_file.write(json.dumps({"structure_id": game.get("structure_id"), **edge}, ensure_ascii=False) + "\n")
+    with (normalized_dir / "dual_dag_summary.json").open("w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
