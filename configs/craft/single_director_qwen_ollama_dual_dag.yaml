@@ -18,10 +18,10 @@ dual_dag:
   enabled: true
   gated_clarification:
     enabled: true
-    min_action_confidence: 0.65
+    min_action_confidence: 0.55
     max_conflict_count: 0
     clarify_on_large_block_span_uncertainty: true
-    clarification_cost: 0.15
+    clarification_cost: 0.4
     mistake_cost_weight: 1.0
 
 villageragent:

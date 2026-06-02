@@ -26,12 +26,32 @@ def test_gate_fires_on_low_confidence():
 
 def test_gate_fires_on_conflict_count():
     should_gate, metadata = should_clarify(
-        candidate_metadata={"chosen_confidence": 0.9, "claim_conflict_count": 1},
+        candidate_metadata={"chosen_confidence": 0.35, "claim_conflict_count": 1},
         config={"dual_dag": {"enabled": True, "gated_clarification": {"enabled": True}}},
     )
 
     assert should_gate is True
-    assert metadata["reason"] == "claim_conflict"
+    assert "claim_conflict" in metadata["reasons"]
+
+
+def test_gate_allows_weak_conflict_when_risk_is_below_cost():
+    should_gate, metadata = should_clarify(
+        candidate_metadata={"chosen_confidence": 0.7, "claim_conflict_count": 1},
+        config={"dual_dag": {"enabled": True, "gated_clarification": {"enabled": True}}},
+    )
+
+    assert should_gate is False
+    assert metadata["risk_exceeds_clarification_cost"] is False
+
+
+def test_gate_allows_medium_confidence_after_tuning():
+    should_gate, metadata = should_clarify(
+        candidate_metadata={"chosen_confidence": 0.6, "claim_conflict_count": 0},
+        config={"dual_dag": {"enabled": True, "gated_clarification": {"enabled": True}}},
+    )
+
+    assert should_gate is False
+    assert metadata["thresholds"]["min_action_confidence"] == 0.55
 
 
 def test_gate_fires_on_large_block_without_span():

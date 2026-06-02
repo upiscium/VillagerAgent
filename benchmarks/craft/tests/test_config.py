@@ -98,5 +98,7 @@ def test_dual_dag_qwen_configs_share_eval_axis():
         assert config["run"]["turns"] == baseline["run"]["turns"]
         assert config["dual_dag"]["enabled"] is True
         assert config["dual_dag"]["gated_clarification"]["enabled"] is True
+        assert config["dual_dag"]["gated_clarification"]["min_action_confidence"] == 0.55
+        assert config["dual_dag"]["gated_clarification"]["clarification_cost"] == 0.4
         assert config["models"]["director"]["provider"] == "ollama_native"
         assert config["models"]["builder"]["provider"] == "ollama_native"
