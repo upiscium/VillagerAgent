@@ -9,6 +9,7 @@ BLOCK_COLORS = {
     "r": "red",
 }
 COLOR_WORDS = set(BLOCK_COLORS.values())
+LOCATION_WORDS = {"bottom", "middle", "top", "left", "right"}
 
 
 @dataclass
@@ -94,7 +95,8 @@ def _candidate_from_action(
     reported_claims: dict[str, dict],
     physically_verified: bool,
 ) -> ActionCandidateNode:
-    support, conflict = _claim_support_conflict(action, reported_claims)
+    location_keywords = _action_location_keywords(action)
+    support, conflict = _claim_support_conflict(action, reported_claims, location_keywords)
     confidence = _bounded_confidence(0.5 + 0.15 * len(support) - 0.2 * len(conflict))
     if physically_verified:
         confidence = min(1.0, confidence + 0.1)
@@ -107,11 +109,18 @@ def _candidate_from_action(
         supported_by=support,
         conflicts_with=conflict,
         required_evidence=[],
-        metadata={"physically_verified": physically_verified},
+        metadata={
+            "physically_verified": physically_verified,
+            "location_keywords": sorted(location_keywords),
+        },
     )
 
 
-def _claim_support_conflict(action: dict, reported_claims: dict[str, dict]) -> tuple[list[str], list[str]]:
+def _claim_support_conflict(
+    action: dict,
+    reported_claims: dict[str, dict],
+    location_keywords: set[str],
+) -> tuple[list[str], list[str]]:
     supported_by = []
     conflicts_with = []
     action_color = _action_color(action)
@@ -122,13 +131,67 @@ def _claim_support_conflict(action: dict, reported_claims: dict[str, dict]) -> t
         claim_id = claim.get("node_id", "")
         if not claim_id:
             continue
-        if block in keywords or (action_color and action_color in keywords):
+        location_overlap = _location_overlap(keywords, location_keywords)
+        if (block in keywords or (action_color and action_color in keywords)) and location_overlap:
             supported_by.append(claim_id)
             continue
         claim_colors = keywords & COLOR_WORDS
-        if action_color and len(claim_colors) == 1 and action_color not in claim_colors:
+        claim_has_location = bool(keywords & LOCATION_WORDS)
+        if (
+            action_color
+            and len(claim_colors) == 1
+            and action_color not in claim_colors
+            and claim_has_location
+            and location_overlap
+        ):
             conflicts_with.append(claim_id)
     return supported_by, conflicts_with
+
+
+def _location_overlap(claim_keywords: set[str], action_location_keywords: set[str]) -> bool:
+    claim_location_keywords = claim_keywords & LOCATION_WORDS
+    if not claim_location_keywords:
+        return True
+    return bool(claim_location_keywords & action_location_keywords)
+
+
+def _action_location_keywords(action: dict) -> set[str]:
+    keywords = set()
+    for key in ("position", "span_to"):
+        coordinate = _parse_coordinate(action.get(key))
+        if coordinate is not None:
+            keywords.update(_coordinate_location_keywords(coordinate))
+    return keywords
+
+
+def _parse_coordinate(value) -> tuple[int, int] | None:
+    if not isinstance(value, str):
+        return None
+    parts = value.strip().strip("()").split(",")
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def _coordinate_location_keywords(coordinate: tuple[int, int]) -> set[str]:
+    x, y = coordinate
+    keywords = set()
+    if x == 0:
+        keywords.add("left")
+    elif x == 1:
+        keywords.add("middle")
+    elif x == 2:
+        keywords.add("right")
+    if y == 0:
+        keywords.add("bottom")
+    elif y == 1:
+        keywords.add("middle")
+    elif y == 2:
+        keywords.add("top")
+    return keywords
 
 
 def _action_color(action: dict) -> str | None:
