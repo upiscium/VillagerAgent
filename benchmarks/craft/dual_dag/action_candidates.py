@@ -96,7 +96,7 @@ def _candidate_from_action(
     physically_verified: bool,
 ) -> ActionCandidateNode:
     location_keywords = _action_location_keywords(action)
-    support, conflict = _claim_support_conflict(action, reported_claims, location_keywords)
+    support, conflict, required_evidence = _claim_support_conflict(action, reported_claims, location_keywords)
     confidence = _bounded_confidence(0.5 + 0.15 * len(support) - 0.2 * len(conflict))
     if physically_verified:
         confidence = min(1.0, confidence + 0.1)
@@ -108,7 +108,7 @@ def _candidate_from_action(
         confidence=confidence,
         supported_by=support,
         conflicts_with=conflict,
-        required_evidence=[],
+        required_evidence=required_evidence,
         metadata={
             "physically_verified": physically_verified,
             "location_keywords": sorted(location_keywords),
@@ -120,9 +120,10 @@ def _claim_support_conflict(
     action: dict,
     reported_claims: dict[str, dict],
     location_keywords: set[str],
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str]]:
     supported_by = []
     conflicts_with = []
+    required_evidence = []
     action_color = _action_color(action)
     block = action.get("block")
     for claim in reported_claims.values():
@@ -144,8 +145,11 @@ def _claim_support_conflict(
             and claim_has_location
             and location_overlap
         ):
+            if content.get("uncertain"):
+                required_evidence.append(claim_id)
+                continue
             conflicts_with.append(claim_id)
-    return supported_by, conflicts_with
+    return supported_by, conflicts_with, required_evidence
 
 
 def _location_overlap(claim_keywords: set[str], action_location_keywords: set[str]) -> bool:

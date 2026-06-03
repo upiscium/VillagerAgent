@@ -127,6 +127,7 @@ def reported_claim_from_message(
             "director_id": director_id,
             "message": message,
             "keywords": _message_keywords(message),
+            "uncertain": _message_has_uncertainty(message),
         },
         confidence=0.7 if message.strip() else 0.0,
         provenance=Provenance(
@@ -147,3 +148,16 @@ def _message_keywords(message: str) -> list[str]:
         "ys", "bs", "os", "gs", "rs", "yl", "bl", "ol", "gl", "rl",
     }
     return [word for word in words if word in keep]
+
+
+def _message_has_uncertainty(message: str) -> bool:
+    lowered = message.lower()
+    markers = (
+        "uncertain",
+        "cannot confirm",
+        "can't confirm",
+        "please confirm",
+        "not sure",
+        "unsure",
+    )
+    return any(marker in lowered for marker in markers)
