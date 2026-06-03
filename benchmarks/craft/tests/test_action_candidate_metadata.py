@@ -74,6 +74,27 @@ def test_candidate_ignores_color_only_conflict():
     assert candidates[0].conflicts_with == []
 
 
+def test_candidate_treats_uncertain_color_mismatch_as_required_evidence():
+    claims = {
+        "D3": {
+            "node_id": "claim:D3:2",
+            "content": {
+                "keywords": ["green", "bottom", "left"],
+                "uncertain": True,
+            },
+        },
+    }
+    candidates = action_candidates_from_moves(
+        moves=[{"action": "place", "block": "rs", "position": "(0,0)", "layer": 1, "span_to": None}],
+        reported_claims=claims,
+        turn_index=2,
+    )
+
+    assert candidates[0].conflicts_with == []
+    assert candidates[0].required_evidence == ["claim:D3:2"]
+    assert candidates[0].confidence == 0.6
+
+
 def test_candidate_support_requires_location_overlap_when_claim_has_location():
     claims = {
         "D1": {

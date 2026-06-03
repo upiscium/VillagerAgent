@@ -86,6 +86,16 @@ def test_reported_claim_preserves_source_and_raw_message():
     assert claim["provenance"]["visibility"] == "public"
 
 
+def test_reported_claim_marks_uncertainty_requests():
+    claim = reported_claim_from_message(
+        director_id="D3",
+        turn_index=2,
+        message="I am uncertain about the depth. Please confirm if this belongs to my wall.",
+    )
+
+    assert claim["content"]["uncertain"] is True
+
+
 def test_empty_reported_claim_has_zero_confidence():
     claim = reported_claim_from_message(
         director_id="D3",
