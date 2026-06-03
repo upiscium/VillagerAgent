@@ -146,6 +146,29 @@ def test_build_metadata_marks_builder_chosen_candidate():
     assert metadata["chosen_by"] == "builder_response"
     assert metadata["claim_support_count"] == 0
     assert metadata["claim_conflict_count"] == 0
+    assert metadata["claim_required_evidence_count"] == 0
+
+
+def test_build_metadata_counts_required_evidence_for_chosen_candidate():
+    action = {"action": "place", "block": "rs", "position": "(0,0)", "layer": 1, "span_to": None}
+    candidates = action_candidates_from_moves(
+        moves=[action],
+        reported_claims={
+            "D3": {
+                "node_id": "claim:D3:2",
+                "content": {"keywords": ["green", "bottom", "left"], "uncertain": True},
+            },
+        },
+        turn_index=2,
+    )
+
+    metadata = build_action_candidate_metadata(
+        candidates=candidates,
+        chosen_action=action,
+        chosen_by="builder_response",
+    )
+
+    assert metadata["claim_required_evidence_count"] == 1
 
 
 def test_build_metadata_marks_oracle_fallback_candidate():

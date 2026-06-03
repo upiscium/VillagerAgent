@@ -98,6 +98,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
         "mean_action_confidence",
         "claim_support_count",
         "claim_conflict_count",
+        "claim_required_evidence_count",
         "candidate_count",
         "clarification_count",
         "gated_clarification_count",
@@ -147,6 +148,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
                 "mean_action_confidence": game_action_candidate_metrics["mean_action_confidence"],
                 "claim_support_count": game_action_candidate_metrics["claim_support_count"],
                 "claim_conflict_count": game_action_candidate_metrics["claim_conflict_count"],
+                "claim_required_evidence_count": game_action_candidate_metrics["claim_required_evidence_count"],
                 "candidate_count": game_action_candidate_metrics["candidate_count"],
                 "clarification_count": game_clarification_metrics["clarification_count"],
                 "gated_clarification_count": game_clarification_metrics["gated_clarification_count"],
@@ -217,6 +219,7 @@ def _action_candidate_metrics(turns: list[dict]) -> dict:
     confidences = []
     claim_support_count = 0
     claim_conflict_count = 0
+    claim_required_evidence_count = 0
     candidate_count = 0
     for turn in turns:
         metadata = (turn.get("builder_action") or {}).get("_action_candidate_metadata", {})
@@ -225,6 +228,7 @@ def _action_candidate_metrics(turns: list[dict]) -> dict:
         candidate_count += int(metadata.get("candidate_count", 0) or 0)
         claim_support_count += int(metadata.get("claim_support_count", 0) or 0)
         claim_conflict_count += int(metadata.get("claim_conflict_count", 0) or 0)
+        claim_required_evidence_count += int(metadata.get("claim_required_evidence_count", 0) or 0)
         confidence = metadata.get("chosen_confidence")
         if confidence is not None:
             confidences.append(float(confidence))
@@ -232,6 +236,7 @@ def _action_candidate_metrics(turns: list[dict]) -> dict:
         "mean_action_confidence": sum(confidences) / len(confidences) if confidences else 0.0,
         "claim_support_count": claim_support_count,
         "claim_conflict_count": claim_conflict_count,
+        "claim_required_evidence_count": claim_required_evidence_count,
         "candidate_count": candidate_count,
     }
 

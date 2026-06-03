@@ -31,6 +31,7 @@ REPORT_FIELDS = [
     "mean_action_confidence",
     "claim_support_count",
     "claim_conflict_count",
+    "claim_required_evidence_count",
     "candidate_count",
     "clarification_count",
     "gated_clarification_count",
@@ -120,6 +121,10 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
         "claim_conflict_count": runtime.get(
             "claim_conflict_count",
             _sum_metric_rows(metrics_rows, "claim_conflict_count"),
+        ),
+        "claim_required_evidence_count": runtime.get(
+            "claim_required_evidence_count",
+            _sum_metric_rows(metrics_rows, "claim_required_evidence_count"),
         ),
         "candidate_count": runtime.get(
             "candidate_count",

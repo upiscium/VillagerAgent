@@ -130,6 +130,7 @@ def test_result_converter_counts_action_candidate_metadata(tmp_path):
                         "chosen_confidence": 0.75,
                         "claim_support_count": 1,
                         "claim_conflict_count": 1,
+                        "claim_required_evidence_count": 1,
                     },
                 },
             }],
@@ -143,6 +144,7 @@ def test_result_converter_counts_action_candidate_metadata(tmp_path):
     assert summary["runtime"]["mean_action_confidence"] == 0.75
     assert summary["runtime"]["claim_support_count"] == 1
     assert summary["runtime"]["claim_conflict_count"] == 1
+    assert summary["runtime"]["claim_required_evidence_count"] == 1
     assert summary["runtime"]["candidate_count"] == 2
     assert "mean_action_confidence" in metrics_text
 

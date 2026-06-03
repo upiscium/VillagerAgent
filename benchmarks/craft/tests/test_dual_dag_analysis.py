@@ -24,8 +24,10 @@ def test_dual_dag_analysis_summarizes_claim_edges_and_turns(tmp_path):
     assert analysis["director_claim_counts"] == {"D1": 1, "D2": 1}
     assert analysis["director_support_counts"] == {"D1": 1}
     assert analysis["director_conflict_counts"] == {"D2": 1}
+    assert analysis["director_required_evidence_counts"] == {"D2": 1}
     assert analysis["supported_action_count"] == 1
     assert analysis["conflicted_action_count"] == 1
+    assert analysis["required_evidence_action_count"] == 1
     assert analysis["gated_clarification_count"] == 1
     assert analysis["builder_fallback_count"] == 1
     assert analysis["turns"][0]["gate_reasons"] == "claim_conflict"
@@ -44,6 +46,7 @@ def test_dual_dag_analysis_writes_json_and_turn_csv(tmp_path):
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         rows = list(csv.DictReader(f))
     assert rows[0]["chosen_candidate_id"] == "action:1:0"
+    assert rows[0]["claim_required_evidence_count"] == "1"
     assert rows[0]["gated_clarification"] == "True"
 
 
@@ -89,7 +92,7 @@ def _write_normalized_run(tmp_path, run_name):
                 "node_type": "reported_claim",
                 "content": {"director_id": "D2"},
             },
-            {"node_id": "action:1:0", "node_type": "place_block"},
+            {"node_id": "action:1:0", "node_type": "place_block", "required_evidence": ["claim:D2:1"]},
         ],
     )
     _write_jsonl(
@@ -114,6 +117,7 @@ def _write_normalized_run(tmp_path, run_name):
                         "chosen_confidence": 0.5,
                         "claim_support_count": 1,
                         "claim_conflict_count": 1,
+                        "claim_required_evidence_count": 1,
                     },
                 },
                 "move_executed": False,
