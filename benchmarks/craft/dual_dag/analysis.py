@@ -17,6 +17,7 @@ TURN_FIELDNAMES = [
     "chosen_confidence",
     "claim_support_count",
     "claim_conflict_count",
+    "claim_required_evidence_count",
     "gated_clarification",
     "gate_reasons",
     "builder_fallback",
@@ -51,8 +52,10 @@ def analyze_run(run_name: str, *, result_root: Path) -> dict:
     )
     director_support_counts: Counter[str] = Counter()
     director_conflict_counts: Counter[str] = Counter()
+    director_required_evidence_counts: Counter[str] = Counter()
     action_support_counts: Counter[str] = Counter()
     action_conflict_counts: Counter[str] = Counter()
+    action_required_evidence_counts: Counter[str] = Counter()
     for edge in edges:
         claim = claims_by_id.get(edge.get("source_id"), {})
         director_id = (claim.get("content") or {}).get("director_id", "unknown")
@@ -63,6 +66,16 @@ def analyze_run(run_name: str, *, result_root: Path) -> dict:
         if edge.get("edge_type") == "conflicts_with":
             director_conflict_counts[director_id] += 1
             action_conflict_counts[target_id] += 1
+    for node in nodes:
+        required_evidence = node.get("required_evidence", [])
+        if not required_evidence:
+            continue
+        action_id = node.get("node_id", "")
+        action_required_evidence_counts[action_id] += len(required_evidence)
+        for claim_id in required_evidence:
+            claim = claims_by_id.get(claim_id, {})
+            director_id = (claim.get("content") or {}).get("director_id", "unknown")
+            director_required_evidence_counts[director_id] += 1
 
     turn_rows = [_turn_row(run_name, summary, turn) for turn in turns]
     confidences = [
@@ -80,8 +93,10 @@ def analyze_run(run_name: str, *, result_root: Path) -> dict:
         "director_claim_counts": dict(director_claim_counts),
         "director_support_counts": dict(director_support_counts),
         "director_conflict_counts": dict(director_conflict_counts),
+        "director_required_evidence_counts": dict(director_required_evidence_counts),
         "supported_action_count": sum(1 for count in action_support_counts.values() if count > 0),
         "conflicted_action_count": sum(1 for count in action_conflict_counts.values() if count > 0),
+        "required_evidence_action_count": sum(1 for count in action_required_evidence_counts.values() if count > 0),
         "mean_action_confidence": sum(confidences) / len(confidences) if confidences else 0.0,
         "gated_clarification_count": sum(1 for row in turn_rows if row["gated_clarification"]),
         "builder_fallback_count": sum(1 for row in turn_rows if row["builder_fallback"]),
@@ -153,6 +168,7 @@ def _turn_row(run_name: str, summary: dict, turn: dict) -> dict:
         "chosen_confidence": metadata.get("chosen_confidence", ""),
         "claim_support_count": metadata.get("claim_support_count", 0),
         "claim_conflict_count": metadata.get("claim_conflict_count", 0),
+        "claim_required_evidence_count": metadata.get("claim_required_evidence_count", 0),
         "gated_clarification": bool(gate),
         "gate_reasons": ",".join(gate.get("reasons", [])),
         "builder_fallback": bool(action.get("_builder_fallback")),

@@ -46,6 +46,7 @@ def test_report_aggregates_multiple_runs(tmp_path):
     assert rows[1]["builder_fallback_rate"] == 1.0
     assert rows[1]["mean_action_confidence"] == 0.6
     assert rows[1]["claim_support_count"] == 2
+    assert rows[1]["claim_required_evidence_count"] == 3
     assert rows[1]["gated_clarification_count"] == 1
     assert rows[1]["mean_risk_score"] == 0.4
 
@@ -100,6 +101,7 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "leakage_passed",
                 "mean_action_confidence",
                 "claim_support_count",
+                "claim_required_evidence_count",
                 "gated_clarification_count",
                 "mean_risk_score",
             ],
@@ -110,6 +112,7 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "leakage_passed": value,
                 "mean_action_confidence": "0.6",
                 "claim_support_count": "2",
+                "claim_required_evidence_count": "3",
                 "gated_clarification_count": "1",
                 "mean_risk_score": "0.4",
             })

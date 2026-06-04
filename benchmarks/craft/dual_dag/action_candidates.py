@@ -83,6 +83,7 @@ def build_action_candidate_metadata(
         "chosen_confidence": chosen.confidence,
         "claim_support_count": len(chosen.supported_by),
         "claim_conflict_count": len(chosen.conflicts_with),
+        "claim_required_evidence_count": len(chosen.required_evidence),
         "candidates": [candidate.to_dict() for candidate in candidates],
     }
 
