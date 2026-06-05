@@ -97,3 +97,50 @@ def test_clarify_action_not_applied_when_gate_disabled():
     action = {"action": "place", "_action_candidate_metadata": {"chosen_confidence": 0.1}}
 
     assert _apply_clarification_gate(action, {}) is action
+
+
+def test_gate_fires_on_conflict_only_when_risk_exceeds_clarification_cost():
+    should_gate, metadata = should_clarify(
+        candidate_metadata={"chosen_confidence": 0.5, "claim_conflict_count": 1},
+        config={
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {
+                    "enabled": True,
+                    "min_action_confidence": 0.4,
+                    "max_conflict_count": 0,
+                    "clarification_cost": 0.2,
+                },
+            }
+        },
+    )
+
+    assert should_gate is True
+    assert metadata["reason"] == "claim_conflict"
+    assert metadata["risk_score"] == 0.5
+
+
+def test_gate_ignores_large_block_span_when_configured_off():
+    should_gate, metadata = should_clarify(
+        candidate_metadata={
+            "chosen_candidate_id": "action:1:0",
+            "chosen_confidence": 0.9,
+            "claim_conflict_count": 0,
+            "candidates": [{
+                "node_id": "action:1:0",
+                "action": {"action": "place", "block": "yl", "position": "(0,0)", "layer": 0},
+            }],
+        },
+        config={
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {
+                    "enabled": True,
+                    "clarify_on_large_block_span_uncertainty": False,
+                },
+            }
+        },
+    )
+
+    assert should_gate is False
+    assert metadata["reason"] == "none"
