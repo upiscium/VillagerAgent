@@ -121,6 +121,84 @@ python -m benchmarks.craft.report \
 
 The comparison report includes run condition, number of games, turns, final progress, completion rate, models, providers, active Directors, Builder fallback rate, VillagerAgent component flags, baseline type, and leakage status.
 
+## Final Qwen Dual-DAG Evaluation
+
+The current paper-facing CRAFT evaluation uses `configs/craft/experiments/qwen_dual_dag_v1.yaml`. It runs four comparable conditions over the configured seed, structures, and turn budget:
+
+- qwen/Ollama 3-Director VillagerAgent Directors
+- qwen/Ollama 3-Director VillagerAgent Directors with Dual-DAG gated clarification
+- qwen/Ollama D1-only single-Director ablation with Dual-DAG enabled
+- comparable official baseline artifact
+
+Run the final evaluation with a suffix so artifacts do not overwrite earlier exploratory runs:
+
+```bash
+python -m benchmarks.craft.experiment \
+  --config configs/craft/experiments/qwen_dual_dag_v1.yaml \
+  --run-name-suffix _final
+```
+
+This writes the comparison report to:
+
+```text
+result/craft/comparison_qwen_dual_dag_v1_final.csv
+result/craft/comparison_qwen_dual_dag_v1_final.json
+```
+
+After the experiment completes, generate aggregate Dual-DAG analysis artifacts:
+
+```bash
+python -m benchmarks.craft.dual_dag.analysis \
+  --runs \
+    craft_eval_qwen_ollama_final \
+    craft_eval_qwen_ollama_dual_dag_final \
+    craft_single_director_qwen_ollama_dual_dag_final \
+    craft_official_baseline_final \
+  --output result/craft/dual_dag_analysis_qwen_dual_dag_v1_final.json \
+  --turn-csv-output result/craft/dual_dag_turns_qwen_dual_dag_v1_final.csv
+```
+
+Then generate the compact summary table used for quick interpretation:
+
+```bash
+python -m benchmarks.craft.experiment_summary \
+  --runs \
+    craft_eval_qwen_ollama_final \
+    craft_eval_qwen_ollama_dual_dag_final \
+    craft_single_director_qwen_ollama_dual_dag_final \
+    craft_official_baseline_final \
+  --analysis-input result/craft/dual_dag_analysis_qwen_dual_dag_v1_final.json \
+  --output result/craft/experiment_summary_qwen_dual_dag_v1_final.csv \
+  --json-output result/craft/experiment_summary_qwen_dual_dag_v1_final.json
+```
+
+The compact summary table is the easiest artifact to inspect first. Read it as follows:
+
+- `mean_final_progress` and `completion_rate` summarize task outcome.
+- `builder_fallback_rate` indicates how often Builder output had to be replaced with a verified fallback candidate.
+- `gated_clarification_rate` indicates how often the Dual-DAG gate intervened with `CLARIFY`.
+- `claim_support_count`, `claim_conflict_count`, and `claim_required_evidence_count` summarize Director coordination evidence for chosen actions.
+- `dual_dag_node_count` and `dual_dag_edge_count` show runtime graph size.
+- `supported_action_count`, `conflicted_action_count`, and `required_evidence_action_count` summarize action-level graph evidence.
+- `leakage_passed` must remain true for partial-information-safe runs.
+
+For the latest verified `_final` run, the generated compact summary was:
+
+```text
+run_name,mean_final_progress,builder_fallback_rate,gated_clarification_rate,claim_support_count,claim_conflict_count,claim_required_evidence_count,dual_dag_node_count,dual_dag_edge_count,leakage_passed
+craft_eval_qwen_ollama_final,0.2384219001610306,0.5333333333333333,0.0,29,0,3,510,29,True
+craft_eval_qwen_ollama_dual_dag_final,0.2384219001610306,0.5333333333333333,0.0,36,0,1,510,36,True
+craft_single_director_qwen_ollama_dual_dag_final,0.2384219001610306,0.13333333333333333,0.0,10,0,1,480,10,True
+craft_official_baseline_final,0.0,0.0,0.0,0,0,0,0,0,True
+```
+
+Interpretation notes:
+
+- The 3-Director Dual-DAG run matched the non-gated 3-Director progress while increasing support evidence and reducing required-evidence count.
+- The single-Director ablation reached the same progress on this small final slice, but with much less support evidence.
+- The official baseline row is a comparable artifact baseline, not a full official CRAFT API runner.
+- `leakage_passed=True` confirms that the prompt/artifact partial-information checks passed for all rows.
+
 ## Partial-Information Guard
 
 The adapter separates each Director's private state from public coordination state. Director prompts may include only:
