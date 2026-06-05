@@ -160,3 +160,90 @@ def test_controller_attaches_epistemic_metadata_to_active_and_inactive_directors
     assert len(metadata["D1"]["epistemic"]["observed_facts"]) == 1
     assert metadata["D2"]["epistemic"] == empty_epistemic_metadata()
     assert metadata["D3"]["epistemic"] == empty_epistemic_metadata()
+
+
+def test_observed_facts_skip_empty_cells_and_include_complete_provenance():
+    private_view = CraftPrivateView(
+        director_id="D1",
+        view_name="front",
+        raw_view={"target_structure": "must not be copied"},
+        text_view="bottom left yellow small; top right blue large",
+        structured_view={
+            "row_0": [{"color": "yellow", "size": 1}, {}, None],
+            "row_2": [{}, {}, {"color": "blue", "size": 2}],
+        },
+    )
+
+    facts = observed_facts_from_private_view(
+        director_id="D1",
+        turn_index=3,
+        private_view=private_view,
+    )
+
+    assert len(facts) == 2
+    first = facts[0].to_dict()
+    assert first["node_id"] == "observed:D1:3:row_0:0"
+    assert first["content"] == {
+        "director_id": "D1",
+        "row": "row_0",
+        "column": 0,
+        "relative_vertical": "bottom",
+        "relative_horizontal": "left",
+        "color": "yellow",
+        "size": 1,
+        "size_label": "small",
+    }
+    assert first["provenance"] == {
+        "source": "private_view",
+        "director_id": "D1",
+        "turn_index": 3,
+        "visibility": "private",
+    }
+    assert "target_structure" not in str(first)
+
+
+def test_public_facts_strip_oracle_prefixed_builder_metadata():
+    public_state = CraftPublicState(
+        turn_index=2,
+        public_messages=[],
+        builder_actions=[{
+            "action": "place",
+            "block": "ys",
+            "position": "(0,0)",
+            "layer": 0,
+            "_oracle_moves": [{"hidden": True}],
+        }],
+        visible_constructed_structure={},
+        progress_summary={"current": 0.25},
+    )
+
+    facts = public_facts_from_state(turn_index=2, public_state=public_state)
+    fact = facts[0].to_dict()
+
+    assert fact["node_id"] == "public:builder_action:2:0"
+    assert fact["content"]["builder_action"] == {
+        "action": "place",
+        "block": "ys",
+        "position": "(0,0)",
+        "layer": 0,
+    }
+    assert "_oracle_moves" not in fact["content"]["builder_action"]
+
+
+def test_reported_claim_keeps_keyword_order_uncertainty_and_provenance():
+    claim = reported_claim_from_message(
+        director_id="D2",
+        turn_index=4,
+        message="Bottom left should be yellow small, but I am not sure.",
+    )
+
+    assert claim["content"]["message"] == "Bottom left should be yellow small, but I am not sure."
+    assert claim["content"]["keywords"] == ["bottom", "left", "yellow", "small"]
+    assert claim["content"]["uncertain"] is True
+    assert claim["confidence"] == 0.7
+    assert claim["provenance"] == {
+        "source": "director_message",
+        "director_id": "D2",
+        "turn_index": 4,
+        "visibility": "public",
+    }
