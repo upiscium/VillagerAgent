@@ -106,6 +106,8 @@ Runs write to `result/craft/{run_name}/`:
 - `normalized/leakage_report.json`
 - `logs/run.log`
 
+See [`METRICS.md`](METRICS.md) for the meaning of normalized metrics, comparison report columns, Dual-DAG analysis fields, and compact experiment summary columns.
+
 ## Compare Runs
 
 Use `benchmarks.craft.report` to summarize one or more normalized CRAFT runs:
