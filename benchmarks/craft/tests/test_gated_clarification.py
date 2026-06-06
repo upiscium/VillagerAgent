@@ -1,5 +1,11 @@
-from benchmarks.craft.craft_env_adapter import _apply_clarification_gate
+from benchmarks.craft.craft_env_adapter import (
+    _apply_clarification_gate,
+    _prioritize_supported_candidates,
+    _runtime_decision_support,
+)
+from benchmarks.craft.dual_dag.action_candidates import action_candidates_from_moves
 from benchmarks.craft.dual_dag.gating import should_clarify
+from benchmarks.craft.dual_dag.runtime import DualDAGRuntime
 
 
 def test_gate_does_not_fire_when_dual_dag_disabled():
@@ -144,3 +150,45 @@ def test_gate_ignores_large_block_span_when_configured_off():
 
     assert should_gate is False
     assert metadata["reason"] == "none"
+
+
+def test_runtime_decision_support_is_config_gated():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    candidates = [{"node_id": "action:1:0", "action": {"action": "place"}, "confidence": 0.8}]
+
+    assert _runtime_decision_support(
+        runtime=runtime,
+        candidates=candidates,
+        config={"dual_dag": {"enabled": True, "runtime_decision_support": {"enabled": False}}},
+        turn_index=1,
+    ) == {}
+
+    support = _runtime_decision_support(
+        runtime=runtime,
+        candidates=candidates,
+        config={"dual_dag": {"enabled": True, "runtime_decision_support": {"enabled": True}}},
+        turn_index=1,
+    )
+
+    assert support["recommended_candidate_id"] == "action:1:0"
+
+
+def test_runtime_decision_support_prioritizes_recommended_oracle_candidate():
+    oracle_moves = [
+        {"action": "place", "block": "bs", "position": "(0,0)", "layer": 0, "span_to": None},
+        {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0, "span_to": None},
+    ]
+    action_candidates = action_candidates_from_moves(
+        moves=oracle_moves,
+        reported_claims={},
+        turn_index=1,
+    )
+
+    prioritized_moves, prioritized_candidates = _prioritize_supported_candidates(
+        oracle_moves=oracle_moves,
+        action_candidates=action_candidates,
+        decision_support={"recommended_candidate_id": "action:1:1"},
+    )
+
+    assert prioritized_moves[0]["block"] == "ys"
+    assert prioritized_candidates[0].node_id == "action:1:1"

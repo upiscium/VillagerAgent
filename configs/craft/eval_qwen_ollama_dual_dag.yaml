@@ -16,6 +16,8 @@ craft:
 
 dual_dag:
   enabled: true
+  runtime_decision_support:
+    enabled: true
   gated_clarification:
     enabled: true
     min_action_confidence: 0.55

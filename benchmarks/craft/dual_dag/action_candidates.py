@@ -66,6 +66,7 @@ def build_action_candidate_metadata(
     candidates: list[ActionCandidateNode],
     chosen_action: dict,
     chosen_by: str,
+    decision_support: dict | None = None,
 ) -> dict:
     chosen = _find_matching_candidate(candidates, chosen_action)
     if chosen is None and candidates:
@@ -76,7 +77,7 @@ def build_action_candidate_metadata(
             reported_claims={},
             turn_index=0,
         )
-    return {
+    metadata = {
         "candidate_count": len(candidates),
         "chosen_candidate_id": chosen.node_id,
         "chosen_by": chosen_by,
@@ -86,6 +87,9 @@ def build_action_candidate_metadata(
         "claim_required_evidence_count": len(chosen.required_evidence),
         "candidates": [candidate.to_dict() for candidate in candidates],
     }
+    if decision_support:
+        metadata["decision_support"] = decision_support
+    return metadata
 
 
 def _candidate_from_action(
