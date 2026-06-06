@@ -43,6 +43,92 @@ def filter_emoji_from_dict(obj):
         return obj
 
 
+def _short_diagnostic_value(value, max_length=500):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except TypeError:
+            text = str(value)
+    text = filter_emoji(text).replace("\n", " ").strip()
+    if len(text) > max_length:
+        return text[:max_length] + "..."
+    return text
+
+
+def _summarize_intermediate_step(step):
+    action = step[0] if isinstance(step, (list, tuple)) and len(step) > 0 else step
+    feedback = step[1] if isinstance(step, (list, tuple)) and len(step) > 1 else None
+    kwargs = action.get("kwargs", {}) if isinstance(action, dict) else {}
+    return {
+        "tool": kwargs.get("tool"),
+        "tool_input": kwargs.get("tool_input"),
+        "log": _short_diagnostic_value(kwargs.get("log"), max_length=200),
+        "feedback": _short_diagnostic_value(feedback, max_length=200),
+    }
+
+
+def _log_action_diagnostics(agent_name, call_site, response, action_list, llmhandler):
+    intermediate_steps = response.get("intermediate_steps", []) if isinstance(response, dict) else []
+    final_answer = response.get("output", "") if isinstance(response, dict) else ""
+    response_keys = sorted(response.keys()) if isinstance(response, dict) else []
+    last_llm_output = llmhandler.llm_out[-1] if getattr(llmhandler, "llm_out", []) else ""
+
+    if action_list:
+        action_names = []
+        for action in action_list:
+            action_kwargs = action.get("action", {}) if isinstance(action, dict) else {}
+            action_kwargs = action_kwargs if isinstance(action_kwargs, dict) else {}
+            action_names.append(action_kwargs.get("tool") or action_kwargs.get("action") or "unknown")
+        logging.info(
+            "Minecraft action diagnostics: agent=%s call_site=%s parsed_actions=%d intermediate_steps=%d actions=%s",
+            agent_name,
+            call_site,
+            len(action_list),
+            len(intermediate_steps),
+            action_names,
+        )
+        return
+
+    step_summaries = [_summarize_intermediate_step(step) for step in intermediate_steps]
+    if intermediate_steps:
+        logging.warning(
+            "Minecraft action diagnostics: agent=%s call_site=%s tool-call parsing failure; "
+            "intermediate_steps=%d parsed_actions=0 response_keys=%s steps=%s final_answer=%s",
+            agent_name,
+            call_site,
+            len(intermediate_steps),
+            response_keys,
+            step_summaries,
+            _short_diagnostic_value(final_answer),
+        )
+        return
+
+    if _short_diagnostic_value(final_answer):
+        logging.warning(
+            "Minecraft action diagnostics: agent=%s call_site=%s thought-only response; "
+            "intermediate_steps=0 parsed_actions=0 response_keys=%s final_answer=%s last_llm_output=%s",
+            agent_name,
+            call_site,
+            response_keys,
+            _short_diagnostic_value(final_answer),
+            _short_diagnostic_value(last_llm_output),
+        )
+        return
+
+    logging.warning(
+        "Minecraft action diagnostics: agent=%s call_site=%s tool-call failure; "
+        "intermediate_steps=0 parsed_actions=0 response_keys=%s final_answer_empty=true last_llm_output=%s",
+        agent_name,
+        call_site,
+        response_keys,
+        _short_diagnostic_value(last_llm_output),
+    )
+
+
 def timeit(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -1016,6 +1102,7 @@ class Agent():
         response = json.loads(dumps(response, pretty=True))
         for step in response["intermediate_steps"]:
             action_list.append({"action": step[0]["kwargs"], "feedback": step[1]})
+        _log_action_diagnostics(self.name, "step", response, action_list, llmhandler)
         
         if len(action_list) == 0:
             return (None, None), {"input": f"Your name is {self.name}.\n{instruction}", "action_list": [],
@@ -1138,6 +1225,7 @@ class Agent():
         response = json.loads(dumps(response, pretty=True))
         for step in response["intermediate_steps"]:
             action_list.append({"action": step[0]["kwargs"], "feedback": step[1]})
+        _log_action_diagnostics(self.name, "run", response, action_list, llmhandler)
         final_answer = response["output"]
         # save the action_list and final_answer
 
