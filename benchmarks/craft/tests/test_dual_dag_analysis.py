@@ -30,6 +30,13 @@ def test_dual_dag_analysis_summarizes_claim_edges_and_turns(tmp_path):
     assert analysis["required_evidence_action_count"] == 1
     assert analysis["gated_clarification_count"] == 1
     assert analysis["builder_fallback_count"] == 1
+    assert analysis["artifact_health"]["passed"] is True
+    assert analysis["artifact_health"]["action_candidate_metadata_turn_count"] == 1
+    assert analysis["failure_modes"]["fallback"]["count"] == 1
+    assert analysis["failure_modes"]["conflict"]["count"] == 1
+    assert analysis["failure_modes"]["required_evidence"]["count"] == 1
+    assert analysis["failure_modes"]["clarification"]["count"] == 1
+    assert analysis["failure_modes"]["gated_clarification"]["count"] == 1
     assert analysis["turns"][0]["gate_reasons"] == "claim_conflict"
 
 
@@ -66,6 +73,31 @@ def test_dual_dag_analysis_writes_multi_run_turn_csv(tmp_path):
 def test_dual_dag_analysis_rejects_missing_artifacts(tmp_path):
     with pytest.raises(DualDAGAnalysisError, match="Missing CRAFT Dual-DAG artifact"):
         analyze_run("missing", result_root=tmp_path)
+
+
+def test_dual_dag_analysis_reports_hidden_state_key_hits(tmp_path):
+    _write_normalized_run(tmp_path, "leaky_run")
+    turns_path = tmp_path / "leaky_run" / "normalized" / "turns.jsonl"
+    _write_jsonl(
+        turns_path,
+        [
+            {
+                "builder_action": {
+                    "action": "place",
+                    "_action_candidate_metadata": {"chosen_confidence": 0.9},
+                },
+                "debug": {"target_structure": "should not be serialized"},
+            },
+        ],
+    )
+
+    analysis = analyze_run("leaky_run", result_root=tmp_path)
+
+    assert analysis["artifact_health"]["passed"] is False
+    assert analysis["artifact_health"]["checks"]["hidden_state_keys_absent"] is False
+    assert {hit["key"] for hit in analysis["artifact_health"]["hidden_state_key_hits"]} == {
+        "target_structure",
+    }
 
 
 def _write_normalized_run(tmp_path, run_name):
@@ -124,6 +156,10 @@ def _write_normalized_run(tmp_path, run_name):
                 "progress": {"progress": 0.25},
             },
         ],
+    )
+    (normalized / "leakage_report.json").write_text(
+        json.dumps({"checks": [{"passed": True, "violations": []}]}),
+        encoding="utf-8",
     )
 
 

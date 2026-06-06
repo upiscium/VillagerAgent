@@ -25,6 +25,15 @@ TURN_FIELDNAMES = [
     "progress",
 ]
 
+HIDDEN_STATE_KEYS = [
+    "target_structure",
+    "oracle_moves",
+    "all_private_views",
+    "raw_private_view",
+    "hidden_spans",
+    "hidden_labels",
+]
+
 
 class DualDAGAnalysisError(ValueError):
     """Raised when normalized Dual-DAG artifacts cannot be analyzed."""
@@ -83,11 +92,14 @@ def analyze_run(run_name: str, *, result_root: Path) -> dict:
         for row in turn_rows
         if row["chosen_confidence"] != ""
     ]
+    failure_modes = _failure_mode_summary(turn_rows)
     return {
         "run_name": summary.get("run_name", run_name),
         "condition": summary.get("condition", ""),
         "node_count": dag_summary.get("node_count", len(nodes)),
         "edge_count": dag_summary.get("edge_count", len(edges)),
+        "artifact_health": _artifact_health(normalized_dir, turns, dag_summary),
+        "failure_modes": failure_modes,
         "node_type_counts": dict(node_type_counts),
         "edge_type_counts": dict(edge_type_counts),
         "director_claim_counts": dict(director_claim_counts),
@@ -98,8 +110,8 @@ def analyze_run(run_name: str, *, result_root: Path) -> dict:
         "conflicted_action_count": sum(1 for count in action_conflict_counts.values() if count > 0),
         "required_evidence_action_count": sum(1 for count in action_required_evidence_counts.values() if count > 0),
         "mean_action_confidence": sum(confidences) / len(confidences) if confidences else 0.0,
-        "gated_clarification_count": sum(1 for row in turn_rows if row["gated_clarification"]),
-        "builder_fallback_count": sum(1 for row in turn_rows if row["builder_fallback"]),
+        "gated_clarification_count": failure_modes["gated_clarification"]["count"],
+        "builder_fallback_count": failure_modes["fallback"]["count"],
         "turns": turn_rows,
     }
 
@@ -201,6 +213,97 @@ def _progress_value(progress) -> float | str:
     if isinstance(progress, (int, float)):
         return progress
     return ""
+
+
+def _failure_mode_summary(turn_rows: list[dict]) -> dict:
+    categories = {
+        "fallback": lambda row: bool(row["builder_fallback"]),
+        "low_confidence": _is_low_confidence_turn,
+        "conflict": lambda row: int(row["claim_conflict_count"] or 0) > 0,
+        "required_evidence": lambda row: int(row["claim_required_evidence_count"] or 0) > 0,
+        "clarification": lambda row: row["action"] == "clarify",
+        "gated_clarification": lambda row: bool(row["gated_clarification"]),
+    }
+    total = len(turn_rows)
+    summary = {}
+    for name, predicate in categories.items():
+        matching_rows = [row for row in turn_rows if predicate(row)]
+        summary[name] = {
+            "count": len(matching_rows),
+            "rate": len(matching_rows) / total if total else 0.0,
+            "turns": [
+                {
+                    "structure_id": row["structure_id"],
+                    "turn_index": row["turn_index"],
+                    "gate_reasons": row["gate_reasons"],
+                }
+                for row in matching_rows
+            ],
+        }
+    return summary
+
+
+def _is_low_confidence_turn(row: dict) -> bool:
+    if "low_action_confidence" in str(row.get("gate_reasons", "")).split(","):
+        return True
+    confidence = row.get("chosen_confidence")
+    if confidence == "":
+        return False
+    try:
+        return float(confidence) < 0.5
+    except (TypeError, ValueError):
+        return False
+
+
+def _artifact_health(normalized_dir: Path, turns: list[dict], dag_summary: dict) -> dict:
+    artifact_files = [
+        "turns.jsonl",
+        "dual_dag_summary.json",
+        "dual_dag_nodes.jsonl",
+        "dual_dag_edges.jsonl",
+        "leakage_report.json",
+    ]
+    missing_files = [name for name in artifact_files if not (normalized_dir / name).exists()]
+    leakage_report = _read_json(normalized_dir / "leakage_report.json")
+    leakage_checks = leakage_report.get("checks", [])
+    leakage_passed = all(check.get("passed", True) for check in leakage_checks)
+    hidden_key_hits = _hidden_key_hits(normalized_dir, artifact_files)
+    node_count = dag_summary.get("node_count", 0)
+    edge_count = dag_summary.get("edge_count", 0)
+    action_metadata_turn_count = sum(
+        1
+        for turn in turns
+        if (turn.get("builder_action") or {}).get("_action_candidate_metadata")
+    )
+    checks = {
+        "required_files_present": not missing_files,
+        "non_negative_dual_dag_counts": node_count >= 0 and edge_count >= 0,
+        "action_candidate_metadata_present": action_metadata_turn_count > 0 if turns else False,
+        "leakage_report_passed": leakage_passed,
+        "hidden_state_keys_absent": not hidden_key_hits,
+    }
+    return {
+        "passed": all(checks.values()),
+        "checks": checks,
+        "missing_files": missing_files,
+        "node_count": node_count,
+        "edge_count": edge_count,
+        "action_candidate_metadata_turn_count": action_metadata_turn_count,
+        "hidden_state_key_hits": hidden_key_hits,
+    }
+
+
+def _hidden_key_hits(normalized_dir: Path, artifact_files: list[str]) -> list[dict]:
+    hits = []
+    for name in artifact_files:
+        path = normalized_dir / name
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for key in HIDDEN_STATE_KEYS:
+            if key in text:
+                hits.append({"file": path.name, "key": key})
+    return hits
 
 
 def _node_kind(node: dict) -> str:
