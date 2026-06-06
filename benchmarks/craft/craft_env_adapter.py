@@ -195,6 +195,7 @@ class CraftEnvAdapter:
                 game_state=game_state,
                 director_messages=messages,
                 epistemic_claims=epistemic_claims,
+                dual_dag_runtime=dual_dag_runtime,
                 turn_index=turn_index,
             )
             dual_dag_runtime.add_action_candidates(
@@ -324,6 +325,7 @@ class CraftEnvAdapter:
         game_state,
         director_messages: dict[str, str],
         epistemic_claims: dict[str, dict],
+        dual_dag_runtime: DualDAGRuntime | None = None,
         turn_index: int,
     ) -> dict:
         from agents.builder_agent import BuilderAgent
@@ -338,6 +340,18 @@ class CraftEnvAdapter:
             reported_claims=epistemic_claims,
             turn_index=turn_index,
         )
+        decision_support = _runtime_decision_support(
+            runtime=dual_dag_runtime,
+            candidates=[candidate.to_dict() for candidate in action_candidates],
+            config=self.config,
+            turn_index=turn_index,
+        )
+        if decision_support:
+            oracle_moves, action_candidates = _prioritize_supported_candidates(
+                oracle_moves=oracle_moves,
+                action_candidates=action_candidates,
+                decision_support=decision_support,
+            )
         prompt_builder = object.__new__(BuilderAgent)
         prompt = prompt_builder.get_builder_prompt(
             director_discussion=discussion,
@@ -367,6 +381,12 @@ class CraftEnvAdapter:
                 reported_claims=epistemic_claims,
                 turn_index=turn_index,
             )]
+            decision_support = _runtime_decision_support(
+                runtime=dual_dag_runtime,
+                candidates=[candidate.to_dict() for candidate in action_candidates],
+                config=self.config,
+                turn_index=turn_index,
+            )
         if parsed.get("action") == "clarify" and oracle_moves:
             fallback = _oracle_fallback_action(
                 oracle_moves=oracle_moves,
@@ -377,6 +397,7 @@ class CraftEnvAdapter:
                     candidates=action_candidates,
                     chosen_action=oracle_moves[0],
                     chosen_by="oracle_fallback",
+                    decision_support=decision_support,
                 ),
             )
             return _apply_clarification_gate(fallback, self.config)
@@ -390,6 +411,7 @@ class CraftEnvAdapter:
                     candidates=action_candidates,
                     chosen_action=oracle_moves[0],
                     chosen_by="oracle_fallback",
+                    decision_support=decision_support,
                 ),
             )
             return _apply_clarification_gate(fallback, self.config)
@@ -397,6 +419,7 @@ class CraftEnvAdapter:
             candidates=action_candidates,
             chosen_action=parsed,
             chosen_by="builder_response",
+            decision_support=decision_support,
         )
         return _apply_clarification_gate(parsed, self.config)
 
@@ -464,6 +487,55 @@ def _format_candidate_response_line(move: dict) -> str:
             return f"REMOVE:{position}:{layer}:{span_to}:CONFIRM:Choosing this verified candidate."
         return f"REMOVE:{position}:{layer}:CONFIRM:Choosing this verified candidate."
     return "CLARIFY:No verified candidate can be matched to the directors' messages."
+
+
+def _runtime_decision_support(
+    *,
+    runtime: DualDAGRuntime | None,
+    candidates: list[dict],
+    config: dict,
+    turn_index: int,
+) -> dict:
+    dual_dag = config.get("dual_dag", {})
+    query_config = dual_dag.get("runtime_decision_support", {})
+    enabled = bool(dual_dag.get("enabled", False) and query_config.get("enabled", False))
+    if not enabled or runtime is None or not candidates:
+        return {}
+    return runtime.current_turn_decision_support(
+        turn_index=turn_index,
+        candidates=candidates,
+    )
+
+
+def _prioritize_supported_candidates(
+    *,
+    oracle_moves: list[dict] | None,
+    action_candidates: list,
+    decision_support: dict,
+) -> tuple[list[dict] | None, list]:
+    recommended_id = decision_support.get("recommended_candidate_id")
+    if not recommended_id:
+        return oracle_moves, action_candidates
+    index_by_id = {
+        candidate.node_id: index
+        for index, candidate in enumerate(action_candidates)
+    }
+    recommended_index = index_by_id.get(recommended_id)
+    if recommended_index is None or recommended_index == 0:
+        return oracle_moves, action_candidates
+    prioritized_candidates = [action_candidates[recommended_index]] + [
+        candidate
+        for index, candidate in enumerate(action_candidates)
+        if index != recommended_index
+    ]
+    if oracle_moves is None:
+        return None, prioritized_candidates
+    prioritized_moves = [oracle_moves[recommended_index]] + [
+        move
+        for index, move in enumerate(oracle_moves)
+        if index != recommended_index
+    ]
+    return prioritized_moves, prioritized_candidates
 
 
 def _matches_oracle_candidate(action: dict, oracle_moves: list[dict]) -> bool:

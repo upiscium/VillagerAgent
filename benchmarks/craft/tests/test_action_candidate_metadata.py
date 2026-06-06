@@ -149,6 +149,28 @@ def test_build_metadata_marks_builder_chosen_candidate():
     assert metadata["claim_required_evidence_count"] == 0
 
 
+def test_build_metadata_includes_public_decision_support_when_provided():
+    action = {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0, "span_to": None}
+    candidates = action_candidates_from_moves(
+        moves=[action],
+        reported_claims={},
+        turn_index=1,
+    )
+    decision_support = {
+        "recommended_candidate_id": "action:1:0",
+        "candidates": [{"node_id": "action:1:0", "confidence": 0.6}],
+    }
+
+    metadata = build_action_candidate_metadata(
+        candidates=candidates,
+        chosen_action=action,
+        chosen_by="builder_response",
+        decision_support=decision_support,
+    )
+
+    assert metadata["decision_support"] is decision_support
+
+
 def test_build_metadata_counts_required_evidence_for_chosen_candidate():
     action = {"action": "place", "block": "rs", "position": "(0,0)", "layer": 1, "span_to": None}
     candidates = action_candidates_from_moves(

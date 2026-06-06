@@ -116,6 +116,23 @@ class DualDAGRuntime:
             if node.get("node_type") == "reported_claim"
         }
 
+    def current_turn_decision_support(
+        self,
+        *,
+        turn_index: int,
+        candidates: list[dict],
+    ) -> dict:
+        rows = [_decision_support_candidate(candidate) for candidate in candidates]
+        recommended = _recommended_candidate(rows)
+        return {
+            "turn_index": turn_index,
+            "candidate_count": len(rows),
+            "recommended_candidate_id": recommended.get("node_id", "") if recommended else "",
+            "has_conflicts": any(row["claim_conflict_count"] > 0 for row in rows),
+            "has_required_evidence": any(row["claim_required_evidence_count"] > 0 for row in rows),
+            "candidates": rows,
+        }
+
     def snapshot_summary(self) -> dict:
         return {
             "epistemic_node_count": len(self.epistemic_nodes),
@@ -141,3 +158,28 @@ class DualDAGRuntime:
 
     def serialized_snapshot(self) -> dict:
         return snapshot_to_dict(self)
+
+
+def _decision_support_candidate(candidate: dict) -> dict:
+    return {
+        "node_id": candidate.get("node_id", ""),
+        "action": candidate.get("action", {}),
+        "confidence": float(candidate.get("confidence", 0.0) or 0.0),
+        "claim_support_count": len(candidate.get("supported_by", []) or []),
+        "claim_conflict_count": len(candidate.get("conflicts_with", []) or []),
+        "claim_required_evidence_count": len(candidate.get("required_evidence", []) or []),
+    }
+
+
+def _recommended_candidate(rows: list[dict]) -> dict | None:
+    if not rows:
+        return None
+    return max(
+        rows,
+        key=lambda row: (
+            row["claim_conflict_count"] == 0,
+            row["claim_required_evidence_count"] == 0,
+            row["confidence"],
+            row["claim_support_count"],
+        ),
+    )

@@ -97,6 +97,7 @@ def test_dual_dag_qwen_configs_share_eval_axis():
         assert config["run"]["structures"] == baseline["run"]["structures"]
         assert config["run"]["turns"] == baseline["run"]["turns"]
         assert config["dual_dag"]["enabled"] is True
+        assert config["dual_dag"]["runtime_decision_support"]["enabled"] is True
         assert config["dual_dag"]["gated_clarification"]["enabled"] is True
         assert config["dual_dag"]["gated_clarification"]["min_action_confidence"] == 0.55
         assert config["dual_dag"]["gated_clarification"]["clarification_cost"] == 0.4

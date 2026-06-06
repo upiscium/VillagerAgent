@@ -202,3 +202,32 @@ def test_runtime_public_state_actions_become_public_facts():
     runtime.update_public_state(turn_index=3, public_state=public_state)
 
     assert runtime.epistemic_nodes["public:builder_action:3:0"]["node_type"] == "public_fact"
+
+
+def test_runtime_current_turn_decision_support_recommends_public_candidate():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    candidates = runtime.build_action_candidates(
+        turn_index=1,
+        oracle_moves=[
+            {"action": "place", "block": "bs", "position": "(0,0)", "layer": 0, "span_to": None},
+            {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0, "span_to": None},
+        ],
+    )
+    candidates[0]["confidence"] = 0.4
+    candidates[0]["conflicts_with"] = ["claim:D1:1"]
+    candidates[1]["confidence"] = 0.7
+
+    support = runtime.current_turn_decision_support(turn_index=1, candidates=candidates)
+
+    assert support["recommended_candidate_id"] == "action:1:1"
+    assert support["has_conflicts"] is True
+    assert support["candidates"][0] == {
+        "node_id": "action:1:0",
+        "action": {"action": "place", "block": "bs", "position": "(0,0)", "layer": 0, "span_to": None},
+        "confidence": 0.4,
+        "claim_support_count": 0,
+        "claim_conflict_count": 1,
+        "claim_required_evidence_count": 0,
+    }
+    assert "target_structure" not in json.dumps(support)
+    assert "oracle_moves" not in json.dumps(support)
