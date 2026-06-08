@@ -14,6 +14,7 @@ from benchmarks.craft.dual_dag.action_candidates import (
     build_action_candidate_metadata,
 )
 from benchmarks.craft.dual_dag.evidence_prompt import (
+    HIDDEN_STATE_KEYS,
     append_public_evidence_summary,
     build_public_evidence_summary,
 )
@@ -202,6 +203,14 @@ class CraftEnvAdapter:
                 dual_dag_runtime=dual_dag_runtime,
                 structure_index=structure_index,
                 turn_index=turn_index,
+                leakage_guard=leakage_guard,
+                leakage_reports=leakage_reports,
+                forbidden_payloads=_builder_forbidden_payloads(
+                    sample=sample,
+                    game_state=game_state,
+                    private_views=private_views,
+                    config=self.config,
+                ),
             )
             dual_dag_runtime.add_action_candidates(
                 turn_index=turn_index,
@@ -333,6 +342,9 @@ class CraftEnvAdapter:
         structure_index: int,
         turn_index: int,
         dual_dag_runtime: DualDAGRuntime | None = None,
+        leakage_guard: LeakageGuard | None = None,
+        leakage_reports: list[dict] | None = None,
+        forbidden_payloads: dict | None = None,
     ) -> dict:
         from agents.builder_agent import BuilderAgent
 
@@ -374,7 +386,7 @@ class CraftEnvAdapter:
         )
         prompt = _append_builder_action_contract(prompt, oracle_moves)
         if self.config.get("logging", {}).get("save_prompts", False):
-            _save_prompt_messages(
+            prompt_path = _save_prompt_messages(
                 output_dir=self.output_dir,
                 structure_index=structure_index,
                 director_id="Builder",
@@ -384,6 +396,13 @@ class CraftEnvAdapter:
                     {"role": "user", "content": prompt},
                 ],
             )
+            if leakage_guard is not None:
+                report = leakage_guard.inspect_prompt_artifact(
+                    artifact_path=prompt_path,
+                    forbidden_payloads=forbidden_payloads or {},
+                )
+                if leakage_reports is not None:
+                    leakage_reports.append(report)
         client = _make_chat_client(builder_model)
         response = client.chat(
             [
@@ -649,6 +668,24 @@ def _oracle_moves_for_guard(game_state, config: dict) -> list[dict] | None:
         return None
 
 
+def _builder_forbidden_payloads(
+    *,
+    sample: dict,
+    game_state,
+    private_views: dict,
+    config: dict,
+) -> dict:
+    forbidden = {
+        "target_structure": sample.get("structure"),
+        "oracle_moves": _oracle_moves_for_guard(game_state, config),
+    }
+    for director_id, view in private_views.items():
+        forbidden[f"{director_id}_raw_private_view"] = view.raw_view
+    for key in HIDDEN_STATE_KEYS:
+        forbidden[f"hidden_key:{key}"] = key
+    return forbidden
+
+
 def _safe_progress_summary(game_state) -> dict:
     try:
         return game_state.get_progress_summary()
@@ -700,7 +737,7 @@ def _save_prompt_messages(
     director_id: str,
     turn_index: int,
     prompt_messages: list[dict],
-) -> None:
+) -> Path:
     prompt_dir = output_dir / "raw" / "prompts" / f"structure_{structure_index}"
     prompt_dir.mkdir(parents=True, exist_ok=True)
     prompt_path = prompt_dir / f"{director_id}_turn_{turn_index:03d}.json"
@@ -716,6 +753,7 @@ def _save_prompt_messages(
             ensure_ascii=False,
             indent=2,
         )
+    return prompt_path
 
 
 def _safe_turn_metadata(metadata: dict) -> dict:

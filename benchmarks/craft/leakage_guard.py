@@ -4,7 +4,7 @@ from typing import Any
 
 
 class PartialInformationLeakageError(RuntimeError):
-    """Raised when hidden CRAFT information appears in a Director prompt."""
+    """Raised when hidden CRAFT information appears in a prompt."""
 
 
 class LeakageGuard:
@@ -18,6 +18,7 @@ class LeakageGuard:
         director_id: str,
         prompt_messages: list[dict],
         forbidden_payloads: dict,
+        artifact_path: Path | None = None,
     ) -> dict:
         prompt_text = "\n".join(m.get("content", "") for m in prompt_messages)
         violations = []
@@ -32,12 +33,29 @@ class LeakageGuard:
             "passed": not violations,
             "violations": violations,
         }
+        if artifact_path is not None:
+            report["artifact_path"] = str(artifact_path)
         self.reports.append(report)
         if violations:
             raise PartialInformationLeakageError(
                 f"Partial-information leakage detected for {director_id}: {violations}"
             )
         return report
+
+    def inspect_prompt_artifact(
+        self,
+        *,
+        artifact_path: Path,
+        forbidden_payloads: dict,
+    ) -> dict:
+        with artifact_path.open("r", encoding="utf-8") as f:
+            artifact = json.load(f)
+        return self.inspect_prompt(
+            director_id=artifact.get("director_id", artifact_path.stem),
+            prompt_messages=artifact.get("prompt_messages", []),
+            forbidden_payloads=forbidden_payloads,
+            artifact_path=artifact_path,
+        )
 
     def save_report(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
