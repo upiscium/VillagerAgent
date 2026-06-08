@@ -553,6 +553,9 @@ def _runtime_decision_support(
     return runtime.current_turn_decision_support(
         turn_index=turn_index,
         candidates=candidates,
+        use_historical_graph_context=bool(
+            query_config.get("historical_retrieval", {}).get("enabled", False)
+        ),
     )
 
 

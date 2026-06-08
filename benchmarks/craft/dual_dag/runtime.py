@@ -1,5 +1,9 @@
 from benchmarks.craft.craft_protocol import CraftPrivateView, CraftPublicState
-from benchmarks.craft.dual_dag.action_candidates import action_candidates_from_moves
+from benchmarks.craft.dual_dag.action_candidates import (
+    action_candidates_from_moves,
+    action_location_keywords,
+    claim_action_relation,
+)
 from benchmarks.craft.dual_dag.epistemic_extractor import (
     observed_facts_from_private_view,
     public_facts_from_state,
@@ -121,8 +125,18 @@ class DualDAGRuntime:
         *,
         turn_index: int,
         candidates: list[dict],
+        use_historical_graph_context: bool = False,
     ) -> dict:
-        rows = [_decision_support_candidate(candidate) for candidate in candidates]
+        rows = [
+            _decision_support_candidate(
+                candidate,
+                graph_context=self.retrieve_public_graph_context(
+                    turn_index=turn_index,
+                    action=candidate.get("action", {}),
+                ) if use_historical_graph_context else None,
+            )
+            for candidate in candidates
+        ]
         recommended = _recommended_candidate(rows)
         return {
             "turn_index": turn_index,
@@ -131,6 +145,71 @@ class DualDAGRuntime:
             "has_conflicts": any(row["claim_conflict_count"] > 0 for row in rows),
             "has_required_evidence": any(row["claim_required_evidence_count"] > 0 for row in rows),
             "candidates": rows,
+        }
+
+    def retrieve_public_graph_context(
+        self,
+        *,
+        turn_index: int,
+        action: dict,
+        max_claims: int = 5,
+        max_actions: int = 5,
+    ) -> dict:
+        location_keywords = action_location_keywords(action)
+        relevant_claims = []
+        for claim in self.reported_claims().values():
+            if not _is_prior_public_node(claim, turn_index):
+                continue
+            relation = claim_action_relation(claim, action, location_keywords)
+            if relation is None:
+                continue
+            relevant_claims.append({
+                "node_id": claim.get("node_id", ""),
+                "relation": relation,
+                "turn_index": (claim.get("provenance", {}) or {}).get("turn_index"),
+                "content": _public_claim_content(claim),
+            })
+
+        relevant_actions = []
+        for node in self.epistemic_nodes.values():
+            if not _is_prior_public_node(node, turn_index):
+                continue
+            content = node.get("content", {}) if isinstance(node, dict) else {}
+            builder_action = content.get("builder_action") if isinstance(content, dict) else None
+            if not isinstance(builder_action, dict):
+                continue
+            if not _actions_share_location_or_type(action, builder_action, location_keywords):
+                continue
+            relevant_actions.append({
+                "node_id": node.get("node_id", ""),
+                "turn_index": (node.get("provenance", {}) or {}).get("turn_index"),
+                "action": {
+                    key: value
+                    for key, value in builder_action.items()
+                    if not str(key).startswith("_")
+                },
+            })
+
+        return {
+            "query": {
+                "turn_index": turn_index,
+                "action": {
+                    key: value
+                    for key, value in action.items()
+                    if not str(key).startswith("_")
+                },
+                "location_keywords": sorted(location_keywords),
+            },
+            "relevant_public_claims": sorted(
+                relevant_claims,
+                key=lambda claim: claim.get("turn_index") or 0,
+                reverse=True,
+            )[:max_claims],
+            "relevant_public_actions": sorted(
+                relevant_actions,
+                key=lambda action_row: action_row.get("turn_index") or 0,
+                reverse=True,
+            )[:max_actions],
         }
 
     def snapshot_summary(self) -> dict:
@@ -160,15 +239,30 @@ class DualDAGRuntime:
         return snapshot_to_dict(self)
 
 
-def _decision_support_candidate(candidate: dict) -> dict:
-    return {
+def _decision_support_candidate(candidate: dict, *, graph_context: dict | None = None) -> dict:
+    historical_claims = (graph_context or {}).get("relevant_public_claims", [])
+    historical_support_count = sum(1 for claim in historical_claims if claim.get("relation") == "supports")
+    historical_conflict_count = sum(1 for claim in historical_claims if claim.get("relation") == "conflicts_with")
+    historical_required_count = sum(1 for claim in historical_claims if claim.get("relation") == "requires_evidence")
+    confidence = float(candidate.get("confidence", 0.0) or 0.0)
+    if graph_context:
+        confidence = _bounded_confidence(
+            confidence
+            + 0.05 * historical_support_count
+            - 0.1 * historical_conflict_count
+            - 0.05 * historical_required_count
+        )
+    row = {
         "node_id": candidate.get("node_id", ""),
         "action": candidate.get("action", {}),
-        "confidence": float(candidate.get("confidence", 0.0) or 0.0),
-        "claim_support_count": len(candidate.get("supported_by", []) or []),
-        "claim_conflict_count": len(candidate.get("conflicts_with", []) or []),
-        "claim_required_evidence_count": len(candidate.get("required_evidence", []) or []),
+        "confidence": confidence,
+        "claim_support_count": len(candidate.get("supported_by", []) or []) + historical_support_count,
+        "claim_conflict_count": len(candidate.get("conflicts_with", []) or []) + historical_conflict_count,
+        "claim_required_evidence_count": len(candidate.get("required_evidence", []) or []) + historical_required_count,
     }
+    if graph_context:
+        row["graph_context"] = graph_context
+    return row
 
 
 def _recommended_candidate(rows: list[dict]) -> dict | None:
@@ -183,3 +277,34 @@ def _recommended_candidate(rows: list[dict]) -> dict | None:
             row["claim_support_count"],
         ),
     )
+
+
+def _is_prior_public_node(node: dict, turn_index: int) -> bool:
+    provenance = node.get("provenance", {}) if isinstance(node, dict) else {}
+    if provenance.get("visibility") != "public":
+        return False
+    node_turn = provenance.get("turn_index")
+    return isinstance(node_turn, int) and node_turn < turn_index
+
+
+def _public_claim_content(claim: dict) -> dict:
+    content = claim.get("content", {}) if isinstance(claim, dict) else {}
+    if not isinstance(content, dict):
+        return {}
+    return {
+        "director_id": content.get("director_id", ""),
+        "message": content.get("message", ""),
+        "keywords": list(content.get("keywords", []) or []),
+        "uncertain": bool(content.get("uncertain", False)),
+    }
+
+
+def _actions_share_location_or_type(action: dict, prior_action: dict, location_keywords: set[str]) -> bool:
+    prior_location_keywords = action_location_keywords(prior_action)
+    if location_keywords and prior_location_keywords:
+        return bool(location_keywords & prior_location_keywords)
+    return bool(action.get("action") and action.get("action") == prior_action.get("action"))
+
+
+def _bounded_confidence(value: float) -> float:
+    return max(0.0, min(1.0, value))

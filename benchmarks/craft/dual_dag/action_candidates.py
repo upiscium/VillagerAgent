@@ -61,6 +61,31 @@ def action_candidate_from_parsed_action(
     )
 
 
+def action_location_keywords(action: dict) -> set[str]:
+    return _action_location_keywords(action)
+
+
+def claim_action_relation(claim: dict, action: dict, location_keywords: set[str]) -> str | None:
+    content = claim.get("content", {}) if isinstance(claim, dict) else {}
+    keywords = set(content.get("keywords", [])) if isinstance(content, dict) else set()
+    if not _location_overlap(keywords, location_keywords):
+        return None
+    action_color = _action_color(action)
+    block = action.get("block")
+    if block in keywords or (action_color and action_color in keywords):
+        return "supports"
+    claim_colors = keywords & COLOR_WORDS
+    claim_has_location = bool(keywords & LOCATION_WORDS)
+    if (
+        action_color
+        and len(claim_colors) == 1
+        and action_color not in claim_colors
+        and claim_has_location
+    ):
+        return "requires_evidence" if content.get("uncertain") else "conflicts_with"
+    return None
+
+
 def build_action_candidate_metadata(
     *,
     candidates: list[ActionCandidateNode],
@@ -132,30 +157,16 @@ def _claim_support_conflict(
     supported_by = []
     conflicts_with = []
     required_evidence = []
-    action_color = _action_color(action)
-    block = action.get("block")
     for claim in reported_claims.values():
-        content = claim.get("content", {}) if isinstance(claim, dict) else {}
-        keywords = set(content.get("keywords", []))
         claim_id = claim.get("node_id", "")
         if not claim_id:
             continue
-        location_overlap = _location_overlap(keywords, location_keywords)
-        if (block in keywords or (action_color and action_color in keywords)) and location_overlap:
+        relation = claim_action_relation(claim, action, location_keywords)
+        if relation == "supports":
             supported_by.append(claim_id)
-            continue
-        claim_colors = keywords & COLOR_WORDS
-        claim_has_location = bool(keywords & LOCATION_WORDS)
-        if (
-            action_color
-            and len(claim_colors) == 1
-            and action_color not in claim_colors
-            and claim_has_location
-            and location_overlap
-        ):
-            if content.get("uncertain"):
-                required_evidence.append(claim_id)
-                continue
+        if relation == "requires_evidence":
+            required_evidence.append(claim_id)
+        if relation == "conflicts_with":
             conflicts_with.append(claim_id)
     return supported_by, conflicts_with, required_evidence
 

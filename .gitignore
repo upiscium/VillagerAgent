@@ -4,6 +4,8 @@ data/history/*
 __pycache__
 */.DS_Store
 *test*
+!benchmarks/craft/tests/
+!benchmarks/craft/tests/test_*.py
 atom_generator.py
 .idea
 
