@@ -1,6 +1,11 @@
 import json
 
 from benchmarks.craft.craft_protocol import CraftPrivateView, CraftPublicState
+from benchmarks.craft.dual_dag.evidence_prompt import (
+    append_public_evidence_summary,
+    build_public_evidence_summary,
+    prompt_contains_hidden_state_key,
+)
 from benchmarks.craft.dual_dag.runtime import DualDAGRuntime
 from benchmarks.craft.dual_dag.serialization import sanitize_for_serialization
 
@@ -231,3 +236,89 @@ def test_runtime_current_turn_decision_support_recommends_public_candidate():
     }
     assert "target_structure" not in json.dumps(support)
     assert "oracle_moves" not in json.dumps(support)
+
+
+def test_public_evidence_summary_includes_required_public_claim_only():
+    claim = {
+        "node_id": "claim:D1:1",
+        "node_type": "reported_claim",
+        "content": {
+            "director_id": "D1",
+            "message": "I am unsure whether the top left block is blue.",
+            "keywords": ["top", "left", "blue"],
+            "uncertain": True,
+        },
+        "provenance": {
+            "source": "director_message",
+            "director_id": "D1",
+            "turn_index": 1,
+            "visibility": "public",
+        },
+    }
+    candidate = {
+        "node_id": "action:1:0",
+        "action": {"action": "place", "block": "rs", "position": "(0,2)", "_private": "drop"},
+        "supported_by": [],
+        "conflicts_with": [],
+        "required_evidence": ["claim:D1:1"],
+    }
+
+    summary = build_public_evidence_summary(
+        candidates=[candidate],
+        reported_claims={"D1": claim},
+    )
+
+    assert summary == [{
+        "candidate_id": "action:1:0",
+        "action": {"action": "place", "block": "rs", "position": "(0,2)"},
+        "supporting_public_claims": [],
+        "conflicting_public_claims": [],
+        "missing_public_evidence_claims": [{
+            "claim_id": "claim:D1:1",
+            "director_id": "D1",
+            "turn_index": 1,
+            "public_message": "I am unsure whether the top left block is blue.",
+            "keywords": ["top", "left", "blue"],
+            "uncertain": True,
+        }],
+    }]
+
+
+def test_public_evidence_prompt_omits_hidden_state_keys():
+    claim = {
+        "node_id": "claim:D2:3",
+        "content": {
+            "director_id": "D2",
+            "message": "Please confirm the bottom right orange block.",
+            "keywords": ["bottom", "right", "orange"],
+            "uncertain": True,
+        },
+        "provenance": {"turn_index": 3, "visibility": "public"},
+    }
+    candidate = {
+        "node_id": "action:3:1",
+        "action": {"action": "place", "block": "bs", "position": "(2,0)"},
+        "supported_by": [],
+        "conflicts_with": [],
+        "required_evidence": ["claim:D2:3"],
+    }
+
+    prompt = append_public_evidence_summary(
+        prompt="Base Builder prompt",
+        candidates=[candidate],
+        reported_claims={"D2": claim},
+    )
+
+    assert "PUBLIC EVIDENCE SUMMARY" in prompt
+    assert "Please confirm the bottom right orange block." in prompt
+    assert not prompt_contains_hidden_state_key(prompt)
+
+
+def test_public_evidence_prompt_noops_without_relevant_evidence():
+    prompt = append_public_evidence_summary(
+        prompt="Base Builder prompt",
+        candidates=[{"node_id": "action:1:0", "action": {"action": "clarify"}}],
+        reported_claims={},
+    )
+
+    assert prompt == "Base Builder prompt"

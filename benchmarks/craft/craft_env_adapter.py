@@ -13,6 +13,7 @@ from benchmarks.craft.dual_dag.action_candidates import (
     action_candidates_from_moves,
     build_action_candidate_metadata,
 )
+from benchmarks.craft.dual_dag.evidence_prompt import append_public_evidence_summary
 from benchmarks.craft.dual_dag.gating import should_clarify
 from benchmarks.craft.dual_dag.runtime import DualDAGRuntime
 from benchmarks.craft.leakage_guard import LeakageGuard
@@ -196,6 +197,7 @@ class CraftEnvAdapter:
                 director_messages=messages,
                 epistemic_claims=epistemic_claims,
                 dual_dag_runtime=dual_dag_runtime,
+                structure_index=structure_index,
                 turn_index=turn_index,
             )
             dual_dag_runtime.add_action_candidates(
@@ -325,8 +327,9 @@ class CraftEnvAdapter:
         game_state,
         director_messages: dict[str, str],
         epistemic_claims: dict[str, dict],
-        dual_dag_runtime: DualDAGRuntime | None = None,
+        structure_index: int,
         turn_index: int,
+        dual_dag_runtime: DualDAGRuntime | None = None,
     ) -> dict:
         from agents.builder_agent import BuilderAgent
 
@@ -360,7 +363,24 @@ class CraftEnvAdapter:
             use_tools=self.config["craft"].get("builder_tool_use", False),
             oracle_moves=oracle_moves,
         )
+        evidence_summary_candidates = [candidate.to_dict() for candidate in action_candidates]
+        prompt = append_public_evidence_summary(
+            prompt=prompt,
+            candidates=evidence_summary_candidates,
+            reported_claims=epistemic_claims,
+        )
         prompt = _append_builder_action_contract(prompt, oracle_moves)
+        if self.config.get("logging", {}).get("save_prompts", False):
+            _save_prompt_messages(
+                output_dir=self.output_dir,
+                structure_index=structure_index,
+                director_id="Builder",
+                turn_index=turn_index,
+                prompt_messages=[
+                    {"role": "system", "content": _builder_system_prompt(oracle_moves)},
+                    {"role": "user", "content": prompt},
+                ],
+            )
         client = _make_chat_client(builder_model)
         response = client.chat(
             [
