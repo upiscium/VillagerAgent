@@ -60,6 +60,70 @@ def test_gate_allows_medium_confidence_after_tuning():
     assert metadata["thresholds"]["min_action_confidence"] == 0.55
 
 
+def test_gate_ignores_required_evidence_when_configured_off():
+    should_gate, metadata = should_clarify(
+        candidate_metadata={
+            "chosen_confidence": 0.35,
+            "claim_conflict_count": 0,
+            "claim_required_evidence_count": 1,
+        },
+        config={"dual_dag": {"enabled": True, "gated_clarification": {"enabled": True}}},
+    )
+
+    assert should_gate is True
+    assert "required_evidence" not in metadata["reasons"]
+    assert metadata["reason"] == "low_action_confidence"
+
+
+def test_gate_fires_on_required_evidence_when_enabled_and_risky():
+    should_gate, metadata = should_clarify(
+        candidate_metadata={
+            "chosen_confidence": 0.5,
+            "claim_conflict_count": 0,
+            "claim_required_evidence_count": 1,
+        },
+        config={
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {
+                    "enabled": True,
+                    "min_action_confidence": 0.4,
+                    "clarify_on_required_evidence": True,
+                    "clarification_cost": 0.2,
+                },
+            }
+        },
+    )
+
+    assert should_gate is True
+    assert metadata["reason"] == "required_evidence"
+    assert metadata["claim_required_evidence_count"] == 1
+
+
+def test_gate_allows_required_evidence_when_risk_is_below_cost():
+    should_gate, metadata = should_clarify(
+        candidate_metadata={
+            "chosen_confidence": 0.8,
+            "claim_conflict_count": 0,
+            "claim_required_evidence_count": 1,
+        },
+        config={
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {
+                    "enabled": True,
+                    "min_action_confidence": 0.4,
+                    "clarify_on_required_evidence": True,
+                    "clarification_cost": 0.4,
+                },
+            }
+        },
+    )
+
+    assert should_gate is False
+    assert metadata["risk_exceeds_clarification_cost"] is False
+
+
 def test_gate_fires_on_large_block_without_span():
     should_gate, metadata = should_clarify(
         candidate_metadata={
@@ -103,6 +167,46 @@ def test_clarify_action_not_applied_when_gate_disabled():
     action = {"action": "place", "_action_candidate_metadata": {"chosen_confidence": 0.1}}
 
     assert _apply_clarification_gate(action, {}) is action
+
+
+def test_required_evidence_clarification_references_public_claim_only():
+    action = _apply_clarification_gate(
+        {
+            "action": "place",
+            "block": "rs",
+            "position": "(0,0)",
+            "_action_candidate_metadata": {
+                "chosen_candidate_id": "action:1:0",
+                "chosen_confidence": 0.5,
+                "claim_conflict_count": 0,
+                "claim_required_evidence_count": 1,
+                "public_evidence_summary": [{
+                    "candidate_id": "action:1:0",
+                    "missing_public_evidence_claims": [{
+                        "claim_id": "claim:D3:1",
+                        "public_message": "I am unsure whether the bottom left block should be green.",
+                    }],
+                }],
+            },
+        },
+        {
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {
+                    "enabled": True,
+                    "min_action_confidence": 0.4,
+                    "clarify_on_required_evidence": True,
+                    "clarification_cost": 0.2,
+                },
+            }
+        },
+    )
+
+    assert action["action"] == "clarify"
+    assert "bottom left block should be green" in action["clarification"]
+    serialized = str(action).lower()
+    assert "target_structure" not in serialized
+    assert "oracle" not in serialized
 
 
 def test_gate_fires_on_conflict_only_when_risk_exceeds_clarification_cost():

@@ -1,6 +1,7 @@
 DEFAULT_GATE_CONFIG = {
     "min_action_confidence": 0.55,
     "max_conflict_count": 0,
+    "clarify_on_required_evidence": False,
     "clarify_on_large_block_span_uncertainty": True,
     "clarification_cost": 0.4,
     "mistake_cost_weight": 1.0,
@@ -14,6 +15,7 @@ def should_clarify(*, candidate_metadata: dict, config: dict) -> tuple[bool, dic
     thresholds = {**DEFAULT_GATE_CONFIG, **gate_config}
     chosen_confidence = float(candidate_metadata.get("chosen_confidence", 0.0) or 0.0)
     conflict_count = int(candidate_metadata.get("claim_conflict_count", 0) or 0)
+    required_evidence_count = int(candidate_metadata.get("claim_required_evidence_count", 0) or 0)
     risk_score = (1.0 - chosen_confidence) * float(thresholds["mistake_cost_weight"])
     risk_exceeds_cost = risk_score > float(thresholds["clarification_cost"])
     reasons = []
@@ -21,6 +23,13 @@ def should_clarify(*, candidate_metadata: dict, config: dict) -> tuple[bool, dic
         reasons.append("low_action_confidence")
     if enabled and conflict_count > int(thresholds["max_conflict_count"]) and risk_exceeds_cost:
         reasons.append("claim_conflict")
+    if (
+        enabled
+        and thresholds.get("clarify_on_required_evidence", False)
+        and required_evidence_count > 0
+        and risk_exceeds_cost
+    ):
+        reasons.append("required_evidence")
     if enabled and thresholds.get("clarify_on_large_block_span_uncertainty", True):
         if _large_block_span_unresolved(candidate_metadata):
             reasons.append("large_block_span_uncertainty")
@@ -31,6 +40,7 @@ def should_clarify(*, candidate_metadata: dict, config: dict) -> tuple[bool, dic
         "reasons": reasons,
         "chosen_confidence": chosen_confidence,
         "claim_conflict_count": conflict_count,
+        "claim_required_evidence_count": required_evidence_count,
         "risk_score": risk_score,
         "risk_exceeds_clarification_cost": risk_exceeds_cost,
         "thresholds": thresholds,
