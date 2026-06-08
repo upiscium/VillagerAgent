@@ -13,7 +13,10 @@ from benchmarks.craft.dual_dag.action_candidates import (
     action_candidates_from_moves,
     build_action_candidate_metadata,
 )
-from benchmarks.craft.dual_dag.evidence_prompt import append_public_evidence_summary
+from benchmarks.craft.dual_dag.evidence_prompt import (
+    append_public_evidence_summary,
+    build_public_evidence_summary,
+)
 from benchmarks.craft.dual_dag.gating import should_clarify
 from benchmarks.craft.dual_dag.runtime import DualDAGRuntime
 from benchmarks.craft.leakage_guard import LeakageGuard
@@ -407,6 +410,10 @@ class CraftEnvAdapter:
                 config=self.config,
                 turn_index=turn_index,
             )
+        public_evidence_summary = build_public_evidence_summary(
+            candidates=[candidate.to_dict() for candidate in action_candidates],
+            reported_claims=epistemic_claims,
+        )
         if parsed.get("action") == "clarify" and oracle_moves:
             fallback = _oracle_fallback_action(
                 oracle_moves=oracle_moves,
@@ -418,6 +425,7 @@ class CraftEnvAdapter:
                     chosen_action=oracle_moves[0],
                     chosen_by="oracle_fallback",
                     decision_support=decision_support,
+                    public_evidence_summary=public_evidence_summary,
                 ),
             )
             return _apply_clarification_gate(fallback, self.config)
@@ -432,6 +440,7 @@ class CraftEnvAdapter:
                     chosen_action=oracle_moves[0],
                     chosen_by="oracle_fallback",
                     decision_support=decision_support,
+                    public_evidence_summary=public_evidence_summary,
                 ),
             )
             return _apply_clarification_gate(fallback, self.config)
@@ -440,6 +449,7 @@ class CraftEnvAdapter:
             chosen_action=parsed,
             chosen_by="builder_response",
             decision_support=decision_support,
+            public_evidence_summary=public_evidence_summary,
         )
         return _apply_clarification_gate(parsed, self.config)
 
@@ -597,10 +607,31 @@ def _apply_clarification_gate(action: dict, config: dict) -> dict:
         return action
     return {
         "action": "clarify",
-        "clarification": "The candidate action is ambiguous. Please clarify the block color, coordinate, layer, or span before building.",
+        "clarification": _clarification_message(gate_metadata, candidate_metadata),
         "_gated_clarification": gate_metadata,
         "_action_candidate_metadata": candidate_metadata,
     }
+
+
+def _clarification_message(gate_metadata: dict, candidate_metadata: dict) -> str:
+    missing_claims = _missing_public_evidence_claims(candidate_metadata)
+    if "required_evidence" in gate_metadata.get("reasons", []) and missing_claims:
+        claim = missing_claims[0]
+        message = claim.get("public_message") or "the uncertain public claim"
+        return (
+            "The candidate action is missing public evidence for an uncertain Director claim. "
+            f"Please clarify: {message}"
+        )
+    return "The candidate action is ambiguous. Please clarify the block color, coordinate, layer, or span before building."
+
+
+def _missing_public_evidence_claims(candidate_metadata: dict) -> list[dict]:
+    chosen_id = candidate_metadata.get("chosen_candidate_id")
+    summaries = candidate_metadata.get("public_evidence_summary", []) or []
+    for summary in summaries:
+        if summary.get("candidate_id") == chosen_id:
+            return list(summary.get("missing_public_evidence_claims", []) or [])
+    return []
 
 
 def _oracle_moves_for_builder(game_state, config: dict) -> list[dict] | None:

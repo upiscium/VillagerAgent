@@ -67,6 +67,7 @@ def build_action_candidate_metadata(
     chosen_action: dict,
     chosen_by: str,
     decision_support: dict | None = None,
+    public_evidence_summary: list[dict] | None = None,
 ) -> dict:
     chosen = _find_matching_candidate(candidates, chosen_action)
     if chosen is None and candidates:
@@ -89,6 +90,8 @@ def build_action_candidate_metadata(
     }
     if decision_support:
         metadata["decision_support"] = decision_support
+    if public_evidence_summary:
+        metadata["public_evidence_summary"] = public_evidence_summary
     return metadata
 
 
