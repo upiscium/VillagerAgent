@@ -36,7 +36,9 @@ class DualDAGRuntime:
             turn_index=turn_index,
             private_view=private_view,
         ):
-            self.epistemic_nodes[node.node_id] = node.to_dict()
+            node_dict = node.to_dict()
+            self.epistemic_nodes[node.node_id] = node_dict
+            self._link_observation_to_claims(node_dict)
 
     def update_public_state(self, *, turn_index: int, public_state: CraftPublicState) -> None:
         for node in public_facts_from_state(turn_index=turn_index, public_state=public_state):
@@ -49,6 +51,7 @@ class DualDAGRuntime:
             message=message,
         )
         self.epistemic_nodes[claim["node_id"]] = claim
+        self._link_observations_to_claim(claim)
         self._upsert_claim_hypothesis(claim)
         return claim
 
@@ -280,6 +283,65 @@ class DualDAGRuntime:
             summary=content.get("message", ""),
             keywords=list(content.get("keywords", []) or []),
         )
+        self._add_epistemic_edge(
+            source_id=claim_id,
+            target_id=f"hypothesis:unresolved_claim:{claim_id}",
+            edge_type="derived_from",
+            turn_index=(claim.get("provenance", {}) or {}).get("turn_index", 0),
+            metadata={"reason": "uncertain_claim"},
+        )
+
+    def _link_observations_to_claim(self, claim: dict) -> None:
+        claim_content = claim.get("content", {}) if isinstance(claim, dict) else {}
+        claim_keywords = set(claim_content.get("keywords", [])) if isinstance(claim_content, dict) else set()
+        provenance = claim.get("provenance", {}) if isinstance(claim, dict) else {}
+        director_id = provenance.get("director_id")
+        turn_index = provenance.get("turn_index", 0)
+        if not claim_keywords or not director_id:
+            return
+        for node in self.epistemic_nodes.values():
+            if node.get("node_type") != "observed_fact":
+                continue
+            node_provenance = node.get("provenance", {}) or {}
+            if node_provenance.get("director_id") != director_id:
+                continue
+            if node_provenance.get("turn_index") != turn_index:
+                continue
+            overlap = _observation_claim_keyword_overlap(node, claim_keywords)
+            if not overlap:
+                continue
+            self._add_epistemic_edge(
+                source_id=node.get("node_id", ""),
+                target_id=claim.get("node_id", ""),
+                edge_type="supports",
+                turn_index=turn_index,
+                metadata={"matched_keywords": sorted(overlap)},
+            )
+
+    def _link_observation_to_claims(self, observation: dict) -> None:
+        provenance = observation.get("provenance", {}) if isinstance(observation, dict) else {}
+        director_id = provenance.get("director_id")
+        turn_index = provenance.get("turn_index")
+        if not director_id or not isinstance(turn_index, int):
+            return
+        for claim in self.reported_claims().values():
+            claim_provenance = claim.get("provenance", {}) or {}
+            if claim_provenance.get("director_id") != director_id:
+                continue
+            if claim_provenance.get("turn_index") != turn_index:
+                continue
+            claim_content = claim.get("content", {}) if isinstance(claim, dict) else {}
+            claim_keywords = set(claim_content.get("keywords", [])) if isinstance(claim_content, dict) else set()
+            overlap = _observation_claim_keyword_overlap(observation, claim_keywords)
+            if not overlap:
+                continue
+            self._add_epistemic_edge(
+                source_id=observation.get("node_id", ""),
+                target_id=claim.get("node_id", ""),
+                edge_type="supports",
+                turn_index=turn_index,
+                metadata={"matched_keywords": sorted(overlap)},
+            )
 
     def _upsert_action_hypothesis(
         self,
@@ -306,6 +368,21 @@ class DualDAGRuntime:
                 candidate_action=candidate_action if isinstance(candidate_action, dict) else {},
             ),
             keywords=list(claim_content.get("keywords", []) or []) if isinstance(claim_content, dict) else [],
+        )
+        edge_type = "conflicts_with" if hypothesis_type == "conflicting_evidence" else "requires_confirmation_from"
+        self._add_epistemic_edge(
+            source_id=claim_id,
+            target_id=f"hypothesis:{hypothesis_type}:{claim_id}:{candidate_id}",
+            edge_type=edge_type,
+            turn_index=turn_index,
+            metadata={"action_candidate_id": candidate_id},
+        )
+        self._add_epistemic_edge(
+            source_id=f"hypothesis:{hypothesis_type}:{claim_id}:{candidate_id}",
+            target_id=candidate_id,
+            edge_type="supports" if hypothesis_type == "required_evidence" else "conflicts_with",
+            turn_index=turn_index,
+            metadata={"source_claim_id": claim_id},
         )
 
     def _upsert_hypothesis(
@@ -352,6 +429,42 @@ class DualDAGRuntime:
                 "visibility": "public",
             },
         }
+
+    def _add_epistemic_edge(
+        self,
+        *,
+        source_id: str,
+        target_id: str,
+        edge_type: str,
+        turn_index: int,
+        metadata: dict | None = None,
+    ) -> None:
+        if not source_id or not target_id:
+            return
+        edge = {
+            "source_id": source_id,
+            "target_id": target_id,
+            "edge_type": edge_type,
+            "metadata": {
+                "turn_index": turn_index,
+                **(metadata or {}),
+            },
+        }
+        existing = next(
+            (
+                row for row in self.epistemic_edges
+                if row.get("source_id") == source_id
+                and row.get("target_id") == target_id
+                and row.get("edge_type") == edge_type
+            ),
+            None,
+        )
+        if existing:
+            existing_metadata = existing.setdefault("metadata", {})
+            existing_metadata.update(metadata or {})
+            existing_metadata["last_updated_turn"] = turn_index
+            return
+        self.epistemic_edges.append(edge)
 
 
 def _decision_support_candidate(candidate: dict, *, graph_context: dict | None = None) -> dict:
@@ -433,6 +546,19 @@ def _hypothesis_summary(*, hypothesis_type: str, claim_content: dict, candidate_
     if hypothesis_type == "required_evidence":
         return f"Claim requires more evidence before candidate action: {message} / {action}"
     return message
+
+
+def _observation_claim_keyword_overlap(observation: dict, claim_keywords: set[str]) -> set[str]:
+    content = observation.get("content", {}) if isinstance(observation, dict) else {}
+    if not isinstance(content, dict):
+        return set()
+    observation_keywords = {
+        content.get("color"),
+        content.get("size_label"),
+        content.get("relative_vertical"),
+        content.get("relative_horizontal"),
+    }
+    return {str(keyword) for keyword in observation_keywords if keyword in claim_keywords}
 
 
 def _bounded_confidence(value: float) -> float:

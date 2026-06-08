@@ -230,7 +230,7 @@ def test_result_converter_writes_dual_dag_artifacts(tmp_path):
             "dual_dag": {
                 "summary": {"epistemic_node_count": 1},
                 "epistemic_nodes": [{"node_id": "claim:D1:1", "node_type": "reported_claim"}],
-                "epistemic_edges": [],
+                "epistemic_edges": [{"source_id": "claim:D1:1", "target_id": "hypothesis:1"}],
                 "action_nodes": [{"node_id": "action:1:0"}],
                 "action_edges": [{"source_id": "claim:D1:1", "target_id": "action:1:0"}],
             },
@@ -245,7 +245,9 @@ def test_result_converter_writes_dual_dag_artifacts(tmp_path):
     nodes_text = (tmp_path / "normalized" / "dual_dag_nodes.jsonl").read_text()
     edges_text = (tmp_path / "normalized" / "dual_dag_edges.jsonl").read_text()
     assert summary["runtime"]["dual_dag_node_count"] == 2
-    assert summary["runtime"]["dual_dag_edge_count"] == 1
+    assert summary["runtime"]["dual_dag_edge_count"] == 2
     assert dag_summary["node_count"] == 2
     assert "claim:D1:1" in nodes_text
     assert "action:1:0" in edges_text
+    assert '"graph_type": "epistemic"' in edges_text
+    assert '"graph_type": "action"' in edges_text

@@ -17,10 +17,12 @@ def test_dual_dag_analysis_summarizes_claim_edges_and_turns(tmp_path):
 
     analysis = analyze_run("craft_dual_dag", result_root=tmp_path)
 
-    assert analysis["node_count"] == 3
-    assert analysis["edge_count"] == 2
-    assert analysis["node_type_counts"] == {"reported_claim": 2, "place_block": 1}
-    assert analysis["edge_type_counts"] == {"supports": 1, "conflicts_with": 1}
+    assert analysis["node_count"] == 4
+    assert analysis["edge_count"] == 4
+    assert analysis["node_type_counts"] == {"reported_claim": 2, "hypothesis": 1, "place_block": 1}
+    assert analysis["edge_type_counts"] == {"supports": 1, "conflicts_with": 2, "derived_from": 1}
+    assert analysis["epistemic_edge_type_counts"] == {"derived_from": 1, "conflicts_with": 1}
+    assert analysis["action_edge_type_counts"] == {"supports": 1, "conflicts_with": 1}
     assert analysis["director_claim_counts"] == {"D1": 1, "D2": 1}
     assert analysis["director_support_counts"] == {"D1": 1}
     assert analysis["director_conflict_counts"] == {"D2": 1}
@@ -108,7 +110,7 @@ def _write_normalized_run(tmp_path, run_name):
         encoding="utf-8",
     )
     (normalized / "dual_dag_summary.json").write_text(
-        json.dumps({"node_count": 3, "edge_count": 2}),
+        json.dumps({"node_count": 4, "edge_count": 4}),
         encoding="utf-8",
     )
     _write_jsonl(
@@ -124,14 +126,31 @@ def _write_normalized_run(tmp_path, run_name):
                 "node_type": "reported_claim",
                 "content": {"director_id": "D2"},
             },
+            {
+                "node_id": "hypothesis:conflicting_evidence:claim:D2:1:action:1:0",
+                "node_type": "hypothesis",
+                "content": {"source_claim_ids": ["claim:D2:1"]},
+            },
             {"node_id": "action:1:0", "node_type": "place_block", "required_evidence": ["claim:D2:1"]},
         ],
     )
     _write_jsonl(
         normalized / "dual_dag_edges.jsonl",
         [
-            {"source_id": "claim:D1:1", "target_id": "action:1:0", "edge_type": "supports"},
-            {"source_id": "claim:D2:1", "target_id": "action:1:0", "edge_type": "conflicts_with"},
+            {"source_id": "claim:D1:1", "target_id": "action:1:0", "edge_type": "supports", "graph_type": "action"},
+            {"source_id": "claim:D2:1", "target_id": "action:1:0", "edge_type": "conflicts_with", "graph_type": "action"},
+            {
+                "source_id": "claim:D2:1",
+                "target_id": "hypothesis:conflicting_evidence:claim:D2:1:action:1:0",
+                "edge_type": "derived_from",
+                "graph_type": "epistemic",
+            },
+            {
+                "source_id": "hypothesis:conflicting_evidence:claim:D2:1:action:1:0",
+                "target_id": "claim:D2:1",
+                "edge_type": "conflicts_with",
+                "graph_type": "epistemic",
+            },
         ],
     )
     _write_jsonl(

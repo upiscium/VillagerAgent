@@ -314,7 +314,15 @@ def _write_dual_dag_artifacts(*, normalized_dir: Path, games: list[dict]) -> Non
         for game in games:
             dual_dag = game.get("dual_dag", {})
             nodes = list(dual_dag.get("epistemic_nodes", [])) + list(dual_dag.get("action_nodes", []))
-            edges = list(dual_dag.get("epistemic_edges", [])) + list(dual_dag.get("action_edges", []))
+            epistemic_edges = [
+                {"graph_type": "epistemic", **edge}
+                for edge in dual_dag.get("epistemic_edges", [])
+            ]
+            action_edges = [
+                {"graph_type": "action", **edge}
+                for edge in dual_dag.get("action_edges", [])
+            ]
+            edges = epistemic_edges + action_edges
             summary["node_count"] += len(nodes)
             summary["edge_count"] += len(edges)
             summary["games"].append({

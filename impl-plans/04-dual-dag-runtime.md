@@ -9,6 +9,7 @@ Implemented:
 - `benchmarks/craft/dual_dag/runtime.py` provides `DualDAGRuntime` with deterministic node storage, snapshotting, serialization, and public graph retrieval.
 - `ObservedFact`, `PublicFact`, and `ReportedClaim` are represented as epistemic nodes with provenance.
 - `Hypothesis` nodes are generated and updated from unresolved claims, conflicting action evidence, and required-evidence action metadata.
+- Epistemic edges connect observations, claims, hypotheses, and action candidates without exposing hidden state.
 - Builder candidate actions are represented as action nodes with support/conflict/required-evidence metadata.
 - Action support/conflict edges are serialized and analyzed.
 - Runtime decision support can use prior public claims/actions when `dual_dag.runtime_decision_support.historical_retrieval.enabled` is true.
@@ -18,7 +19,7 @@ Not yet implemented:
 
 - `ResolvedFact` nodes.
 - Rich hypothesis confidence/update/resolution semantics beyond the initial generated node metadata.
-- Epistemic edges such as `derived_from`, `resolved_by`, and `requires_confirmation_from`.
+- `ResolvedFact` generation and `resolved_by` edges.
 - Graph traversal that changes action state from `blocked` to `executable`.
 - Explicit `Clarify` / `WaitForEvidence` graph nodes and update loops after clarification responses.
 - Bridge from CRAFT Action Candidate DAG to the VillagerAgent Task DAG / Minecraft runtime.

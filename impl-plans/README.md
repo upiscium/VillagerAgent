@@ -6,9 +6,9 @@ The plans are ordered so each PR can deliver a measurable artifact without requi
 
 ## Current Status
 
-Phases 1-3 are implemented for the CRAFT integration. Phase 4 is partially implemented: CRAFT now has an explicit `DualDAGRuntime`, serialized graph artifacts, action support/conflict edges, hypothesis nodes, and config-gated runtime graph retrieval for action scoring.
+Phases 1-3 are implemented for the CRAFT integration. Phase 4 is partially implemented: CRAFT now has an explicit `DualDAGRuntime`, serialized graph artifacts, action support/conflict edges, hypothesis nodes, epistemic edges, and config-gated runtime graph retrieval for action scoring.
 
-The remaining Phase 4 work is the full knowledge-resolution layer: resolved facts, richer hypothesis update/resolution semantics, epistemic edges such as `derived_from` and `resolved_by`, graph-traversal action unlock, explicit `Clarify` / `WaitForEvidence` nodes, and the future bridge from CRAFT action candidates to the VillagerAgent Task DAG.
+The remaining Phase 4 work is the full knowledge-resolution layer: resolved facts, richer hypothesis update/resolution semantics, `resolved_by` edges, graph-traversal action unlock, explicit `Clarify` / `WaitForEvidence` nodes, and the future bridge from CRAFT action candidates to the VillagerAgent Task DAG.
 
 ## Plan Order
 

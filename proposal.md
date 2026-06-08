@@ -6,7 +6,7 @@
 
 現状は，Director の発話を `ReportedClaim` として保持し，Builder の候補行動に support/conflict/required-evidence/confidence を付け，必要なら `CLARIFY` に倒すところまで実装済みである．また，`DualDAGRuntime` により `Epistemic DAG` と `Action Candidate DAG` のノード・エッジを CRAFT ローカルに保持し，過去の public claim/action を検索して action scoring に使う runtime retrieval も実装済みである．
 
-一方で，提案の中核である `Hypothesis` と `ResolvedFact` による知識解決はまだ部分実装である．`Hypothesis` node は unresolved/conflicting evidence から生成・更新されるが，`ResolvedFact`，`derived_from` / `resolved_by` / `requires_confirmation_from` などの epistemic edge，graph traversal による action unlock，および Minecraft 実環境での VillagerAgent Task DAG 接続は未実装である．
+一方で，提案の中核である `Hypothesis` と `ResolvedFact` による知識解決はまだ部分実装である．`Hypothesis` node は unresolved/conflicting evidence から生成・更新され，`supports` / `conflicts_with` / `derived_from` / `requires_confirmation_from` の一部 epistemic edge も populated されるが，`ResolvedFact`，`resolved_by`，graph traversal による action unlock，および Minecraft 実環境での VillagerAgent Task DAG 接続は未実装である．
 
 | 領域 | 現状 |
 | --- | --- |
@@ -17,7 +17,7 @@
 | Evidence-aware Builder prompting | 実装済み．public evidence summary を Builder prompt に追加する |
 | Partial-information safety | 実装済み．hidden target/oracle/private view の prompt/artifact leakage を検査する |
 | Hypothesis / ResolvedFact | 部分実装済み．`Hypothesis` は生成・更新されるが，`ResolvedFact` と解決処理はまだない |
-| Epistemic edge population | 未実装に近い．action support/conflict edge はあるが，知識解決用 edge はない |
+| Epistemic edge population | 部分実装済み．observation/claim/hypothesis/action 間に一部 edge を張る |
 | Graph traversal unlock | 未実装．action state を traversal で `blocked` から `executable` にする処理はない |
 | Minecraft Task DAG 接続 | 未実装 |
 
@@ -274,12 +274,12 @@ AgentNet などの分散 DAG 型フレームワークは，主にタスク分割
 - action unlock 条件を graph traversal として扱う
 - Minecraft 実環境では Action Candidate DAG を VillagerAgent Task DAG に接続する
 
-現状: 部分実装済み．`DualDAGRuntime` は CRAFT ローカルの graph object として，epistemic/action nodes，action support/conflict edges，hypothesis nodes，snapshot，serialization，public graph retrieval を持つ．ただし `ResolvedFact`, epistemic edge population, action state transition, graph traversal unlock, Minecraft Task DAG 接続は未実装である．
+現状: 部分実装済み．`DualDAGRuntime` は CRAFT ローカルの graph object として，epistemic/action nodes，action support/conflict edges，hypothesis nodes，epistemic edges，snapshot，serialization，public graph retrieval を持つ．ただし `ResolvedFact`, `resolved_by`, action state transition, graph traversal unlock, Minecraft Task DAG 接続は未実装である．
 
 次の実装対象は以下である．
 
 - `Hypothesis` node の confidence/update/resolution semantics を拡張する
-- `supports`, `conflicts_with`, `derived_from`, `resolved_by`, `requires_confirmation_from` を Epistemic DAG 側にも populated edge として追加する
+- `resolved_by` と ResolvedFact 生成を Epistemic DAG 側に追加する
 - `ResolvedFact` または public evidence threshold による action unlock 条件を実装する
 - `Clarify` / `WaitForEvidence` を明示的な action candidate として graph に残す
 - clarification response を `ReportedClaim` / `ResolvedFact` として取り込み，候補行動を再評価する
