@@ -15,6 +15,7 @@ from benchmarks.craft.dual_dag.action_candidates import (
 )
 from benchmarks.craft.dual_dag.evidence_prompt import (
     HIDDEN_STATE_KEYS,
+    append_public_evidence_context,
     append_public_evidence_summary,
     build_public_evidence_summary,
 )
@@ -384,6 +385,20 @@ class CraftEnvAdapter:
             candidates=evidence_summary_candidates,
             reported_claims=epistemic_claims,
         )
+        if not evidence_summary_candidates:
+            prompt = append_public_evidence_context(
+                prompt=prompt,
+                reported_claims=(
+                    dual_dag_runtime.reported_claims()
+                    if dual_dag_runtime is not None
+                    else epistemic_claims
+                ),
+                hypotheses=(
+                    dual_dag_runtime.hypotheses()
+                    if dual_dag_runtime is not None
+                    else {}
+                ),
+            )
         prompt = _append_builder_action_contract(prompt, oracle_moves)
         if self.config.get("logging", {}).get("save_prompts", False):
             prompt_path = _save_prompt_messages(

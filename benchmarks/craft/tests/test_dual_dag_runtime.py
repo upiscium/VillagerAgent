@@ -2,7 +2,9 @@ import json
 
 from benchmarks.craft.craft_protocol import CraftPrivateView, CraftPublicState
 from benchmarks.craft.dual_dag.evidence_prompt import (
+    append_public_evidence_context,
     append_public_evidence_summary,
+    build_public_evidence_context,
     build_public_evidence_summary,
     prompt_contains_hidden_state_key,
 )
@@ -478,3 +480,65 @@ def test_public_evidence_prompt_noops_without_relevant_evidence():
     )
 
     assert prompt == "Base Builder prompt"
+
+
+def test_public_evidence_context_supports_no_oracle_prompt_without_hidden_state():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_reported_claim(
+        director_id="D1",
+        turn_index=1,
+        message="I am unsure whether the top left block is blue, please confirm.",
+    )
+
+    prompt = append_public_evidence_context(
+        prompt="Base Builder prompt",
+        reported_claims=runtime.reported_claims(),
+        hypotheses=runtime.hypotheses(),
+    )
+
+    assert "PUBLIC EVIDENCE CONTEXT" in prompt
+    assert "No oracle candidates are available" in prompt
+    assert "requires_confirmation" in prompt
+    assert "hypothesis:unresolved_claim:claim:D1:1" in prompt
+    assert "target_structure" not in prompt
+    assert "oracle_moves" not in prompt
+    assert "raw_private_view" not in prompt
+    assert not prompt_contains_hidden_state_key(prompt)
+
+
+def test_public_evidence_context_uses_public_claims_only():
+    public_claim = {
+        "node_id": "claim:D1:1",
+        "content": {
+            "director_id": "D1",
+            "message": "Bottom left is yellow.",
+            "keywords": ["bottom", "left", "yellow"],
+            "uncertain": False,
+        },
+        "provenance": {"turn_index": 1, "visibility": "public"},
+    }
+    private_claim = {
+        "node_id": "claim:D2:1",
+        "content": {
+            "director_id": "D2",
+            "message": "Hidden target_structure should not appear.",
+            "keywords": ["target_structure"],
+            "uncertain": True,
+        },
+        "provenance": {"turn_index": 1, "visibility": "private"},
+    }
+
+    context = build_public_evidence_context(
+        reported_claims={"public": public_claim, "private": private_claim},
+        hypotheses={},
+    )
+
+    assert context["public_claims"] == [{
+        "claim_id": "claim:D1:1",
+        "director_id": "D1",
+        "turn_index": 1,
+        "public_message": "Bottom left is yellow.",
+        "keywords": ["bottom", "left", "yellow"],
+        "evidence_status": "reported",
+    }]
+    assert "target_structure" not in json.dumps(context)
