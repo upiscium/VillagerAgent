@@ -111,6 +111,36 @@ def test_result_converter_counts_epistemic_metadata(tmp_path):
     assert "observed_fact_count" in metrics_text
 
 
+def test_result_converter_counts_dual_dag_hypothesis_nodes(tmp_path):
+    config = {
+        "run": {"name": "test", "seed": 3, "structures": [0], "turns": 1},
+        "models": {"director": {"model": "d"}, "builder": {"model": "b"}},
+        "villageragent": {"enabled": True},
+    }
+    normalize_results(
+        config=config,
+        condition="villageragent_directors",
+        raw_result={
+            "structure_id": 0,
+            "turns": [],
+            "dual_dag": {
+                "epistemic_nodes": [{"node_id": "hypothesis:1", "node_type": "hypothesis"}],
+                "action_nodes": [],
+                "epistemic_edges": [],
+                "action_edges": [],
+            },
+            "final_progress": 0.0,
+            "completed": False,
+        },
+        output_dir=tmp_path,
+    )
+
+    summary = json.loads((tmp_path / "normalized" / "summary.json").read_text())
+    metrics_text = (tmp_path / "normalized" / "metrics.csv").read_text()
+    assert summary["runtime"]["hypothesis_count"] == 1
+    assert ",1," in metrics_text
+
+
 def test_result_converter_counts_action_candidate_metadata(tmp_path):
     config = {
         "run": {"name": "test", "seed": 3, "structures": [0], "turns": 1},

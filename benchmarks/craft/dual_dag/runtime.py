@@ -49,6 +49,7 @@ class DualDAGRuntime:
             message=message,
         )
         self.epistemic_nodes[claim["node_id"]] = claim
+        self._upsert_claim_hypothesis(claim)
         return claim
 
     def add_action_candidates(
@@ -76,6 +77,19 @@ class DualDAGRuntime:
                     "edge_type": "conflicts_with",
                     "metadata": {"turn_index": turn_index},
                 })
+                self._upsert_action_hypothesis(
+                    hypothesis_type="conflicting_evidence",
+                    claim_id=claim_id,
+                    candidate_id=candidate_id,
+                    turn_index=turn_index,
+                )
+            for claim_id in candidate.get("required_evidence", []):
+                self._upsert_action_hypothesis(
+                    hypothesis_type="required_evidence",
+                    claim_id=claim_id,
+                    candidate_id=candidate_id,
+                    turn_index=turn_index,
+                )
 
     def build_action_candidates(
         self,
@@ -118,6 +132,13 @@ class DualDAGRuntime:
             node_id: node
             for node_id, node in self.epistemic_nodes.items()
             if node.get("node_type") == "reported_claim"
+        }
+
+    def hypotheses(self) -> dict[str, dict]:
+        return {
+            node_id: node
+            for node_id, node in self.epistemic_nodes.items()
+            if node.get("node_type") == "hypothesis"
         }
 
     def current_turn_decision_support(
@@ -222,6 +243,10 @@ class DualDAGRuntime:
                 1 for node in self.epistemic_nodes.values()
                 if node.get("node_type") == "reported_claim"
             ),
+            "hypothesis_count": sum(
+                1 for node in self.epistemic_nodes.values()
+                if node.get("node_type") == "hypothesis"
+            ),
             "action_candidate_count": len(self.action_nodes),
         }
 
@@ -237,6 +262,96 @@ class DualDAGRuntime:
 
     def serialized_snapshot(self) -> dict:
         return snapshot_to_dict(self)
+
+    def _upsert_claim_hypothesis(self, claim: dict) -> None:
+        content = claim.get("content", {}) if isinstance(claim, dict) else {}
+        if not isinstance(content, dict) or not content.get("uncertain"):
+            return
+        claim_id = claim.get("node_id", "")
+        if not claim_id:
+            return
+        self._upsert_hypothesis(
+            node_id=f"hypothesis:unresolved_claim:{claim_id}",
+            hypothesis_type="unresolved_claim",
+            turn_index=(claim.get("provenance", {}) or {}).get("turn_index", 0),
+            source_claim_ids=[claim_id],
+            action_candidate_ids=[],
+            confidence=0.4,
+            summary=content.get("message", ""),
+            keywords=list(content.get("keywords", []) or []),
+        )
+
+    def _upsert_action_hypothesis(
+        self,
+        *,
+        hypothesis_type: str,
+        claim_id: str,
+        candidate_id: str,
+        turn_index: int,
+    ) -> None:
+        claim = self.epistemic_nodes.get(claim_id, {})
+        claim_content = claim.get("content", {}) if isinstance(claim, dict) else {}
+        candidate = self.action_nodes.get(candidate_id, {})
+        candidate_action = candidate.get("action", {}) if isinstance(candidate, dict) else {}
+        self._upsert_hypothesis(
+            node_id=f"hypothesis:{hypothesis_type}:{claim_id}:{candidate_id}",
+            hypothesis_type=hypothesis_type,
+            turn_index=turn_index,
+            source_claim_ids=[claim_id],
+            action_candidate_ids=[candidate_id],
+            confidence=0.3 if hypothesis_type == "conflicting_evidence" else 0.35,
+            summary=_hypothesis_summary(
+                hypothesis_type=hypothesis_type,
+                claim_content=claim_content if isinstance(claim_content, dict) else {},
+                candidate_action=candidate_action if isinstance(candidate_action, dict) else {},
+            ),
+            keywords=list(claim_content.get("keywords", []) or []) if isinstance(claim_content, dict) else [],
+        )
+
+    def _upsert_hypothesis(
+        self,
+        *,
+        node_id: str,
+        hypothesis_type: str,
+        turn_index: int,
+        source_claim_ids: list[str],
+        action_candidate_ids: list[str],
+        confidence: float,
+        summary: str,
+        keywords: list[str],
+    ) -> None:
+        existing = self.epistemic_nodes.get(node_id)
+        if existing:
+            content = existing.setdefault("content", {})
+            content["source_claim_ids"] = sorted(set(content.get("source_claim_ids", [])) | set(source_claim_ids))
+            content["action_candidate_ids"] = sorted(
+                set(content.get("action_candidate_ids", [])) | set(action_candidate_ids)
+            )
+            content["keywords"] = sorted(set(content.get("keywords", [])) | set(keywords))
+            content["last_updated_turn"] = turn_index
+            existing["confidence"] = max(float(existing.get("confidence", 0.0) or 0.0), confidence)
+            return
+        self.epistemic_nodes[node_id] = {
+            "node_id": node_id,
+            "node_type": "hypothesis",
+            "content": {
+                "hypothesis_type": hypothesis_type,
+                "status": "unresolved",
+                "summary": summary,
+                "source_claim_ids": sorted(source_claim_ids),
+                "action_candidate_ids": sorted(action_candidate_ids),
+                "keywords": sorted(set(keywords)),
+                "created_turn": turn_index,
+                "last_updated_turn": turn_index,
+            },
+            "confidence": confidence,
+            "provenance": {
+                "source": "dual_dag_runtime",
+                "director_id": None,
+                "turn_index": turn_index,
+                "visibility": "public",
+            },
+        }
 
 
 def _decision_support_candidate(candidate: dict, *, graph_context: dict | None = None) -> dict:
@@ -304,6 +419,20 @@ def _actions_share_location_or_type(action: dict, prior_action: dict, location_k
     if location_keywords and prior_location_keywords:
         return bool(location_keywords & prior_location_keywords)
     return bool(action.get("action") and action.get("action") == prior_action.get("action"))
+
+
+def _hypothesis_summary(*, hypothesis_type: str, claim_content: dict, candidate_action: dict) -> str:
+    message = claim_content.get("message", "")
+    action = {
+        key: value
+        for key, value in candidate_action.items()
+        if not str(key).startswith("_")
+    }
+    if hypothesis_type == "conflicting_evidence":
+        return f"Claim conflicts with candidate action: {message} / {action}"
+    if hypothesis_type == "required_evidence":
+        return f"Claim requires more evidence before candidate action: {message} / {action}"
+    return message
 
 
 def _bounded_confidence(value: float) -> float:

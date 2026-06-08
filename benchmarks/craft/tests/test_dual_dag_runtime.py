@@ -138,6 +138,7 @@ def test_runtime_reset_clears_all_node_and_edge_counts():
         "epistemic_edge_count": 0,
         "action_edge_count": 0,
         "reported_claim_count": 0,
+        "hypothesis_count": 0,
         "action_candidate_count": 0,
     }
 
@@ -236,6 +237,93 @@ def test_runtime_current_turn_decision_support_recommends_public_candidate():
     }
     assert "target_structure" not in json.dumps(support)
     assert "oracle_moves" not in json.dumps(support)
+
+
+def test_runtime_creates_hypothesis_for_uncertain_claim():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+
+    runtime.add_reported_claim(
+        director_id="D1",
+        turn_index=1,
+        message="I am unsure whether the bottom left block is blue, please confirm.",
+    )
+
+    hypotheses = runtime.hypotheses()
+    assert list(hypotheses) == ["hypothesis:unresolved_claim:claim:D1:1"]
+    hypothesis = hypotheses["hypothesis:unresolved_claim:claim:D1:1"]
+    assert hypothesis["node_type"] == "hypothesis"
+    assert hypothesis["content"]["hypothesis_type"] == "unresolved_claim"
+    assert hypothesis["content"]["source_claim_ids"] == ["claim:D1:1"]
+    assert hypothesis["content"]["status"] == "unresolved"
+    assert runtime.snapshot_summary()["hypothesis_count"] == 1
+
+
+def test_runtime_creates_and_updates_action_hypothesis_for_required_evidence():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_reported_claim(
+        director_id="D1",
+        turn_index=1,
+        message="Bottom left may be blue small, please confirm.",
+    )
+    candidate = {
+        "node_id": "action:2:0",
+        "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+        "confidence": 0.6,
+        "supported_by": [],
+        "conflicts_with": [],
+        "required_evidence": ["claim:D1:1"],
+    }
+
+    runtime.add_action_candidates(turn_index=2, candidates=[candidate])
+    runtime.add_action_candidates(turn_index=3, candidates=[candidate])
+
+    hypothesis = runtime.hypotheses()["hypothesis:required_evidence:claim:D1:1:action:2:0"]
+    assert hypothesis["content"]["hypothesis_type"] == "required_evidence"
+    assert hypothesis["content"]["source_claim_ids"] == ["claim:D1:1"]
+    assert hypothesis["content"]["action_candidate_ids"] == ["action:2:0"]
+    assert hypothesis["content"]["created_turn"] == 2
+    assert hypothesis["content"]["last_updated_turn"] == 3
+
+
+def test_runtime_creates_action_hypothesis_for_conflicting_evidence():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_reported_claim(
+        director_id="D1",
+        turn_index=1,
+        message="Bottom left is blue small.",
+    )
+    candidate = {
+        "node_id": "action:2:0",
+        "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+        "confidence": 0.4,
+        "supported_by": [],
+        "conflicts_with": ["claim:D1:1"],
+        "required_evidence": [],
+    }
+
+    runtime.add_action_candidates(turn_index=2, candidates=[candidate])
+
+    hypothesis = runtime.hypotheses()["hypothesis:conflicting_evidence:claim:D1:1:action:2:0"]
+    assert hypothesis["content"]["hypothesis_type"] == "conflicting_evidence"
+    assert hypothesis["content"]["source_claim_ids"] == ["claim:D1:1"]
+    assert hypothesis["content"]["action_candidate_ids"] == ["action:2:0"]
+    assert hypothesis["confidence"] == 0.3
+
+
+def test_serialized_hypothesis_excludes_hidden_state():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_reported_claim(
+        director_id="D1",
+        turn_index=1,
+        message="I am unsure whether the top right block is red.",
+    )
+
+    serialized = json.dumps(runtime.serialized_snapshot())
+
+    assert "hypothesis" in serialized
+    assert "target_structure" not in serialized
+    assert "oracle_moves" not in serialized
+    assert "raw_private_view" not in serialized
 
 
 def test_public_evidence_summary_includes_required_public_claim_only():

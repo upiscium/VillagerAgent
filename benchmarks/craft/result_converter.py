@@ -26,6 +26,10 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
     action_candidate_metrics = _action_candidate_metrics(turns)
     clarification_metrics = _clarification_metrics(turns)
     dual_dag_metrics = _dual_dag_metrics(games)
+    hypothesis_count = max(
+        epistemic_counts["hypothesis_count"],
+        dual_dag_metrics.pop("hypothesis_count", 0),
+    )
     summary = {
         "benchmark": "CRAFT",
         "condition": condition,
@@ -51,6 +55,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
             "builder_fallback_rate": builder_fallback_count / len(turns) if turns else 0.0,
             "baseline_type": _baseline_type(condition),
             **epistemic_counts,
+            "hypothesis_count": hypothesis_count,
             **action_candidate_metrics,
             **clarification_metrics,
             **dual_dag_metrics,
@@ -122,6 +127,10 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
             game_action_candidate_metrics = _action_candidate_metrics(game.get("turns", []))
             game_clarification_metrics = _clarification_metrics(game.get("turns", []))
             game_dual_dag_metrics = _dual_dag_metrics([game])
+            game_hypothesis_count = max(
+                game_epistemic_counts["hypothesis_count"],
+                game_dual_dag_metrics.pop("hypothesis_count", 0),
+            )
             writer.writerow({
                 "run_name": config["run"]["name"],
                 "condition": condition,
@@ -144,7 +153,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
                 "builder_fallback_rate": _fallback_rate(game.get("turns", [])),
                 "observed_fact_count": game_epistemic_counts["observed_fact_count"],
                 "reported_claim_count": game_epistemic_counts["reported_claim_count"],
-                "hypothesis_count": game_epistemic_counts["hypothesis_count"],
+                "hypothesis_count": game_hypothesis_count,
                 "mean_action_confidence": game_action_candidate_metrics["mean_action_confidence"],
                 "claim_support_count": game_action_candidate_metrics["claim_support_count"],
                 "claim_conflict_count": game_action_candidate_metrics["claim_conflict_count"],
@@ -276,15 +285,19 @@ def _clarification_metrics(turns: list[dict]) -> dict:
 def _dual_dag_metrics(games: list[dict]) -> dict:
     node_count = 0
     edge_count = 0
+    hypothesis_count = 0
     for game in games:
         dual_dag = game.get("dual_dag", {})
-        node_count += len(dual_dag.get("epistemic_nodes", []))
+        epistemic_nodes = list(dual_dag.get("epistemic_nodes", []))
+        node_count += len(epistemic_nodes)
         node_count += len(dual_dag.get("action_nodes", []))
         edge_count += len(dual_dag.get("epistemic_edges", []))
         edge_count += len(dual_dag.get("action_edges", []))
+        hypothesis_count += sum(1 for node in epistemic_nodes if node.get("node_type") == "hypothesis")
     return {
         "dual_dag_node_count": node_count,
         "dual_dag_edge_count": edge_count,
+        "hypothesis_count": hypothesis_count,
     }
 
 

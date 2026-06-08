@@ -1,10 +1,33 @@
 # Phase 4: Full Dual-DAG Runtime
 
+## Current Status
+
+This phase is partially implemented.
+
+Implemented:
+
+- `benchmarks/craft/dual_dag/runtime.py` provides `DualDAGRuntime` with deterministic node storage, snapshotting, serialization, and public graph retrieval.
+- `ObservedFact`, `PublicFact`, and `ReportedClaim` are represented as epistemic nodes with provenance.
+- `Hypothesis` nodes are generated and updated from unresolved claims, conflicting action evidence, and required-evidence action metadata.
+- Builder candidate actions are represented as action nodes with support/conflict/required-evidence metadata.
+- Action support/conflict edges are serialized and analyzed.
+- Runtime decision support can use prior public claims/actions when `dual_dag.runtime_decision_support.historical_retrieval.enabled` is true.
+- Hidden target/oracle/private-view keys are filtered or checked in serialized artifacts and prompt leakage checks.
+
+Not yet implemented:
+
+- `ResolvedFact` nodes.
+- Rich hypothesis confidence/update/resolution semantics beyond the initial generated node metadata.
+- Epistemic edges such as `derived_from`, `resolved_by`, and `requires_confirmation_from`.
+- Graph traversal that changes action state from `blocked` to `executable`.
+- Explicit `Clarify` / `WaitForEvidence` graph nodes and update loops after clarification responses.
+- Bridge from CRAFT Action Candidate DAG to the VillagerAgent Task DAG / Minecraft runtime.
+
 ## Goal
 
 Promote Phase 1-3 metadata structures into explicit graph objects with update, query, and serialization APIs.
 
-This phase turns the metadata-first system into a true Dual-DAG runtime while keeping the implementation CRAFT-local.
+This phase turns the metadata-first system into a true Dual-DAG runtime while keeping the implementation CRAFT-local. The current implementation covers the runtime shell and action-evidence retrieval; the full hypothesis/resolution and unlock semantics remain future work.
 
 ## Prerequisites
 
