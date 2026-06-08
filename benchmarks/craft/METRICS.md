@@ -49,7 +49,7 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 ## Dual-DAG Size
 
 - `dual_dag_node_count`: Number of serialized Dual-DAG nodes. Nodes include observed facts, public facts, reported claims, action candidates, and public Builder actions.
-- `dual_dag_edge_count`: Number of serialized Dual-DAG edges. Current edges are mainly `supports` and `conflicts_with`.
+- `dual_dag_edge_count`: Number of serialized Dual-DAG edges. Current edges include action support/conflict edges and epistemic `supports`, `conflicts_with`, `derived_from`, and `requires_confirmation_from` edges.
 
 ## Dual-DAG Analysis Metrics
 
@@ -60,6 +60,8 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 - `director_support_counts`: Per-Director support edge counts.
 - `director_conflict_counts`: Per-Director conflict edge counts.
 - `director_required_evidence_counts`: Per-Director required-evidence counts.
+- `epistemic_edge_type_counts`: Epistemic edge counts by type, such as `supports`, `conflicts_with`, `derived_from`, and `requires_confirmation_from`.
+- `action_edge_type_counts`: Action-candidate edge counts by type.
 
 ## Safety Metrics
 

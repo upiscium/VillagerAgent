@@ -50,6 +50,17 @@ def analyze_run(run_name: str, *, result_root: Path) -> dict:
 
     node_type_counts = Counter(_node_kind(node) for node in nodes)
     edge_type_counts = Counter(edge.get("edge_type", "") for edge in edges)
+    nodes_by_id = {node.get("node_id"): node for node in nodes if node.get("node_id")}
+    epistemic_edge_type_counts = Counter(
+        edge.get("edge_type", "")
+        for edge in edges
+        if _edge_graph_type(edge, nodes_by_id) == "epistemic"
+    )
+    action_edge_type_counts = Counter(
+        edge.get("edge_type", "")
+        for edge in edges
+        if _edge_graph_type(edge, nodes_by_id) == "action"
+    )
     claims_by_id = {
         node.get("node_id"): node
         for node in nodes
@@ -66,6 +77,8 @@ def analyze_run(run_name: str, *, result_root: Path) -> dict:
     action_conflict_counts: Counter[str] = Counter()
     action_required_evidence_counts: Counter[str] = Counter()
     for edge in edges:
+        if _edge_graph_type(edge, nodes_by_id) != "action":
+            continue
         claim = claims_by_id.get(edge.get("source_id"), {})
         director_id = (claim.get("content") or {}).get("director_id", "unknown")
         target_id = edge.get("target_id", "")
@@ -102,6 +115,8 @@ def analyze_run(run_name: str, *, result_root: Path) -> dict:
         "failure_modes": failure_modes,
         "node_type_counts": dict(node_type_counts),
         "edge_type_counts": dict(edge_type_counts),
+        "epistemic_edge_type_counts": dict(epistemic_edge_type_counts),
+        "action_edge_type_counts": dict(action_edge_type_counts),
         "director_claim_counts": dict(director_claim_counts),
         "director_support_counts": dict(director_support_counts),
         "director_conflict_counts": dict(director_conflict_counts),
@@ -308,6 +323,20 @@ def _hidden_key_hits(normalized_dir: Path, artifact_files: list[str]) -> list[di
 
 def _node_kind(node: dict) -> str:
     return node.get("node_type") or node.get("action_type") or "unknown"
+
+
+def _edge_graph_type(edge: dict, nodes_by_id: dict[str, dict]) -> str:
+    graph_type = edge.get("graph_type")
+    if graph_type in {"epistemic", "action"}:
+        return graph_type
+    source = nodes_by_id.get(edge.get("source_id"), {})
+    target = nodes_by_id.get(edge.get("target_id"), {})
+    source_kind = _node_kind(source)
+    target_kind = _node_kind(target)
+    if source_kind in {"observed_fact", "public_fact", "reported_claim", "hypothesis"}:
+        if target_kind in {"observed_fact", "public_fact", "reported_claim", "hypothesis"}:
+            return "epistemic"
+    return "action"
 
 
 def _read_json(path: Path) -> dict:

@@ -63,6 +63,34 @@ def test_runtime_links_action_candidates_to_supporting_claims():
     }]
 
 
+def test_runtime_links_observations_to_matching_claims():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.update_private_observation(
+        director_id="D1",
+        turn_index=1,
+        private_view=CraftPrivateView(
+            director_id="D1",
+            view_name="left",
+            raw_view="hidden raw view",
+            text_view="yellow bottom left",
+            structured_view={"row_0": [{"color": "yellow", "size": 1}]},
+        ),
+    )
+
+    runtime.add_reported_claim(
+        director_id="D1",
+        turn_index=1,
+        message="Bottom left is yellow small.",
+    )
+
+    assert runtime.epistemic_edges == [{
+        "source_id": "observed:D1:1:row_0:0",
+        "target_id": "claim:D1:1",
+        "edge_type": "supports",
+        "metadata": {"turn_index": 1, "matched_keywords": ["bottom", "left", "small", "yellow"]},
+    }]
+
+
 def test_runtime_keeps_all_reported_claims_by_node_id():
     runtime = DualDAGRuntime(director_ids=["D1"], config={})
     runtime.add_reported_claim(
@@ -256,6 +284,12 @@ def test_runtime_creates_hypothesis_for_uncertain_claim():
     assert hypothesis["content"]["source_claim_ids"] == ["claim:D1:1"]
     assert hypothesis["content"]["status"] == "unresolved"
     assert runtime.snapshot_summary()["hypothesis_count"] == 1
+    assert runtime.epistemic_edges == [{
+        "source_id": "claim:D1:1",
+        "target_id": "hypothesis:unresolved_claim:claim:D1:1",
+        "edge_type": "derived_from",
+        "metadata": {"turn_index": 1, "reason": "uncertain_claim"},
+    }]
 
 
 def test_runtime_creates_and_updates_action_hypothesis_for_required_evidence():
@@ -283,6 +317,26 @@ def test_runtime_creates_and_updates_action_hypothesis_for_required_evidence():
     assert hypothesis["content"]["action_candidate_ids"] == ["action:2:0"]
     assert hypothesis["content"]["created_turn"] == 2
     assert hypothesis["content"]["last_updated_turn"] == 3
+    assert runtime.epistemic_edges == [
+        {
+            "source_id": "claim:D1:1",
+            "target_id": "hypothesis:unresolved_claim:claim:D1:1",
+            "edge_type": "derived_from",
+            "metadata": {"turn_index": 1, "reason": "uncertain_claim"},
+        },
+        {
+            "source_id": "claim:D1:1",
+            "target_id": "hypothesis:required_evidence:claim:D1:1:action:2:0",
+            "edge_type": "requires_confirmation_from",
+            "metadata": {"turn_index": 2, "action_candidate_id": "action:2:0", "last_updated_turn": 3},
+        },
+        {
+            "source_id": "hypothesis:required_evidence:claim:D1:1:action:2:0",
+            "target_id": "action:2:0",
+            "edge_type": "supports",
+            "metadata": {"turn_index": 2, "source_claim_id": "claim:D1:1", "last_updated_turn": 3},
+        },
+    ]
 
 
 def test_runtime_creates_action_hypothesis_for_conflicting_evidence():
@@ -308,6 +362,20 @@ def test_runtime_creates_action_hypothesis_for_conflicting_evidence():
     assert hypothesis["content"]["source_claim_ids"] == ["claim:D1:1"]
     assert hypothesis["content"]["action_candidate_ids"] == ["action:2:0"]
     assert hypothesis["confidence"] == 0.3
+    assert runtime.epistemic_edges == [
+        {
+            "source_id": "claim:D1:1",
+            "target_id": "hypothesis:conflicting_evidence:claim:D1:1:action:2:0",
+            "edge_type": "conflicts_with",
+            "metadata": {"turn_index": 2, "action_candidate_id": "action:2:0"},
+        },
+        {
+            "source_id": "hypothesis:conflicting_evidence:claim:D1:1:action:2:0",
+            "target_id": "action:2:0",
+            "edge_type": "conflicts_with",
+            "metadata": {"turn_index": 2, "source_claim_id": "claim:D1:1"},
+        },
+    ]
 
 
 def test_serialized_hypothesis_excludes_hidden_state():
