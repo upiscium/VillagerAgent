@@ -4,6 +4,12 @@ This directory breaks `proposal.md` into implementation-sized plans for the CRAF
 
 The plans are ordered so each PR can deliver a measurable artifact without requiring the full Dual-DAG system at once.
 
+## Current Status
+
+Phases 1-3 are implemented for the CRAFT integration. Phase 4 is partially implemented: CRAFT now has an explicit `DualDAGRuntime`, serialized graph artifacts, action support/conflict edges, hypothesis nodes, and config-gated runtime graph retrieval for action scoring.
+
+The remaining Phase 4 work is the full knowledge-resolution layer: resolved facts, richer hypothesis update/resolution semantics, epistemic edges such as `derived_from` and `resolved_by`, graph-traversal action unlock, explicit `Clarify` / `WaitForEvidence` nodes, and the future bridge from CRAFT action candidates to the VillagerAgent Task DAG.
+
 ## Plan Order
 
 1. `01-epistemic-metadata.md`
@@ -20,7 +26,8 @@ The plans are ordered so each PR can deliver a measurable artifact without requi
 
 4. `04-dual-dag-runtime.md`
    - Promote metadata structures into explicit graph objects.
-   - Prepare the bridge to VillagerAgent Task DAG and later Minecraft runtime.
+   - Status: partially implemented for CRAFT runtime, serialization, graph retrieval, and analysis.
+   - Remaining: resolved-fact/resolution graph logic and the bridge to VillagerAgent Task DAG.
 
 ## Shared Constraints
 

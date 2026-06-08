@@ -29,7 +29,7 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 
 - `observed_fact_count`: Number of facts extracted from Directors' private CRAFT views.
 - `reported_claim_count`: Number of claims extracted from public Director messages. Other Directors' messages are treated as claims, not ground-truth facts.
-- `hypothesis_count`: Number of hypothesis nodes. This is reserved for future use and is usually zero in the current implementation.
+- `hypothesis_count`: Number of hypothesis nodes. Current hypotheses are generated from unresolved public claims, conflicting action evidence, and required-evidence action metadata.
 
 ## Claim And Evidence Relations
 
