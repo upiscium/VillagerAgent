@@ -8,6 +8,7 @@ from benchmarks.craft.config import (
     output_dir_for_config,
     save_resolved_config,
 )
+from benchmarks.craft.adapters.ollama_preflight import preflight_ollama_model
 from benchmarks.craft.craft_env_adapter import CraftEnvAdapter
 from benchmarks.craft.result_converter import normalize_results
 
@@ -59,6 +60,32 @@ def _require_runtime_api_keys(config: dict) -> None:
             )
 
 
+def _preflight_ollama_models(config: dict) -> list[dict]:
+    results = []
+    seen = set()
+    for model_name in ("director", "builder"):
+        model_config = config.get("models", {}).get(model_name, {})
+        provider = model_config.get("provider")
+        base_url = model_config.get("base_url", "")
+        model = model_config.get("model", "")
+        if not _is_ollama_model_config(model_config):
+            continue
+        if not base_url or not model:
+            continue
+        key = (base_url.rstrip("/"), model)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(preflight_ollama_model(base_url=base_url, model=model))
+    return results
+
+
+def _is_ollama_model_config(model_config: dict) -> bool:
+    provider = model_config.get("provider")
+    base_url = model_config.get("base_url", "")
+    return provider in {"ollama", "ollama_native"} or "ollama" in base_url.lower()
+
+
 def run_config(
     config_path: str,
     *,
@@ -80,6 +107,9 @@ def run_config(
     if dry_run:
         _print_dry_run(config, condition, output_dir)
         return output_dir
+
+    if condition != "official_baseline":
+        _preflight_ollama_models(config)
 
     adapter = CraftEnvAdapter(config, output_dir)
     raw_result = adapter.run(condition)
