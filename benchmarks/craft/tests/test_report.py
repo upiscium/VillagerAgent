@@ -74,6 +74,17 @@ def test_report_marks_leakage_failure(tmp_path):
     assert rows[0]["leakage_passed"] is False
 
 
+def test_report_includes_failed_run_status(tmp_path):
+    _write_failed_run(tmp_path, "craft_failed_run")
+
+    rows = build_comparison_report(["craft_failed_run"], result_root=tmp_path)
+
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["error_type"] == "OllamaPreflightError"
+    assert rows[0]["error_message"] == "model unavailable"
+    assert rows[0]["leakage_passed"] is False
+
+
 def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manager):
     normalized = tmp_path / run_name / "normalized"
     normalized.mkdir(parents=True)
@@ -116,3 +127,20 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "gated_clarification_count": "1",
                 "mean_risk_score": "0.4",
             })
+
+
+def _write_failed_run(tmp_path, run_name):
+    normalized = tmp_path / run_name / "normalized"
+    normalized.mkdir(parents=True)
+    summary = {
+        "run_name": run_name,
+        "status": "failed",
+        "condition": "villageragent_directors",
+        "failure": {"type": "OllamaPreflightError", "message": "model unavailable"},
+        "runtime": {"status": "failed"},
+        "models": {"director": "director-model", "builder": "builder-model"},
+    }
+    (normalized / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    with (normalized / "metrics.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["leakage_passed"])
+        writer.writeheader()

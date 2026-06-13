@@ -1,9 +1,22 @@
 import argparse
+import csv
+import json
 from pathlib import Path
 
 import yaml
 
-from benchmarks.craft.config import load_config, output_dir_for_config, repo_root
+from benchmarks.craft.config import (
+    condition_from_config,
+    load_config,
+    output_dir_for_config,
+    repo_root,
+    save_resolved_config,
+)
+from benchmarks.craft.experiment_summary import (
+    build_experiment_summary,
+    write_summary_csv,
+    write_summary_json,
+)
 from benchmarks.craft.report import build_comparison_report, write_csv_report, write_json_report
 from benchmarks.craft.run import run_config
 
@@ -49,16 +62,30 @@ def run_experiment(
     command = _command_text(manifest_path, dry_run=dry_run, overrides=overrides)
 
     run_names = []
+    failures = []
+    continue_on_error = bool(experiment.get("continue_on_error", False))
     for config_path in experiment["runs"]:
         config = load_config(config_path, overrides=run_overrides)
         output_dir = output_dir_for_config(config)
         run_names.append(output_dir.name)
-        run_config(
-            config_path,
-            dry_run=dry_run,
-            overrides=run_overrides,
-            command_text=command,
-        )
+        try:
+            run_config(
+                config_path,
+                dry_run=dry_run,
+                overrides=run_overrides,
+                command_text=command,
+            )
+        except Exception as exc:
+            if dry_run or not continue_on_error:
+                raise
+            _write_failure_artifacts(
+                config=config,
+                output_dir=output_dir,
+                config_path=config_path,
+                command=command,
+                error=exc,
+            )
+            failures.append({"run_name": output_dir.name, "error": str(exc)})
 
     if dry_run:
         return []
@@ -81,7 +108,22 @@ def run_experiment(
         if not json_path.is_absolute():
             json_path = root / json_path
         write_json_report(rows, json_path)
+    compact_output = report.get("compact_summary_output")
+    if compact_output:
+        compact_rows = build_experiment_summary(run_names, result_root=result_root)
+        compact_path = _report_path(compact_output, run_overrides)
+        if not compact_path.is_absolute():
+            compact_path = root / compact_path
+        write_summary_csv(compact_rows, compact_path)
+        compact_json_output = report.get("compact_summary_json_output")
+        if compact_json_output:
+            compact_json_path = _report_path(compact_json_output, run_overrides)
+            if not compact_json_path.is_absolute():
+                compact_json_path = root / compact_json_path
+            write_summary_json(compact_rows, compact_json_path)
     print(f"Wrote CRAFT experiment report: {output}")
+    if failures:
+        print(f"Recorded {len(failures)} CRAFT experiment run failure(s).")
     return rows
 
 
@@ -137,6 +179,59 @@ def _report_path(path: str, overrides: dict) -> Path:
     if suffix:
         report_path = report_path.with_name(f"{report_path.stem}{suffix}{report_path.suffix}")
     return report_path
+
+
+def _write_failure_artifacts(
+    *,
+    config: dict,
+    output_dir: Path,
+    config_path: str,
+    command: str,
+    error: Exception,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_resolved_config(config, output_dir)
+    (output_dir / "command.txt").write_text(command + "\n", encoding="utf-8")
+    normalized_dir = output_dir / "normalized"
+    normalized_dir.mkdir(parents=True, exist_ok=True)
+    failure = {
+        "type": type(error).__name__,
+        "message": str(error),
+        "config_path": config_path,
+    }
+    summary = {
+        "run_name": output_dir.name,
+        "condition": condition_from_config(config),
+        "seed": config.get("run", {}).get("seed", ""),
+        "structures": config.get("run", {}).get("structures", []) or [],
+        "turns": config.get("run", {}).get("turns", ""),
+        "num_games": 0,
+        "mean_final_progress": 0.0,
+        "completion_rate": 0.0,
+        "models": {
+            "director": config.get("models", {}).get("director", {}).get("model", ""),
+            "builder": config.get("models", {}).get("builder", {}).get("model", ""),
+        },
+        "providers": {
+            "director": config.get("models", {}).get("director", {}).get("provider", ""),
+            "builder": config.get("models", {}).get("builder", {}).get("provider", ""),
+        },
+        "villageragent": {
+            "use_task_decomposer": config.get("villageragent", {}).get("use_task_decomposer", False),
+            "use_agent_controller": config.get("villageragent", {}).get("use_agent_controller", False),
+            "use_state_manager": config.get("villageragent", {}).get("use_state_manager", False),
+        },
+        "runtime": {"status": "failed", "failure": failure},
+        "status": "failed",
+        "failure": failure,
+    }
+    (normalized_dir / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    with (normalized_dir / "metrics.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["leakage_passed"])
+        writer.writeheader()
 
 
 def main() -> None:

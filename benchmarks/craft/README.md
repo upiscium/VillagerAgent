@@ -77,7 +77,7 @@ To compare the VillagerAgent Director condition across the configured Ollama mod
 python -m benchmarks.craft.experiment --config configs/craft/experiments/ollama_model_comparison_v1.yaml
 ```
 
-This model comparison manifest uses the same seed, structures, and turn count as the qwen batch evaluation for `qwen3.5:9b`, `qwen3.5:4b`, `qwen3.6:27b`, `gemma4:26b`, and `gemma4:e4b`.
+This model comparison manifest uses the same seed, structures, and turn count as the qwen batch evaluation for `qwen3.5:9b`, `qwen3.5:4b`, `qwen3.6:27b`, `gemma4:26b`, and `gemma4:e4b`. It records individual endpoint or model failures as failed run artifacts and still writes the comparison report plus compact summary table.
 
 ## Single Director Ablation
 

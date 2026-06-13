@@ -10,6 +10,9 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 
 ## Runtime And Configuration
 
+- `status`: Run status in aggregate reports. Completed runs default to `completed`; experiment-level failure artifacts use `failed`.
+- `error_type`: Exception class recorded for a failed experiment run, empty for completed runs.
+- `error_message`: Failure message recorded for a failed experiment run, empty for completed runs.
 - `condition`: Evaluation condition, such as `villageragent_directors`, `single_director_ablation`, or `official_baseline`.
 - `active_directors`: Director IDs that actually produce messages. Three-director runs use `D1,D2,D3`; single-director ablations use `D1`.
 - `active_director_count`: Number of active Directors.
