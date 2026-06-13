@@ -77,6 +77,17 @@ def test_experiment_summary_marks_leakage_failure(tmp_path):
     assert rows[0]["leakage_passed"] is False
 
 
+def test_experiment_summary_includes_failed_run_status(tmp_path):
+    _write_failed_run(tmp_path, "craft_failed")
+
+    rows = build_experiment_summary(["craft_failed"], result_root=tmp_path)
+
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["error_type"] == "RuntimeError"
+    assert rows[0]["error_message"] == "model unavailable"
+    assert rows[0]["leakage_passed"] is False
+
+
 def _write_run(tmp_path, run_name, *, leakage_values, write_run_analysis=True):
     normalized = tmp_path / run_name / "normalized"
     normalized.mkdir(parents=True)
@@ -109,3 +120,19 @@ def _write_run(tmp_path, run_name, *, leakage_values, write_run_analysis=True):
         writer.writeheader()
         for value in leakage_values:
             writer.writerow({"leakage_passed": value})
+
+
+def _write_failed_run(tmp_path, run_name):
+    normalized = tmp_path / run_name / "normalized"
+    normalized.mkdir(parents=True)
+    summary = {
+        "run_name": run_name,
+        "status": "failed",
+        "condition": "villageragent_directors",
+        "failure": {"type": "RuntimeError", "message": "model unavailable"},
+        "runtime": {"status": "failed"},
+    }
+    (normalized / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    with (normalized / "metrics.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["leakage_passed"])
+        writer.writeheader()

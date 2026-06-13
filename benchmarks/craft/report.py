@@ -10,6 +10,9 @@ from benchmarks.craft.config import repo_root
 
 REPORT_FIELDS = [
     "run_name",
+    "status",
+    "error_type",
+    "error_message",
     "condition",
     "seed",
     "structures",
@@ -66,7 +69,11 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
         summary = json.load(f)
     resolved_config = _load_resolved_config(run_dir / "config.resolved.yaml")
     metrics_rows = _read_metrics(metrics_path)
-    leakage_passed = all(_as_bool(row.get("leakage_passed", True)) for row in metrics_rows)
+    status = summary.get("status") or summary.get("runtime", {}).get("status") or "completed"
+    failure = summary.get("failure") or summary.get("runtime", {}).get("failure", {}) or {}
+    leakage_passed = status == "completed" and all(
+        _as_bool(row.get("leakage_passed", True)) for row in metrics_rows
+    )
     condition = summary.get("condition", "")
     runtime = summary.get("runtime", {})
     active_directors = runtime.get("active_directors") or _active_directors_from_config(
@@ -75,6 +82,9 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
     )
     return {
         "run_name": summary.get("run_name", run_name),
+        "status": status,
+        "error_type": failure.get("type", ""),
+        "error_message": failure.get("message", ""),
         "condition": condition,
         "seed": summary.get("seed", ""),
         "structures": ",".join(str(item) for item in summary.get("structures", []) or []),

@@ -1,3 +1,6 @@
+import csv
+import json
+
 import pytest
 import yaml
 
@@ -34,6 +37,8 @@ def test_load_ollama_model_comparison_manifest():
         "configs/craft/eval_gemma4_26b_ollama.yaml",
         "configs/craft/eval_gemma4_e4b_ollama.yaml",
     ]
+    assert experiment["continue_on_error"] is True
+    assert experiment["report"]["compact_summary_output"].endswith("summary_ollama_models_v1.csv")
 
 
 def test_load_qwen_dual_dag_manifest():
@@ -139,3 +144,78 @@ def test_run_experiment_dry_run_creates_run_output(tmp_path):
     assert resolved_config["run"]["turns"] == 1
     assert resolved_config["run"]["seed"] == 9
     assert "--run-name-suffix _smoke" in command_text
+
+
+def test_run_experiment_records_failed_run_and_writes_summaries(tmp_path, monkeypatch):
+    root = repo_root()
+    config_path = tmp_path / "ollama.yaml"
+    config_path.write_text(
+        yaml.safe_dump({
+            "run": {
+                "name": "craft_failed_model",
+                "seed": 3,
+                "output_dir": str(tmp_path / "results"),
+                "structures": [0],
+                "turns": 1,
+            },
+            "craft": {
+                "repo_path": str(root / "external/CRAFT"),
+                "dataset_path": str(root / "external/CRAFT/data/structures_dataset_20.json"),
+                "use_oracle": True,
+                "oracle_n": 1,
+                "builder_tool_use": False,
+            },
+            "villageragent": {"enabled": False},
+            "models": {
+                "director": {
+                    "provider": "openai_compatible",
+                    "model": "missing-model",
+                    "base_url": "https://ollama.invalid/v1",
+                    "api_key": "ollama",
+                },
+                "builder": {
+                    "provider": "openai_compatible",
+                    "model": "missing-model",
+                    "base_url": "https://ollama.invalid/v1",
+                    "api_key": "ollama",
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "experiment.yaml"
+    manifest_path.write_text(
+        yaml.safe_dump({
+            "experiment": {
+                "name": "failed_run",
+                "continue_on_error": True,
+                "result_root": str(tmp_path / "results"),
+                "runs": [str(config_path)],
+                "report": {
+                    "output": str(tmp_path / "comparison.csv"),
+                    "json_output": str(tmp_path / "comparison.json"),
+                    "compact_summary_output": str(tmp_path / "summary.csv"),
+                    "compact_summary_json_output": str(tmp_path / "summary.json"),
+                },
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    def fail_run(*args, **kwargs):
+        raise RuntimeError("model unavailable")
+
+    monkeypatch.setattr("benchmarks.craft.experiment.run_config", fail_run)
+
+    rows = run_experiment(str(manifest_path))
+
+    assert rows[0]["run_name"] == "craft_failed_model"
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["error_type"] == "RuntimeError"
+    normalized = tmp_path / "results" / "craft_failed_model" / "normalized"
+    failure_summary = json.loads((normalized / "summary.json").read_text(encoding="utf-8"))
+    assert failure_summary["failure"]["message"] == "model unavailable"
+    with (tmp_path / "summary.csv").open("r", encoding="utf-8", newline="") as f:
+        summary_rows = list(csv.DictReader(f))
+    assert summary_rows[0]["status"] == "failed"
+    assert summary_rows[0]["leakage_passed"] == "False"

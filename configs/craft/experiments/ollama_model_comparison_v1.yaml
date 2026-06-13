@@ -1,6 +1,7 @@
 experiment:
   name: "craft_ollama_model_comparison_v1"
   result_root: "result/craft"
+  continue_on_error: true
   runs:
     - "configs/craft/eval_qwen_ollama.yaml"
     - "configs/craft/eval_qwen35_4b_ollama.yaml"
@@ -10,3 +11,5 @@ experiment:
   report:
     output: "result/craft/comparison_ollama_models_v1.csv"
     json_output: "result/craft/comparison_ollama_models_v1.json"
+    compact_summary_output: "result/craft/summary_ollama_models_v1.csv"
+    compact_summary_json_output: "result/craft/summary_ollama_models_v1.json"

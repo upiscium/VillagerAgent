@@ -8,6 +8,9 @@ from benchmarks.craft.config import repo_root
 
 SUMMARY_FIELDS = [
     "run_name",
+    "status",
+    "error_type",
+    "error_message",
     "condition",
     "mean_final_progress",
     "completion_rate",
@@ -87,9 +90,14 @@ def _summarize_run(run_name: str, *, result_root: Path, analysis: dict | None = 
     normalized_dir = result_root / run_name / "normalized"
     summary = _read_json(normalized_dir / "summary.json")
     runtime = summary.get("runtime", {})
+    status = summary.get("status") or runtime.get("status") or "completed"
+    failure = summary.get("failure") or runtime.get("failure", {}) or {}
     analysis = analysis or _read_optional_json(normalized_dir / "dual_dag_analysis.json")
     return {
         "run_name": summary.get("run_name", run_name),
+        "status": status,
+        "error_type": failure.get("type", ""),
+        "error_message": failure.get("message", ""),
         "condition": summary.get("condition", ""),
         "mean_final_progress": summary.get("mean_final_progress", 0.0),
         "completion_rate": summary.get("completion_rate", 0.0),
@@ -104,7 +112,7 @@ def _summarize_run(run_name: str, *, result_root: Path, analysis: dict | None = 
         "supported_action_count": analysis.get("supported_action_count", 0),
         "conflicted_action_count": analysis.get("conflicted_action_count", 0),
         "required_evidence_action_count": analysis.get("required_evidence_action_count", 0),
-        "leakage_passed": _leakage_passed(normalized_dir),
+        "leakage_passed": status == "completed" and _leakage_passed(normalized_dir),
     }
 
 
