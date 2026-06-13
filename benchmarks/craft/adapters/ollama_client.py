@@ -1,5 +1,7 @@
 import requests
 
+from benchmarks.craft.adapters.llm_output import response_attempt_info, validate_llm_output
+
 
 class OllamaNativeClient:
     def __init__(self, *, base_url: str, think: bool = False):
@@ -31,24 +33,27 @@ class OllamaNativeClient:
         data = response.json()
         message = data.get("message", {})
         content = message.get("content", "") or ""
-        thinking = message.get("thinking", "") or ""
+        attempt = response_attempt_info(
+            content=content,
+            reasoning=message.get("thinking", "") or "",
+            finish_reason=data.get("done_reason"),
+            usage={
+                "prompt_tokens": data.get("prompt_eval_count"),
+                "completion_tokens": data.get("eval_count"),
+                "total_tokens": _sum_optional(data.get("prompt_eval_count"), data.get("eval_count")),
+            },
+            require_final_answer=True,
+        )
+        validation = validate_llm_output(attempt["content"], require_final_answer=True)
         self.last_response_info = {
             "model": model,
             "provider": "ollama_native",
-            "content_empty": not bool(content),
-            "attempts": [{
-                "content": content,
-                "content_chars": len(content),
-                "reasoning_chars": len(thinking),
-                "finish_reason": data.get("done_reason"),
-                "usage": {
-                    "prompt_tokens": data.get("prompt_eval_count"),
-                    "completion_tokens": data.get("eval_count"),
-                    "total_tokens": _sum_optional(data.get("prompt_eval_count"), data.get("eval_count")),
-                },
-            }],
+            "content_empty": validation["content_empty"],
+            "malformed_final_answer": validation["malformed_final_answer"],
+            "validation_errors": validation["validation_errors"],
+            "attempts": [attempt],
         }
-        return content
+        return attempt["content"]
 
 
 def _sum_optional(left, right):

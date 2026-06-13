@@ -16,6 +16,8 @@ def test_client_retries_empty_content_with_reasoning():
 
     assert content == "final public message"
     assert client.last_response_info["content_empty"] is False
+    assert client.last_response_info["malformed_final_answer"] is True
+    assert client.last_response_info["validation_errors"] == ["malformed_final_answer"]
     assert len(client.last_response_info["attempts"]) == 2
     assert client.client.chat.completions.calls[1]["max_tokens"] == 4096
 
@@ -34,7 +36,25 @@ def test_client_records_empty_response_metadata():
 
     assert content == ""
     assert client.last_response_info["content_empty"] is True
+    assert client.last_response_info["validation_errors"] == ["empty_content"]
     assert len(client.last_response_info["attempts"]) == 1
+
+
+def test_client_records_valid_final_answer_metadata():
+    client = OpenAICompatibleClient(base_url="http://unused", api_key="test")
+    client.client = _FakeOpenAI([
+        _FakeResponse(content="PLACE:ys:(0,0):0:CONFIRM:ok", reasoning="", finish_reason="stop"),
+    ])
+
+    content = client.chat(
+        [{"role": "user", "content": "Place something"}],
+        model="gemma4:e4b",
+        max_tokens=10,
+    )
+
+    assert content == "PLACE:ys:(0,0):0:CONFIRM:ok"
+    assert client.last_response_info["malformed_final_answer"] is False
+    assert client.last_response_info["validation_errors"] == []
 
 
 class _FakeOpenAI:

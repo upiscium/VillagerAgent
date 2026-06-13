@@ -1,5 +1,7 @@
 from openai import OpenAI
 
+from benchmarks.craft.adapters.llm_output import response_attempt_info, validate_llm_output
+
 
 class OpenAICompatibleClient:
     def __init__(self, *, base_url: str, api_key: str):
@@ -39,10 +41,13 @@ class OpenAICompatibleClient:
             attempts.append(retry_info)
             content = retry_info["content"]
 
+        validation = validate_llm_output(content, require_final_answer=True)
         self.last_response_info = {
             "model": model,
             "attempts": attempts,
-            "content_empty": not bool(content),
+            "content_empty": validation["content_empty"],
+            "malformed_final_answer": validation["malformed_final_answer"],
+            "validation_errors": validation["validation_errors"],
         }
         return content or ""
 
@@ -63,15 +68,13 @@ class OpenAICompatibleClient:
 def _response_info(response) -> dict:
     choice = response.choices[0]
     message = choice.message
-    content = message.content or ""
-    reasoning = getattr(message, "reasoning", None) or ""
-    return {
-        "content": content,
-        "content_chars": len(content),
-        "reasoning_chars": len(reasoning),
-        "finish_reason": getattr(choice, "finish_reason", None),
-        "usage": _usage_dict(getattr(response, "usage", None)),
-    }
+    return response_attempt_info(
+        content=message.content,
+        reasoning=getattr(message, "reasoning", None),
+        finish_reason=getattr(choice, "finish_reason", None),
+        usage=_usage_dict(getattr(response, "usage", None)),
+        require_final_answer=True,
+    )
 
 
 def _usage_dict(usage) -> dict | None:
