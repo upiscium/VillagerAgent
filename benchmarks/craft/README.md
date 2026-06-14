@@ -87,6 +87,14 @@ python -m benchmarks.craft.experiment --config configs/craft/experiments/qwen_ro
 
 This robustness manifest runs the qwen baseline, Dual-DAG condition, single-Director Dual-DAG ablation, and comparable official baseline artifact over seeds `1, 3, 5` and structures `0, 1, 2, 3, 4`. It writes comparison, compact summary, and variance summary artifacts under `result/craft/`.
 
+To run the full official CRAFT baseline through `external/CRAFT/run_craft.py`, use:
+
+```bash
+python -m benchmarks.craft.run --config configs/craft/official_baseline_full.yaml
+```
+
+This invokes the upstream CRAFT CLI with the configured seed, structures, turns, oracle, and no-tools settings, then normalizes the official JSON logs into the same `summary.json`, `turns.jsonl`, and `metrics.csv` format used by other CRAFT runs. The existing `configs/craft/official_baseline.yaml` remains available as a lightweight comparable artifact baseline.
+
 ## Single Director Ablation
 
 ```bash
@@ -204,7 +212,7 @@ Interpretation notes:
 
 - The 3-Director Dual-DAG run matched the non-gated 3-Director progress while increasing support evidence and reducing required-evidence count.
 - The single-Director ablation reached the same progress on this small final slice, but with much less support evidence.
-- The official baseline row is a comparable artifact baseline, not a full official CRAFT API runner.
+- Use `configs/craft/official_baseline_full.yaml` when a full upstream CRAFT CLI baseline is required; `configs/craft/official_baseline.yaml` remains a comparable artifact baseline.
 - `leakage_passed=True` confirms that the prompt/artifact partial-information checks passed for all rows.
 
 ## Partial-Information Guard

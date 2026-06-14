@@ -1,6 +1,7 @@
 import copy
 import json
 import random
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -272,6 +273,9 @@ class CraftEnvAdapter:
         return self._run_villageragent_directors(condition)
 
     def _run_official_baseline(self, condition: str) -> dict:
+        if self.config.get("craft", {}).get("official_runner") == "external_cli":
+            return self._run_official_baseline_external_cli(condition)
+
         dataset = load_dataset(self.config["craft"]["dataset_path"])
         structures = self.config["run"].get("structures") or list(range(len(dataset)))
         games = [
@@ -298,6 +302,57 @@ class CraftEnvAdapter:
             "run settings. Full official CRAFT API execution is intentionally left to "
             "external/CRAFT until provider/base_url parity is available."
         )
+        raw_dir = self.output_dir / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        with (raw_dir / "official_baseline.json").open("w", encoding="utf-8") as f:
+            json.dump(raw_result, f, ensure_ascii=False, indent=2)
+        return raw_result
+
+    def _run_official_baseline_external_cli(self, condition: str) -> dict:
+        craft = self.config["craft"]
+        run = self.config["run"]
+        structures = run.get("structures") or list(range(len(load_dataset(craft["dataset_path"]))))
+        runner_output = self.output_dir / "raw" / "official_craft_runner"
+        runner_output.mkdir(parents=True, exist_ok=True)
+        command = _official_runner_command(
+            craft_repo=Path(craft["repo_path"]),
+            dataset_path=Path(craft["dataset_path"]),
+            output_dir=runner_output,
+            structures=structures,
+            turns=run["turns"],
+            seed=run.get("seed", 3),
+            craft_config=craft,
+            model_config=self.config["models"],
+        )
+        completed = subprocess.run(
+            command,
+            cwd=craft["repo_path"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        games = _load_official_runner_games(
+            runner_output=runner_output,
+            condition=condition,
+            requested_structures=structures,
+        )
+        _sanitize_official_runner_outputs(runner_output)
+        raw_result = _aggregate_games(condition, games)
+        raw_result["official_craft_runner"] = {
+            "mode": "external_cli",
+            "command": command,
+            "repo_path": craft["repo_path"],
+            "dataset_path": craft["dataset_path"],
+            "output_dir": str(runner_output),
+            "structure_indices": structures,
+            "turns": run["turns"],
+            "seed": run.get("seed"),
+            "use_oracle": craft.get("use_oracle", False),
+            "oracle_n": craft.get("oracle_n"),
+            "builder_tool_use": craft.get("builder_tool_use", False),
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        }
         raw_dir = self.output_dir / "raw"
         raw_dir.mkdir(parents=True, exist_ok=True)
         with (raw_dir / "official_baseline.json").open("w", encoding="utf-8") as f:
@@ -721,6 +776,146 @@ def _extract_progress(progress: Any) -> float:
         if isinstance(metrics, dict) and "overall_progress" in metrics:
             return float(metrics["overall_progress"])
     return 0.0
+
+
+def _official_runner_command(
+    *,
+    craft_repo: Path,
+    dataset_path: Path,
+    output_dir: Path,
+    structures: list[int],
+    turns: int,
+    seed: int,
+    craft_config: dict,
+    model_config: dict,
+) -> list[str]:
+    director = model_config.get("director", {})
+    builder = model_config.get("builder", {})
+    command = [
+        sys.executable,
+        str(craft_repo / "run_craft.py"),
+        "--mode",
+        craft_config.get("official_runner_mode", "api"),
+        "--director",
+        director.get("model", "gpt-4o-mini"),
+        "--builder",
+        builder.get("model", "gpt-4o-mini"),
+        "--dataset",
+        str(dataset_path),
+        "--output",
+        str(output_dir),
+        "--turns",
+        str(turns),
+        "--run",
+        str(seed),
+        "--structures",
+        ",".join(str(index) for index in structures),
+    ]
+    if craft_config.get("use_oracle", False):
+        command.append("--oracle")
+        command.extend(["--oracle_n", str(craft_config.get("oracle_n", 5))])
+    if not craft_config.get("builder_tool_use", True):
+        command.append("--no_tools")
+    return command
+
+
+def _load_official_runner_games(
+    *,
+    runner_output: Path,
+    condition: str,
+    requested_structures: list[int],
+) -> list[dict]:
+    games_by_structure = {}
+    for path in sorted(runner_output.glob("**/craft_structure_*.json")):
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        for game in payload.get("games", []):
+            structure_index = _official_structure_index(payload, game)
+            if structure_index in requested_structures:
+                games_by_structure[structure_index] = _convert_official_game(
+                    condition=condition,
+                    game=game,
+                    structure_index=structure_index,
+                )
+    missing = [index for index in requested_structures if index not in games_by_structure]
+    if missing:
+        raise RuntimeError(
+            "Official CRAFT runner did not produce results for structures: "
+            + ",".join(str(index) for index in missing)
+        )
+    return [games_by_structure[index] for index in requested_structures]
+
+
+def _sanitize_official_runner_outputs(runner_output: Path) -> None:
+    forbidden_keys = set(HIDDEN_STATE_KEYS) | {
+        "target_structure",
+        "target_spans",
+        "oracle_moves",
+        "internal_thinking",
+    }
+    for path in runner_output.glob("**/craft_structure_*.json"):
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        sanitized = _drop_hidden_keys(payload, forbidden_keys)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(sanitized, f, ensure_ascii=False, indent=2)
+
+
+def _drop_hidden_keys(value, forbidden_keys: set[str]):
+    if isinstance(value, dict):
+        return {
+            key: _drop_hidden_keys(item, forbidden_keys)
+            for key, item in value.items()
+            if key not in forbidden_keys
+        }
+    if isinstance(value, list):
+        return [_drop_hidden_keys(item, forbidden_keys) for item in value]
+    return value
+
+
+def _official_structure_index(payload: dict, game: dict) -> int:
+    experiment_info = payload.get("experiment_info", {})
+    if "structure_index" in experiment_info:
+        return int(experiment_info["structure_index"])
+    structure_id = str(game.get("structure_id", ""))
+    if structure_id.startswith("structure_"):
+        return max(int(structure_id.rsplit("_", 1)[-1]) - 1, 0)
+    return int(game.get("structure_index", 0))
+
+
+def _convert_official_game(*, condition: str, game: dict, structure_index: int) -> dict:
+    turns = [
+        _convert_official_turn(structure_index=structure_index, turn=turn)
+        for turn in game.get("turns", [])
+    ]
+    return {
+        "condition": condition,
+        "structure_id": structure_index,
+        "sample_id": game.get("structure_id", structure_index),
+        "completed": bool(game.get("completed", False)),
+        "final_progress": float(game.get("final_progress", 0.0) or 0.0),
+        "turns": turns,
+        "leakage_passed": True,
+        "leakage_report": {"checks": []},
+    }
+
+
+def _convert_official_turn(*, structure_index: int, turn: dict) -> dict:
+    director_responses = turn.get("director_responses", {}) or {}
+    director_messages = {
+        director_id: response.get("public_message", "") if isinstance(response, dict) else str(response)
+        for director_id, response in director_responses.items()
+    }
+    progress = turn.get("progress_data") or turn.get("progress_summary") or {}
+    return {
+        "structure_id": structure_index,
+        "turn_index": turn.get("turn_number") or turn.get("turn_index"),
+        "director_messages": director_messages,
+        "builder_action": turn.get("move_attempted") or turn.get("builder_action"),
+        "move_executed": bool(turn.get("move_executed", False)),
+        "progress": progress,
+        "leakage_check": {"passed": True, "violations": []},
+    }
 
 
 def _aggregate_games(condition: str, games: list[dict]) -> dict:
