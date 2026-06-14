@@ -20,7 +20,7 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 - `use_task_decomposer`: Whether the VillagerAgent task decomposer is enabled.
 - `use_agent_controller`: Whether the VillagerAgent controller is enabled.
 - `use_state_manager`: Whether the VillagerAgent state manager is enabled.
-- `baseline_type`: Baseline implementation type. The current official baseline row is `comparable_artifact`, not a full official CRAFT API runner.
+- `baseline_type`: Baseline implementation type. `comparable_artifact` is the lightweight artifact row generated without invoking upstream CRAFT; `full_official_runner` is produced by `external/CRAFT/run_craft.py` and normalized into the local CRAFT artifact format.
 - `seed`: Random seed used for the run.
 - `structures`: Comma-separated CRAFT structure IDs evaluated by the run.
 

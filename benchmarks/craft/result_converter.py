@@ -53,7 +53,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
             "active_director_count": len(active_directors),
             "builder_fallback_count": builder_fallback_count,
             "builder_fallback_rate": builder_fallback_count / len(turns) if turns else 0.0,
-            "baseline_type": _baseline_type(condition),
+            "baseline_type": _baseline_type(condition, raw_result),
             **epistemic_counts,
             "hypothesis_count": hypothesis_count,
             **action_candidate_metrics,
@@ -167,7 +167,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
                 "conflict_gate_count": game_clarification_metrics["conflict_gate_count"],
                 "dual_dag_node_count": game_dual_dag_metrics["dual_dag_node_count"],
                 "dual_dag_edge_count": game_dual_dag_metrics["dual_dag_edge_count"],
-                "baseline_type": _baseline_type(condition),
+                "baseline_type": _baseline_type(condition, raw_result),
                 "use_task_decomposer": config.get("villageragent", {}).get("use_task_decomposer", False),
                 "use_agent_controller": config.get("villageragent", {}).get("use_agent_controller", False),
                 "use_state_manager": config.get("villageragent", {}).get("use_state_manager", False),
@@ -192,8 +192,11 @@ def _active_directors(config: dict, condition: str) -> list[str]:
     return []
 
 
-def _baseline_type(condition: str) -> str:
+def _baseline_type(condition: str, raw_result: dict | None = None) -> str:
     if condition == "official_baseline":
+        runner = (raw_result or {}).get("official_craft_runner", {})
+        if runner.get("mode") == "external_cli":
+            return "full_official_runner"
         return "comparable_artifact"
     return ""
 

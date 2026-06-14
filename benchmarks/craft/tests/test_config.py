@@ -60,10 +60,14 @@ def test_single_director_qwen_ollama_config_uses_native_provider():
 
 def test_official_baseline_matches_qwen_batch_eval_axis():
     baseline = load_config("configs/craft/official_baseline.yaml")
+    full_baseline = load_config("configs/craft/official_baseline_full.yaml")
     batch = load_config("configs/craft/eval_qwen_ollama.yaml")
-    assert baseline["run"]["seed"] == batch["run"]["seed"]
-    assert baseline["run"]["structures"] == batch["run"]["structures"]
-    assert baseline["run"]["turns"] == batch["run"]["turns"]
+    for config in (baseline, full_baseline):
+        assert config["run"]["seed"] == batch["run"]["seed"]
+        assert config["run"]["structures"] == batch["run"]["structures"]
+        assert config["run"]["turns"] == batch["run"]["turns"]
+        assert condition_from_config(config) == "official_baseline"
+    assert full_baseline["craft"]["official_runner"] == "external_cli"
 
 
 def test_ollama_model_comparison_configs_share_eval_axis():
