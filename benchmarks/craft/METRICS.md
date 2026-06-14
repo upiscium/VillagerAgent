@@ -11,6 +11,7 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 ## Runtime And Configuration
 
 - `status`: Run status in aggregate reports. Completed runs default to `completed`; experiment-level failure artifacts use `failed`.
+- `run_group`: Run name with a trailing `_seedN` suffix removed. Robustness variance summaries use this by default to keep conditions such as non-Dual-DAG and Dual-DAG qwen runs separate even when their `condition` value matches.
 - `error_type`: Exception class recorded for a failed experiment run, empty for completed runs.
 - `error_message`: Failure message recorded for a failed experiment run, empty for completed runs.
 - `condition`: Evaluation condition, such as `villageragent_directors`, `single_director_ablation`, or `official_baseline`.
@@ -20,6 +21,8 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 - `use_agent_controller`: Whether the VillagerAgent controller is enabled.
 - `use_state_manager`: Whether the VillagerAgent state manager is enabled.
 - `baseline_type`: Baseline implementation type. The current official baseline row is `comparable_artifact`, not a full official CRAFT API runner.
+- `seed`: Random seed used for the run.
+- `structures`: Comma-separated CRAFT structure IDs evaluated by the run.
 
 ## Builder Behavior
 
@@ -80,3 +83,16 @@ For paper-facing or quick inspection tables, focus on:
 - Coordination quality: `claim_support_count`, `claim_conflict_count`, `claim_required_evidence_count`
 - Graph richness: `dual_dag_node_count`, `dual_dag_edge_count`, `supported_action_count`, `conflicted_action_count`, `required_evidence_action_count`
 - Safety: `leakage_passed`
+
+## Variance Summary Columns
+
+Robustness manifests can emit a variance summary grouped by `run_group` by default:
+
+- `group`: Group key used for aggregation, usually `run_group`.
+- `run_count`: Total runs in the group, including failed runs.
+- `completed_run_count`: Runs with `status=completed` included in numeric variance calculations.
+- `failed_run_count`: Runs with non-completed status.
+- `seed_count`: Number of distinct seeds represented by the group.
+- `structures`: Union of structure IDs represented by the group.
+- `mean_final_progress_mean`, `mean_final_progress_stddev`, `mean_final_progress_min`, `mean_final_progress_max`: Mean, population standard deviation, minimum, and maximum over completed runs.
+- `completion_rate_mean`, `completion_rate_stddev`, `completion_rate_min`, `completion_rate_max`: Mean, population standard deviation, minimum, and maximum over completed runs.

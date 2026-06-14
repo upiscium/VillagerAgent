@@ -14,8 +14,11 @@ from benchmarks.craft.config import (
 )
 from benchmarks.craft.experiment_summary import (
     build_experiment_summary,
+    build_variance_summary,
     write_summary_csv,
     write_summary_json,
+    write_variance_csv,
+    write_variance_json,
 )
 from benchmarks.craft.report import build_comparison_report, write_csv_report, write_json_report
 from benchmarks.craft.run import run_config
@@ -41,8 +44,8 @@ def load_experiment(path: str) -> dict:
     runs = experiment.get("runs")
     if not isinstance(runs, list) or not runs:
         raise ExperimentConfigError("experiment.runs must be a non-empty list.")
-    if not all(isinstance(run, str) for run in runs):
-        raise ExperimentConfigError("experiment.runs entries must be config paths.")
+    for run in runs:
+        _validate_run_spec(run)
     overrides = experiment.get("overrides", {})
     if overrides and not isinstance(overrides, dict):
         raise ExperimentConfigError("experiment.overrides must be a mapping when provided.")
@@ -64,15 +67,17 @@ def run_experiment(
     run_names = []
     failures = []
     continue_on_error = bool(experiment.get("continue_on_error", False))
-    for config_path in experiment["runs"]:
-        config = load_config(config_path, overrides=run_overrides)
+    for run_spec in _expand_run_specs(experiment["runs"], run_overrides):
+        config_path = run_spec["config"]
+        spec_overrides = run_spec["overrides"]
+        config = load_config(config_path, overrides=spec_overrides)
         output_dir = output_dir_for_config(config)
         run_names.append(output_dir.name)
         try:
             run_config(
                 config_path,
                 dry_run=dry_run,
-                overrides=run_overrides,
+                overrides=spec_overrides,
                 command_text=command,
             )
         except Exception as exc:
@@ -121,6 +126,22 @@ def run_experiment(
             if not compact_json_path.is_absolute():
                 compact_json_path = root / compact_json_path
             write_summary_json(compact_rows, compact_json_path)
+        variance_output = report.get("variance_summary_output")
+        if variance_output:
+            variance_rows = build_variance_summary(
+                compact_rows,
+                group_by=report.get("variance_group_by", "run_group"),
+            )
+            variance_path = _report_path(variance_output, run_overrides)
+            if not variance_path.is_absolute():
+                variance_path = root / variance_path
+            write_variance_csv(variance_rows, variance_path)
+            variance_json_output = report.get("variance_summary_json_output")
+            if variance_json_output:
+                variance_json_path = _report_path(variance_json_output, run_overrides)
+                if not variance_json_path.is_absolute():
+                    variance_json_path = root / variance_json_path
+                write_variance_json(variance_rows, variance_json_path)
     print(f"Wrote CRAFT experiment report: {output}")
     if failures:
         print(f"Recorded {len(failures)} CRAFT experiment run failure(s).")
@@ -154,6 +175,48 @@ def _experiment_overrides(experiment: dict, cli_overrides: dict | None) -> dict:
         if value is not None:
             manifest_overrides[key] = value
     return manifest_overrides
+
+
+def _validate_run_spec(run) -> None:
+    if isinstance(run, str):
+        return
+    if not isinstance(run, dict) or not isinstance(run.get("config"), str):
+        raise ExperimentConfigError("experiment.runs entries must be config paths or mappings with config.")
+    if "seeds" in run and not _is_int_list(run["seeds"]):
+        raise ExperimentConfigError("experiment.runs[].seeds must be a list[int].")
+    if "structures" in run and not _is_int_list(run["structures"]):
+        raise ExperimentConfigError("experiment.runs[].structures must be a list[int].")
+    if "suffix" in run and not isinstance(run["suffix"], str):
+        raise ExperimentConfigError("experiment.runs[].suffix must be a string.")
+
+
+def _expand_run_specs(runs: list, base_overrides: dict) -> list[dict]:
+    expanded = []
+    for run in runs:
+        if isinstance(run, str):
+            expanded.append({"config": run, "overrides": dict(base_overrides)})
+            continue
+        seeds = run.get("seeds") or [base_overrides.get("seed")]
+        suffix = run.get("suffix", "")
+        for seed in seeds:
+            overrides = dict(base_overrides)
+            if seed is not None:
+                overrides["seed"] = seed
+            if run.get("structures") is not None:
+                overrides["structures"] = run["structures"]
+            override_suffix = base_overrides.get("run_name_suffix", "")
+            if suffix:
+                override_suffix = f"{override_suffix}{suffix}"
+            if len(seeds) > 1 or seed is not None:
+                override_suffix = f"{override_suffix}_seed{seed}"
+            if override_suffix:
+                overrides["run_name_suffix"] = override_suffix
+            expanded.append({"config": run["config"], "overrides": overrides})
+    return expanded
+
+
+def _is_int_list(value) -> bool:
+    return isinstance(value, list) and all(isinstance(item, int) for item in value)
 
 
 def _command_text(manifest_path: str, *, dry_run: bool, overrides: dict | None) -> str:
