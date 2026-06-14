@@ -1,11 +1,7 @@
-FORBIDDEN_SERIALIZED_KEYS = {
-    "target_structure",
-    "oracle_moves",
-    "all_private_views",
-    "raw_private_view",
-    "hidden_spans",
-    "hidden_labels",
-}
+from benchmarks.craft.hidden_state_keys import BASE_HIDDEN_STATE_KEYS
+
+
+FORBIDDEN_SERIALIZED_KEYS = BASE_HIDDEN_STATE_KEYS
 
 
 def sanitize_for_serialization(value):

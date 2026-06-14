@@ -15,10 +15,13 @@ from benchmarks.craft.dual_dag.action_candidates import (
     build_action_candidate_metadata,
 )
 from benchmarks.craft.dual_dag.evidence_prompt import (
-    HIDDEN_STATE_KEYS,
     append_public_evidence_context,
     append_public_evidence_summary,
     build_public_evidence_summary,
+)
+from benchmarks.craft.hidden_state_keys import (
+    BASE_HIDDEN_STATE_KEYS,
+    OFFICIAL_RUNNER_HIDDEN_STATE_KEYS,
 )
 from benchmarks.craft.dual_dag.gating import should_clarify
 from benchmarks.craft.dual_dag.runtime import DualDAGRuntime
@@ -754,7 +757,7 @@ def _builder_forbidden_payloads(
     }
     for director_id, view in private_views.items():
         forbidden[f"{director_id}_raw_private_view"] = view.raw_view
-    for key in HIDDEN_STATE_KEYS:
+    for key in BASE_HIDDEN_STATE_KEYS:
         forbidden[f"hidden_key:{key}"] = key
     return forbidden
 
@@ -847,12 +850,7 @@ def _load_official_runner_games(
 
 
 def _sanitize_official_runner_outputs(runner_output: Path) -> None:
-    forbidden_keys = set(HIDDEN_STATE_KEYS) | {
-        "target_structure",
-        "target_spans",
-        "oracle_moves",
-        "internal_thinking",
-    }
+    forbidden_keys = set(OFFICIAL_RUNNER_HIDDEN_STATE_KEYS)
     for path in runner_output.glob("**/craft_structure_*.json"):
         with path.open("r", encoding="utf-8") as f:
             payload = json.load(f)

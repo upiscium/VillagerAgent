@@ -5,6 +5,7 @@ from collections import Counter
 from pathlib import Path
 
 from benchmarks.craft.config import repo_root
+from benchmarks.craft.hidden_state_keys import hidden_state_key_labels
 
 
 TURN_FIELDNAMES = [
@@ -25,14 +26,7 @@ TURN_FIELDNAMES = [
     "progress",
 ]
 
-HIDDEN_STATE_KEYS = [
-    "target_structure",
-    "oracle_moves",
-    "all_private_views",
-    "raw_private_view",
-    "hidden_spans",
-    "hidden_labels",
-]
+HIDDEN_STATE_KEYS = hidden_state_key_labels()
 
 
 class DualDAGAnalysisError(ValueError):

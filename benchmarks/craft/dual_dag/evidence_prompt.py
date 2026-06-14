@@ -1,14 +1,9 @@
 import json
 
+from benchmarks.craft.hidden_state_keys import BASE_HIDDEN_STATE_KEYS
 
-HIDDEN_STATE_KEYS = {
-    "target_structure",
-    "oracle_moves",
-    "all_private_views",
-    "raw_private_view",
-    "hidden_spans",
-    "hidden_labels",
-}
+
+HIDDEN_STATE_KEYS = BASE_HIDDEN_STATE_KEYS
 
 
 def append_public_evidence_summary(

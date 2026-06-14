@@ -1,15 +1,10 @@
 import copy
 
 from benchmarks.craft.craft_protocol import PrivateAgentState, PublicCoordinationState
+from benchmarks.craft.hidden_state_keys import BASE_HIDDEN_STATE_KEYS
 
 
-FORBIDDEN_STATE_KEYS = {
-    "target_structure",
-    "oracle_moves",
-    "all_private_views",
-    "hidden_spans",
-    "hidden_labels",
-}
+FORBIDDEN_STATE_KEYS = BASE_HIDDEN_STATE_KEYS
 
 
 class PartialInformationStateError(ValueError):
