@@ -6,17 +6,23 @@ import pytest
 from benchmarks.craft.experiment_summary import (
     ExperimentSummaryError,
     build_experiment_summary,
+    build_variance_summary,
     write_summary_csv,
     write_summary_json,
+    write_variance_csv,
+    write_variance_json,
 )
 
 
 def test_experiment_summary_combines_runtime_and_analysis_metrics(tmp_path):
-    _write_run(tmp_path, "craft_dual_dag", leakage_values=["True"])
+    _write_run(tmp_path, "craft_dual_dag", leakage_values=["True"], seed=3, structures=[0, 1])
 
     rows = build_experiment_summary(["craft_dual_dag"], result_root=tmp_path)
 
     assert rows[0]["run_name"] == "craft_dual_dag"
+    assert rows[0]["run_group"] == "craft_dual_dag"
+    assert rows[0]["seed"] == 3
+    assert rows[0]["structures"] == "0,1"
     assert rows[0]["mean_final_progress"] == 0.25
     assert rows[0]["claim_required_evidence_count"] == 3
     assert rows[0]["supported_action_count"] == 2
@@ -88,13 +94,68 @@ def test_experiment_summary_includes_failed_run_status(tmp_path):
     assert rows[0]["leakage_passed"] is False
 
 
-def _write_run(tmp_path, run_name, *, leakage_values, write_run_analysis=True):
+def test_variance_summary_groups_completed_runs_and_records_failures(tmp_path):
+    _write_run(tmp_path, "craft_dual_dag_seed1", leakage_values=["True"], seed=1, progress=0.2)
+    _write_run(tmp_path, "craft_dual_dag_seed3", leakage_values=["True"], seed=3, progress=0.4)
+    _write_failed_run(tmp_path, "craft_dual_dag_seed5", seed=5)
+    rows = build_experiment_summary(
+        ["craft_dual_dag_seed1", "craft_dual_dag_seed3", "craft_dual_dag_seed5"],
+        result_root=tmp_path,
+    )
+
+    variance_rows = build_variance_summary(rows)
+
+    assert variance_rows[0]["group"] == "craft_dual_dag"
+    assert variance_rows[0]["run_count"] == 3
+    assert variance_rows[0]["completed_run_count"] == 2
+    assert variance_rows[0]["failed_run_count"] == 1
+    assert variance_rows[0]["seed_count"] == 3
+    assert variance_rows[0]["structures"] == "0,1,2"
+    assert variance_rows[0]["mean_final_progress_mean"] == 0.30000000000000004
+    assert variance_rows[0]["mean_final_progress_stddev"] == 0.1
+
+
+def test_variance_summary_writes_csv_and_json(tmp_path):
+    rows = [{
+        "condition": "villageragent_directors",
+        "status": "completed",
+        "seed": 1,
+        "structures": "0,1",
+        "mean_final_progress": 0.5,
+        "completion_rate": 0.25,
+    }]
+    variance_rows = build_variance_summary(rows)
+    csv_path = tmp_path / "variance.csv"
+    json_path = tmp_path / "variance.json"
+
+    write_variance_csv(variance_rows, csv_path)
+    write_variance_json(variance_rows, json_path)
+
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        csv_rows = list(csv.DictReader(f))
+    assert csv_rows[0]["group"] == "villageragent_directors"
+    assert json.loads(json_path.read_text(encoding="utf-8"))["groups"][0]["seed_count"] == 1
+
+
+def _write_run(
+    tmp_path,
+    run_name,
+    *,
+    leakage_values,
+    write_run_analysis=True,
+    seed=3,
+    structures=None,
+    progress=0.25,
+):
+    structures = structures or [0, 1, 2]
     normalized = tmp_path / run_name / "normalized"
     normalized.mkdir(parents=True)
     summary = {
         "run_name": run_name,
         "condition": "villageragent_directors",
-        "mean_final_progress": 0.25,
+        "seed": seed,
+        "structures": structures,
+        "mean_final_progress": progress,
         "completion_rate": 0.0,
         "runtime": {
             "builder_fallback_rate": 0.2,
@@ -122,13 +183,15 @@ def _write_run(tmp_path, run_name, *, leakage_values, write_run_analysis=True):
             writer.writerow({"leakage_passed": value})
 
 
-def _write_failed_run(tmp_path, run_name):
+def _write_failed_run(tmp_path, run_name, *, seed=3):
     normalized = tmp_path / run_name / "normalized"
     normalized.mkdir(parents=True)
     summary = {
         "run_name": run_name,
         "status": "failed",
         "condition": "villageragent_directors",
+        "seed": seed,
+        "structures": [0, 1, 2],
         "failure": {"type": "RuntimeError", "message": "model unavailable"},
         "runtime": {"status": "failed"},
     }

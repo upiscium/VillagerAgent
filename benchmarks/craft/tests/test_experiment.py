@@ -7,6 +7,7 @@ import yaml
 from benchmarks.craft.config import repo_root
 from benchmarks.craft.experiment import (
     ExperimentConfigError,
+    _expand_run_specs,
     _experiment_overrides,
     _report_path,
     _structure_override,
@@ -53,6 +54,19 @@ def test_load_qwen_dual_dag_manifest():
     ]
 
 
+def test_load_qwen_robustness_manifest():
+    manifest = load_experiment("configs/craft/experiments/qwen_robustness_v1.yaml")
+    experiment = manifest["experiment"]
+    assert experiment["name"] == "craft_qwen_robustness_v1"
+    assert experiment["runs"][0] == {
+        "config": "configs/craft/eval_qwen_ollama.yaml",
+        "suffix": "_robust",
+        "seeds": [1, 3, 5],
+        "structures": [0, 1, 2, 3, 4],
+    }
+    assert experiment["report"]["variance_summary_output"].endswith("variance_qwen_robustness_v1.csv")
+
+
 def test_load_experiment_rejects_empty_runs(tmp_path):
     manifest_path = tmp_path / "empty.yaml"
     manifest_path.write_text(yaml.safe_dump({"experiment": {"runs": []}}), encoding="utf-8")
@@ -70,6 +84,16 @@ def test_load_experiment_rejects_non_mapping_overrides(tmp_path):
         load_experiment(str(manifest_path))
 
 
+def test_load_experiment_rejects_bad_run_spec(tmp_path):
+    manifest_path = tmp_path / "bad_run_spec.yaml"
+    manifest_path.write_text(
+        yaml.safe_dump({"experiment": {"runs": [{"config": "config.yaml", "seeds": ["bad"]}]}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ExperimentConfigError, match="seeds"):
+        load_experiment(str(manifest_path))
+
+
 def test_experiment_cli_overrides_replace_manifest_overrides():
     overrides = _experiment_overrides(
         {"overrides": {"structures": [0, 1], "turns": 5, "run_name_suffix": "_manifest"}},
@@ -81,6 +105,38 @@ def test_experiment_cli_overrides_replace_manifest_overrides():
     assert str(_report_path("result/craft/comparison.csv", overrides)).endswith(
         "result/craft/comparison_smoke.csv"
     )
+
+
+def test_expand_run_specs_adds_seed_suffix_and_structure_override():
+    runs = [{
+        "config": "configs/craft/eval_qwen_ollama.yaml",
+        "suffix": "_robust",
+        "seeds": [1, 3],
+        "structures": [0, 1, 2, 3, 4],
+    }]
+
+    expanded = _expand_run_specs(runs, {"run_name_suffix": "_final", "turns": 5})
+
+    assert expanded == [
+        {
+            "config": "configs/craft/eval_qwen_ollama.yaml",
+            "overrides": {
+                "run_name_suffix": "_final_robust_seed1",
+                "turns": 5,
+                "seed": 1,
+                "structures": [0, 1, 2, 3, 4],
+            },
+        },
+        {
+            "config": "configs/craft/eval_qwen_ollama.yaml",
+            "overrides": {
+                "run_name_suffix": "_final_robust_seed3",
+                "turns": 5,
+                "seed": 3,
+                "structures": [0, 1, 2, 3, 4],
+            },
+        },
+    ]
 
 
 def test_run_experiment_dry_run_creates_run_output(tmp_path):
@@ -196,6 +252,8 @@ def test_run_experiment_records_failed_run_and_writes_summaries(tmp_path, monkey
                     "json_output": str(tmp_path / "comparison.json"),
                     "compact_summary_output": str(tmp_path / "summary.csv"),
                     "compact_summary_json_output": str(tmp_path / "summary.json"),
+                    "variance_summary_output": str(tmp_path / "variance.csv"),
+                    "variance_summary_json_output": str(tmp_path / "variance.json"),
                 },
             }
         }),
@@ -219,3 +277,9 @@ def test_run_experiment_records_failed_run_and_writes_summaries(tmp_path, monkey
         summary_rows = list(csv.DictReader(f))
     assert summary_rows[0]["status"] == "failed"
     assert summary_rows[0]["leakage_passed"] == "False"
+    with (tmp_path / "variance.csv").open("r", encoding="utf-8", newline="") as f:
+        variance_rows = list(csv.DictReader(f))
+    assert variance_rows[0]["failed_run_count"] == "1"
+    assert json.loads((tmp_path / "variance.json").read_text(encoding="utf-8"))["groups"][0][
+        "failed_run_count"
+    ] == 1

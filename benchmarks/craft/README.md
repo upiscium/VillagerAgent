@@ -79,6 +79,14 @@ python -m benchmarks.craft.experiment --config configs/craft/experiments/ollama_
 
 This model comparison manifest uses the same seed, structures, and turn count as the qwen batch evaluation for `qwen3.5:9b`, `qwen3.5:4b`, `qwen3.6:27b`, `gemma4:26b`, and `gemma4:e4b`. It records individual endpoint or model failures as failed run artifacts and still writes the comparison report plus compact summary table.
 
+To evaluate robustness across broader structures and multiple seeds, use:
+
+```bash
+python -m benchmarks.craft.experiment --config configs/craft/experiments/qwen_robustness_v1.yaml
+```
+
+This robustness manifest runs the qwen baseline, Dual-DAG condition, single-Director Dual-DAG ablation, and comparable official baseline artifact over seeds `1, 3, 5` and structures `0, 1, 2, 3, 4`. It writes comparison, compact summary, and variance summary artifacts under `result/craft/`.
+
 ## Single Director Ablation
 
 ```bash
@@ -119,7 +127,7 @@ python -m benchmarks.craft.report \
   --json-output result/craft/comparison_summary.json
 ```
 
-The comparison report includes run condition, number of games, turns, final progress, completion rate, models, providers, active Directors, Builder fallback rate, VillagerAgent component flags, baseline type, and leakage status.
+The comparison report includes run condition, number of games, turns, final progress, completion rate, models, providers, active Directors, Builder fallback rate, VillagerAgent component flags, baseline type, run status, failure details, and leakage status.
 
 ## Final Qwen Dual-DAG Evaluation
 
