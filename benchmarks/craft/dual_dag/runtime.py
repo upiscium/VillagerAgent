@@ -226,6 +226,40 @@ class DualDAGRuntime:
             "candidates": rows,
         }
 
+    def update_action_candidate_states(
+        self,
+        *,
+        turn_index: int,
+        min_confidence: float = 0.6,
+        min_support_count: int = 1,
+    ) -> list[dict]:
+        resolved_evidence_ids = _resolved_evidence_ids(self.resolved_facts().values())
+        public_actions = _public_builder_actions(self.epistemic_nodes.values())
+        updated = []
+        for candidate_id, candidate in self.action_nodes.items():
+            state, unlock = _action_candidate_state(
+                candidate=candidate,
+                resolved_evidence_ids=resolved_evidence_ids,
+                public_actions=public_actions,
+                min_confidence=min_confidence,
+                min_support_count=min_support_count,
+            )
+            candidate["state"] = state
+            metadata = candidate.setdefault("metadata", {})
+            metadata["unlock"] = {
+                "state": state,
+                "turn_index": turn_index,
+                **unlock,
+            }
+            updated.append(candidate)
+            self._add_action_state_edge(
+                candidate_id=candidate_id,
+                state=state,
+                unlock=unlock,
+                turn_index=turn_index,
+            )
+        return updated
+
     def retrieve_public_graph_context(
         self,
         *,
@@ -525,6 +559,42 @@ class DualDAGRuntime:
             return
         self.epistemic_edges.append(edge)
 
+    def _add_action_state_edge(
+        self,
+        *,
+        candidate_id: str,
+        state: str,
+        unlock: dict,
+        turn_index: int,
+    ) -> None:
+        for evidence_id in unlock.get("evidence_ids", []) or []:
+            edge_type = "unlocks_action" if state == "executable" else "blocks_action"
+            edge = {
+                "source_id": evidence_id,
+                "target_id": candidate_id,
+                "edge_type": edge_type,
+                "metadata": {
+                    "turn_index": turn_index,
+                    "state": state,
+                    "reason": unlock.get("reason", ""),
+                },
+            }
+            existing = next(
+                (
+                    row for row in self.action_edges
+                    if row.get("source_id") == edge["source_id"]
+                    and row.get("target_id") == edge["target_id"]
+                    and row.get("edge_type") == edge["edge_type"]
+                ),
+                None,
+            )
+            if existing:
+                existing_metadata = existing.setdefault("metadata", {})
+                existing_metadata.update(edge["metadata"])
+                existing_metadata["last_updated_turn"] = turn_index
+                continue
+            self.action_edges.append(edge)
+
 
 def _decision_support_candidate(candidate: dict, *, graph_context: dict | None = None) -> dict:
     historical_claims = (graph_context or {}).get("relevant_public_claims", [])
@@ -614,6 +684,84 @@ def _actions_share_location_or_type(action: dict, prior_action: dict, location_k
     if location_keywords and prior_location_keywords:
         return bool(location_keywords & prior_location_keywords)
     return bool(action.get("action") and action.get("action") == prior_action.get("action"))
+
+
+def _action_candidate_state(
+    *,
+    candidate: dict,
+    resolved_evidence_ids: set[str],
+    public_actions: list[dict],
+    min_confidence: float,
+    min_support_count: int,
+) -> tuple[str, dict]:
+    conflicts = list(candidate.get("conflicts_with", []) or [])
+    if conflicts:
+        return "invalidated", {"reason": "conflicting_evidence", "evidence_ids": conflicts}
+
+    required = list(candidate.get("required_evidence", []) or [])
+    unresolved = [evidence_id for evidence_id in required if evidence_id not in resolved_evidence_ids]
+    if unresolved:
+        return "waiting_for_evidence", {"reason": "required_evidence_unresolved", "evidence_ids": unresolved}
+    if required:
+        return "executable", {"reason": "required_evidence_resolved", "evidence_ids": required}
+
+    supported_by = list(candidate.get("supported_by", []) or [])
+    if len(supported_by) >= min_support_count:
+        return "executable", {"reason": "supported_by_public_claims", "evidence_ids": supported_by}
+
+    action = candidate.get("action", {}) if isinstance(candidate.get("action"), dict) else {}
+    matching_public_actions = [
+        public_action.get("node_id", "")
+        for public_action in public_actions
+        if _matches_public_builder_action(action, public_action.get("action", {}))
+    ]
+    if matching_public_actions:
+        return "executable", {"reason": "matches_public_board_state", "evidence_ids": matching_public_actions}
+
+    metadata = candidate.get("metadata", {}) if isinstance(candidate.get("metadata"), dict) else {}
+    if metadata.get("physically_verified"):
+        return "executable", {"reason": "physically_verified", "evidence_ids": []}
+
+    if float(candidate.get("confidence", 0.0) or 0.0) >= min_confidence:
+        return "executable", {"reason": "confidence_threshold", "evidence_ids": []}
+
+    return "blocked", {"reason": "insufficient_public_evidence", "evidence_ids": []}
+
+
+def _resolved_evidence_ids(resolved_facts) -> set[str]:
+    evidence_ids = set()
+    for fact in resolved_facts:
+        fact_id = fact.get("node_id", "") if isinstance(fact, dict) else ""
+        if fact_id:
+            evidence_ids.add(fact_id)
+        content = fact.get("content", {}) if isinstance(fact, dict) else {}
+        if isinstance(content, dict):
+            evidence_ids.update(str(evidence_id) for evidence_id in content.get("evidence_ids", []) or [])
+    return evidence_ids
+
+
+def _public_builder_actions(nodes) -> list[dict]:
+    actions = []
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("node_type") != "public_fact":
+            continue
+        provenance = node.get("provenance", {}) or {}
+        if provenance.get("visibility") != "public":
+            continue
+        content = node.get("content", {}) if isinstance(node.get("content"), dict) else {}
+        action = content.get("builder_action") if isinstance(content, dict) else None
+        if not isinstance(action, dict):
+            continue
+        actions.append({
+            "node_id": node.get("node_id", ""),
+            "action": {key: value for key, value in action.items() if not str(key).startswith("_")},
+        })
+    return actions
+
+
+def _matches_public_builder_action(action: dict, public_action: dict) -> bool:
+    keys = ["action", "block", "position", "layer", "span_to"]
+    return all(action.get(key) == public_action.get(key) for key in keys if action.get(key) is not None)
 
 
 def _hypothesis_summary(*, hypothesis_type: str, claim_content: dict, candidate_action: dict) -> str:
