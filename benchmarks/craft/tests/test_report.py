@@ -48,6 +48,8 @@ def test_report_aggregates_multiple_runs(tmp_path):
     assert rows[1]["claim_support_count"] == 2
     assert rows[1]["claim_required_evidence_count"] == 3
     assert rows[1]["gated_clarification_count"] == 1
+    assert rows[1]["clarification_resolution_rate"] == 0.5
+    assert rows[1]["mean_clarification_quality_score"] == 0.75
     assert rows[1]["mean_risk_score"] == 0.4
 
     csv_path = tmp_path / "comparison_summary.csv"
@@ -114,6 +116,10 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "claim_support_count",
                 "claim_required_evidence_count",
                 "gated_clarification_count",
+                "clarification_resolution_count",
+                "clarification_resolution_rate",
+                "mean_clarification_quality_score",
+                "mean_post_clarification_progress_delta",
                 "mean_risk_score",
             ],
         )
@@ -125,6 +131,10 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "claim_support_count": "2",
                 "claim_required_evidence_count": "3",
                 "gated_clarification_count": "1",
+                "clarification_resolution_count": "1",
+                "clarification_resolution_rate": "0.5",
+                "mean_clarification_quality_score": "0.75",
+                "mean_post_clarification_progress_delta": "0.2",
                 "mean_risk_score": "0.4",
             })
 

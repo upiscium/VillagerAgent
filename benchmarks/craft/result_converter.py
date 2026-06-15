@@ -108,6 +108,10 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
         "clarification_count",
         "gated_clarification_count",
         "gated_clarification_rate",
+        "clarification_resolution_count",
+        "clarification_resolution_rate",
+        "mean_clarification_quality_score",
+        "mean_post_clarification_progress_delta",
         "mean_risk_score",
         "low_confidence_gate_count",
         "conflict_gate_count",
@@ -162,6 +166,10 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
                 "clarification_count": game_clarification_metrics["clarification_count"],
                 "gated_clarification_count": game_clarification_metrics["gated_clarification_count"],
                 "gated_clarification_rate": game_clarification_metrics["gated_clarification_rate"],
+                "clarification_resolution_count": game_clarification_metrics["clarification_resolution_count"],
+                "clarification_resolution_rate": game_clarification_metrics["clarification_resolution_rate"],
+                "mean_clarification_quality_score": game_clarification_metrics["mean_clarification_quality_score"],
+                "mean_post_clarification_progress_delta": game_clarification_metrics["mean_post_clarification_progress_delta"],
                 "mean_risk_score": game_clarification_metrics["mean_risk_score"],
                 "low_confidence_gate_count": game_clarification_metrics["low_confidence_gate_count"],
                 "conflict_gate_count": game_clarification_metrics["conflict_gate_count"],
@@ -256,13 +264,22 @@ def _action_candidate_metrics(turns: list[dict]) -> dict:
 def _clarification_metrics(turns: list[dict]) -> dict:
     clarification_count = 0
     gated_clarification_count = 0
+    clarification_resolution_count = 0
     low_confidence_gate_count = 0
     conflict_gate_count = 0
     risk_scores = []
-    for turn in turns:
+    quality_scores = []
+    progress_deltas = []
+    for index, turn in enumerate(turns):
         action = turn.get("builder_action") or {}
         if action.get("action") == "clarify":
             clarification_count += 1
+            quality_scores.append(_clarification_quality_score(action))
+            resolution = _clarification_resolution(turns, index)
+            if resolution["resolved"]:
+                clarification_resolution_count += 1
+            if resolution["progress_delta"] is not None:
+                progress_deltas.append(resolution["progress_delta"])
         gate = action.get("_gated_clarification")
         if not gate:
             continue
@@ -279,10 +296,108 @@ def _clarification_metrics(turns: list[dict]) -> dict:
         "clarification_count": clarification_count,
         "gated_clarification_count": gated_clarification_count,
         "gated_clarification_rate": gated_clarification_count / len(turns) if turns else 0.0,
+        "clarification_resolution_count": clarification_resolution_count,
+        "clarification_resolution_rate": (
+            clarification_resolution_count / clarification_count
+            if clarification_count else 0.0
+        ),
+        "mean_clarification_quality_score": (
+            sum(quality_scores) / len(quality_scores)
+            if quality_scores else 0.0
+        ),
+        "mean_post_clarification_progress_delta": (
+            sum(progress_deltas) / len(progress_deltas)
+            if progress_deltas else 0.0
+        ),
         "mean_risk_score": sum(risk_scores) / len(risk_scores) if risk_scores else 0.0,
         "low_confidence_gate_count": low_confidence_gate_count,
         "conflict_gate_count": conflict_gate_count,
     }
+
+
+def _clarification_quality_score(action: dict) -> float:
+    score = 0.0
+    clarification = str(action.get("clarification", "")).lower()
+    gate = action.get("_gated_clarification") or {}
+    metadata = action.get("_action_candidate_metadata") or {}
+    reasons = set(gate.get("reasons", []) or [])
+    if clarification and any(token in clarification for token in ("clarify", "please", "?")):
+        score += 0.3
+    if reasons - {"none"}:
+        score += 0.3
+    if reasons & {"claim_conflict", "required_evidence", "large_block_span_uncertainty"}:
+        score += 0.2
+    if metadata.get("public_evidence_summary") or int(metadata.get("claim_required_evidence_count", 0) or 0) > 0:
+        score += 0.2
+    return min(score, 1.0)
+
+
+def _clarification_resolution(turns: list[dict], index: int) -> dict:
+    clarify_turn = turns[index]
+    clarify_action = clarify_turn.get("builder_action") or {}
+    next_action_turn = _next_non_clarify_turn(turns, index + 1)
+    if next_action_turn is None:
+        return {"resolved": False, "progress_delta": None}
+    before_metadata = _action_metadata(clarify_action)
+    after_action = next_action_turn.get("builder_action") or {}
+    after_metadata = _action_metadata(after_action)
+    progress_delta = _progress_value(next_action_turn.get("progress")) - _progress_value(clarify_turn.get("progress"))
+    confidence_improved = _metadata_float(after_metadata, "chosen_confidence") > _metadata_float(
+        before_metadata,
+        "chosen_confidence",
+    )
+    conflict_reduced = _metadata_int(after_metadata, "claim_conflict_count") < _metadata_int(
+        before_metadata,
+        "claim_conflict_count",
+    )
+    evidence_reduced = _metadata_int(after_metadata, "claim_required_evidence_count") < _metadata_int(
+        before_metadata,
+        "claim_required_evidence_count",
+    )
+    return {
+        "resolved": progress_delta > 0.0 or confidence_improved or conflict_reduced or evidence_reduced,
+        "progress_delta": progress_delta,
+    }
+
+
+def _next_non_clarify_turn(turns: list[dict], start: int) -> dict | None:
+    for turn in turns[start:]:
+        action = turn.get("builder_action") or {}
+        if action.get("action") not in {None, "clarify"}:
+            return turn
+    return None
+
+
+def _action_metadata(action: dict) -> dict:
+    metadata = action.get("_action_candidate_metadata") or {}
+    gate = action.get("_gated_clarification") or {}
+    return {**gate, **metadata}
+
+
+def _metadata_float(metadata: dict, key: str) -> float:
+    try:
+        return float(metadata.get(key, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _metadata_int(metadata: dict, key: str) -> int:
+    try:
+        return int(float(metadata.get(key, 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _progress_value(progress) -> float:
+    if isinstance(progress, dict):
+        if "current" in progress:
+            return _metadata_float(progress, "current")
+        if "overall_progress" in progress:
+            return _metadata_float(progress, "overall_progress")
+        metrics = progress.get("metrics")
+        if isinstance(metrics, dict):
+            return _metadata_float(metrics, "overall_progress")
+    return 0.0
 
 
 def _dual_dag_metrics(games: list[dict]) -> dict:

@@ -209,10 +209,68 @@ def test_result_converter_counts_gated_clarification_metadata(tmp_path):
     assert summary["runtime"]["clarification_count"] == 1
     assert summary["runtime"]["gated_clarification_count"] == 1
     assert summary["runtime"]["gated_clarification_rate"] == 1.0
+    assert summary["runtime"]["clarification_resolution_count"] == 0
+    assert summary["runtime"]["clarification_resolution_rate"] == 0.0
+    assert summary["runtime"]["mean_clarification_quality_score"] == 0.5
     assert summary["runtime"]["mean_risk_score"] == 0.4
     assert summary["runtime"]["low_confidence_gate_count"] == 1
     assert summary["runtime"]["conflict_gate_count"] == 1
     assert "gated_clarification_count" in metrics_text
+
+
+def test_result_converter_tracks_clarification_resolution_and_progress_delta(tmp_path):
+    config = {
+        "run": {"name": "test", "seed": 3, "structures": [0], "turns": 2},
+        "models": {"director": {"model": "d"}, "builder": {"model": "b"}},
+        "villageragent": {"enabled": True},
+    }
+    normalize_results(
+        config=config,
+        condition="villageragent_directors",
+        raw_result={
+            "structure_id": 0,
+            "turns": [
+                {
+                    "builder_action": {
+                        "action": "clarify",
+                        "clarification": "Please clarify the missing color evidence?",
+                        "_gated_clarification": {
+                            "risk_score": 0.5,
+                            "reasons": ["required_evidence"],
+                            "chosen_confidence": 0.3,
+                            "claim_required_evidence_count": 2,
+                        },
+                        "_action_candidate_metadata": {
+                            "claim_required_evidence_count": 2,
+                            "public_evidence_summary": [{"candidate_id": "action:1:0"}],
+                        },
+                    },
+                    "progress": {"overall_progress": 0.1},
+                },
+                {
+                    "builder_action": {
+                        "action": "place",
+                        "_action_candidate_metadata": {
+                            "chosen_confidence": 0.8,
+                            "claim_required_evidence_count": 0,
+                        },
+                    },
+                    "progress": {"overall_progress": 0.4},
+                },
+            ],
+            "final_progress": 0.4,
+            "completed": False,
+        },
+        output_dir=tmp_path,
+    )
+
+    summary = json.loads((tmp_path / "normalized" / "summary.json").read_text())
+    metrics_text = (tmp_path / "normalized" / "metrics.csv").read_text()
+    assert summary["runtime"]["clarification_resolution_count"] == 1
+    assert summary["runtime"]["clarification_resolution_rate"] == 1.0
+    assert summary["runtime"]["mean_clarification_quality_score"] == 1.0
+    assert summary["runtime"]["mean_post_clarification_progress_delta"] == 0.30000000000000004
+    assert "clarification_resolution_rate" in metrics_text
 
 
 def test_result_converter_writes_dual_dag_artifacts(tmp_path):
