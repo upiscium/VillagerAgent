@@ -103,6 +103,76 @@ class DualDAGRuntime:
                     turn_index=turn_index,
                 )
 
+    def add_coordination_action_candidate(
+        self,
+        *,
+        turn_index: int,
+        action_type: str,
+        reason: str,
+        related_candidate_ids: list[str] | None = None,
+        blocking_claim_ids: list[str] | None = None,
+        required_evidence_ids: list[str] | None = None,
+        question: str = "",
+        confidence: float = 1.0,
+    ) -> dict:
+        if action_type not in {"clarify", "wait_for_evidence"}:
+            raise ValueError("action_type must be clarify or wait_for_evidence")
+        index = sum(
+            1 for node_id in self.action_nodes
+            if node_id.startswith(f"coordination:{action_type}:{turn_index}:")
+        )
+        node_id = f"coordination:{action_type}:{turn_index}:{index}"
+        related_candidate_ids = sorted(set(related_candidate_ids or []))
+        blocking_claim_ids = sorted(set(blocking_claim_ids or []))
+        required_evidence_ids = sorted(set(required_evidence_ids or []))
+        action = {
+            "action": action_type,
+            "reason": reason,
+        }
+        if question:
+            action["clarification"] = question
+        candidate = {
+            "node_id": node_id,
+            "action_type": action_type,
+            "action": action,
+            "state": "candidate" if action_type == "clarify" else "waiting_for_evidence",
+            "confidence": _bounded_confidence(float(confidence)),
+            "supported_by": [],
+            "conflicts_with": blocking_claim_ids,
+            "required_evidence": required_evidence_ids,
+            "metadata": {
+                "coordination_action": True,
+                "reason": reason,
+                "related_candidate_ids": related_candidate_ids,
+            },
+        }
+        self.action_nodes[node_id] = candidate
+        for claim_id in blocking_claim_ids:
+            self._add_action_edge(
+                source_id=claim_id,
+                target_id=node_id,
+                edge_type="requires_clarification",
+                turn_index=turn_index,
+                metadata={"reason": reason},
+            )
+        for evidence_id in required_evidence_ids:
+            self._add_action_edge(
+                source_id=node_id,
+                target_id=evidence_id,
+                edge_type="waits_for_evidence",
+                turn_index=turn_index,
+                metadata={"reason": reason},
+            )
+        for candidate_id in related_candidate_ids:
+            self._add_action_edge(
+                source_id=node_id,
+                target_id=candidate_id,
+                edge_type="coordinates_action",
+                turn_index=turn_index,
+                metadata={"reason": reason},
+            )
+        return candidate
+
     def build_action_candidates(
         self,
         *,
@@ -578,6 +648,42 @@ class DualDAGRuntime:
             existing_metadata["last_updated_turn"] = turn_index
             return
         self.epistemic_edges.append(edge)
+
+    def _add_action_edge(
+        self,
+        *,
+        source_id: str,
+        target_id: str,
+        edge_type: str,
+        turn_index: int,
+        metadata: dict | None = None,
+    ) -> None:
+        if not source_id or not target_id:
+            return
+        edge = {
+            "source_id": source_id,
+            "target_id": target_id,
+            "edge_type": edge_type,
+            "metadata": {
+                "turn_index": turn_index,
+                **(metadata or {}),
+            },
+        }
+        existing = next(
+            (
+                row for row in self.action_edges
+                if row.get("source_id") == source_id
+                and row.get("target_id") == target_id
+                and row.get("edge_type") == edge_type
+            ),
+            None,
+        )
+        if existing:
+            existing_metadata = existing.setdefault("metadata", {})
+            existing_metadata.update(metadata or {})
+            existing_metadata["last_updated_turn"] = turn_index
+            return
+        self.action_edges.append(edge)
 
     def _add_action_state_edge(
         self,

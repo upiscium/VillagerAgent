@@ -735,6 +735,85 @@ def test_action_candidate_state_blocks_insufficient_public_evidence():
     }
 
 
+def test_runtime_persists_clarify_action_candidate_with_dependencies():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+
+    clarify = runtime.add_coordination_action_candidate(
+        turn_index=3,
+        action_type="clarify",
+        reason="required_evidence",
+        related_candidate_ids=["action:3:0"],
+        blocking_claim_ids=["claim:D1:2"],
+        required_evidence_ids=["claim:D1:2"],
+        question="Please confirm the bottom-left block color.",
+        confidence=0.9,
+    )
+
+    assert clarify == {
+        "node_id": "coordination:clarify:3:0",
+        "action_type": "clarify",
+        "action": {
+            "action": "clarify",
+            "reason": "required_evidence",
+            "clarification": "Please confirm the bottom-left block color.",
+        },
+        "state": "candidate",
+        "confidence": 0.9,
+        "supported_by": [],
+        "conflicts_with": ["claim:D1:2"],
+        "required_evidence": ["claim:D1:2"],
+        "metadata": {
+            "coordination_action": True,
+            "reason": "required_evidence",
+            "related_candidate_ids": ["action:3:0"],
+        },
+    }
+    assert runtime.snapshot()["action_nodes"] == [clarify]
+    assert runtime.action_edges == [
+        {
+            "source_id": "claim:D1:2",
+            "target_id": "coordination:clarify:3:0",
+            "edge_type": "requires_clarification",
+            "metadata": {"turn_index": 3, "reason": "required_evidence"},
+        },
+        {
+            "source_id": "coordination:clarify:3:0",
+            "target_id": "claim:D1:2",
+            "edge_type": "waits_for_evidence",
+            "metadata": {"turn_index": 3, "reason": "required_evidence"},
+        },
+        {
+            "source_id": "coordination:clarify:3:0",
+            "target_id": "action:3:0",
+            "edge_type": "coordinates_action",
+            "metadata": {"turn_index": 3, "reason": "required_evidence"},
+        },
+    ]
+
+
+def test_runtime_persists_wait_for_evidence_action_candidate_without_hidden_state():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+
+    wait = runtime.add_coordination_action_candidate(
+        turn_index=4,
+        action_type="wait_for_evidence",
+        reason="conflicting_evidence",
+        related_candidate_ids=["action:4:0"],
+        blocking_claim_ids=["claim:D2:4"],
+        required_evidence_ids=["claim:D3:4"],
+        question="Please wait for public evidence before acting.",
+        confidence=1.2,
+    )
+    serialized = json.dumps(runtime.serialized_snapshot())
+
+    assert wait["node_id"] == "coordination:wait_for_evidence:4:0"
+    assert wait["state"] == "waiting_for_evidence"
+    assert wait["confidence"] == 1.0
+    assert wait["action"]["action"] == "wait_for_evidence"
+    assert "target_structure" not in serialized
+    assert "oracle_moves" not in serialized
+
+
 def test_public_evidence_summary_includes_required_public_claim_only():
     claim = {
         "node_id": "claim:D1:1",
