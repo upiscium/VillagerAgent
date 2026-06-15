@@ -173,6 +173,68 @@ class DualDAGRuntime:
             )
         return candidate
 
+    def ingest_clarification_response(
+        self,
+        *,
+        clarify_candidate_id: str,
+        director_id: str,
+        turn_index: int,
+        message: str,
+    ) -> dict:
+        claim = self.add_reported_claim(
+            director_id=director_id,
+            turn_index=turn_index,
+            message=message,
+        )
+        claim_id = claim.get("node_id", "")
+        clarify_candidate = self.action_nodes.get(clarify_candidate_id, {})
+        metadata = clarify_candidate.get("metadata", {}) if isinstance(clarify_candidate, dict) else {}
+        related_candidate_ids = list(metadata.get("related_candidate_ids", []) or [])
+        requested_evidence_ids = list(clarify_candidate.get("required_evidence", []) or [])
+        self._add_action_edge(
+            source_id=claim_id,
+            target_id=clarify_candidate_id,
+            edge_type="clarification_response",
+            turn_index=turn_index,
+            metadata={"director_id": director_id},
+        )
+
+        updated_candidates = []
+        resolved_fact = None
+        for candidate_id in related_candidate_ids:
+            candidate = self.action_nodes.get(candidate_id)
+            if not isinstance(candidate, dict):
+                continue
+            relation = claim_action_relation(
+                claim,
+                candidate.get("action", {}) if isinstance(candidate.get("action"), dict) else {},
+                action_location_keywords(candidate.get("action", {}) if isinstance(candidate.get("action"), dict) else {}),
+            )
+            if relation == "supports":
+                _append_unique(candidate, "supported_by", claim_id)
+                if resolved_fact is None and not (claim.get("content", {}) or {}).get("uncertain", False):
+                    resolved_fact = self.add_resolved_fact(
+                        fact_id=f"clarification_response:{claim_id}".replace(":", "_"),
+                        turn_index=turn_index,
+                        summary=(claim.get("content", {}) or {}).get("message", message),
+                        evidence_ids=[claim_id, *requested_evidence_ids],
+                        confidence=max(float(claim.get("confidence", 0.0) or 0.0), 0.8),
+                        content=_public_claim_content(claim),
+                    )
+            elif relation == "conflicts_with":
+                _append_unique(candidate, "conflicts_with", claim_id)
+            elif relation == "requires_evidence":
+                _append_unique(candidate, "required_evidence", claim_id)
+            updated_candidates.append(candidate)
+
+        self.update_action_candidate_states(turn_index=turn_index)
+        self.update_hypothesis_lifecycle(turn_index=turn_index)
+        return {
+            "reported_claim": claim,
+            "resolved_fact": resolved_fact,
+            "updated_candidates": updated_candidates,
+        }
+
     def build_action_candidates(
         self,
         *,
@@ -852,6 +914,13 @@ def _action_candidate_state(
         return "executable", {"reason": "confidence_threshold", "evidence_ids": []}
 
     return "blocked", {"reason": "insufficient_public_evidence", "evidence_ids": []}
+
+
+def _append_unique(row: dict, key: str, value: str) -> None:
+    values = list(row.get(key, []) or [])
+    if value not in values:
+        values.append(value)
+    row[key] = values
 
 
 def _update_hypothesis_lifecycle(
