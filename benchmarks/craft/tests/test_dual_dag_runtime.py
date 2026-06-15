@@ -488,6 +488,147 @@ def test_resolved_fact_serialization_excludes_hidden_state():
     assert runtime.resolved_facts()["resolved_fact:safe_fact"]["confidence"] == 1.0
 
 
+def test_action_candidate_state_unlocks_support_only_candidate():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_action_candidates(turn_index=2, candidates=[{
+        "node_id": "action:2:0",
+        "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+        "confidence": 0.45,
+        "supported_by": ["claim:D1:1"],
+        "conflicts_with": [],
+        "required_evidence": [],
+        "metadata": {},
+    }])
+
+    updated = runtime.update_action_candidate_states(turn_index=2)
+
+    assert updated[0]["state"] == "executable"
+    assert updated[0]["metadata"]["unlock"] == {
+        "state": "executable",
+        "turn_index": 2,
+        "reason": "supported_by_public_claims",
+        "evidence_ids": ["claim:D1:1"],
+    }
+    assert runtime.action_edges[-1] == {
+        "source_id": "claim:D1:1",
+        "target_id": "action:2:0",
+        "edge_type": "unlocks_action",
+        "metadata": {"turn_index": 2, "state": "executable", "reason": "supported_by_public_claims"},
+    }
+
+
+def test_action_candidate_state_invalidates_conflicting_candidate():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_action_candidates(turn_index=2, candidates=[{
+        "node_id": "action:2:0",
+        "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+        "confidence": 0.9,
+        "supported_by": ["claim:D1:1"],
+        "conflicts_with": ["claim:D2:1"],
+        "required_evidence": [],
+        "metadata": {"physically_verified": True},
+    }])
+
+    updated = runtime.update_action_candidate_states(turn_index=2)
+
+    assert updated[0]["state"] == "invalidated"
+    assert updated[0]["metadata"]["unlock"]["reason"] == "conflicting_evidence"
+    assert runtime.action_edges[-1]["edge_type"] == "blocks_action"
+
+
+def test_action_candidate_state_waits_until_required_evidence_is_resolved():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_action_candidates(turn_index=2, candidates=[{
+        "node_id": "action:2:0",
+        "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+        "confidence": 0.9,
+        "supported_by": [],
+        "conflicts_with": [],
+        "required_evidence": ["claim:D1:1"],
+        "metadata": {"physically_verified": True},
+    }])
+
+    unresolved = runtime.update_action_candidate_states(turn_index=2)[0]
+    assert unresolved["state"] == "waiting_for_evidence"
+    assert unresolved["metadata"]["unlock"]["reason"] == "required_evidence_unresolved"
+
+    runtime.add_resolved_fact(
+        fact_id="claim_d1_1_resolved",
+        turn_index=3,
+        summary="D1 claim is resolved by public evidence.",
+        evidence_ids=["claim:D1:1"],
+        confidence=0.8,
+        content={"block": "ys"},
+    )
+    resolved = runtime.update_action_candidate_states(turn_index=3)[0]
+
+    assert resolved["state"] == "executable"
+    assert resolved["metadata"]["unlock"] == {
+        "state": "executable",
+        "turn_index": 3,
+        "reason": "required_evidence_resolved",
+        "evidence_ids": ["claim:D1:1"],
+    }
+
+
+def test_action_candidate_state_unlocks_from_public_board_state_without_hidden_state():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_public_builder_action(
+        turn_index=1,
+        action={
+            "action": "place",
+            "block": "ys",
+            "position": "(0,0)",
+            "layer": 0,
+            "_oracle_moves": ["hidden"],
+        },
+    )
+    runtime.add_action_candidates(turn_index=2, candidates=[{
+        "node_id": "action:2:0",
+        "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+        "confidence": 0.2,
+        "supported_by": [],
+        "conflicts_with": [],
+        "required_evidence": [],
+        "metadata": {},
+    }])
+
+    updated = runtime.update_action_candidate_states(turn_index=2)[0]
+    serialized = json.dumps(runtime.serialized_snapshot())
+
+    assert updated["state"] == "executable"
+    assert updated["metadata"]["unlock"] == {
+        "state": "executable",
+        "turn_index": 2,
+        "reason": "matches_public_board_state",
+        "evidence_ids": ["public:builder_action:1:0"],
+    }
+    assert "oracle_moves" not in serialized
+
+
+def test_action_candidate_state_blocks_insufficient_public_evidence():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_action_candidates(turn_index=2, candidates=[{
+        "node_id": "action:2:0",
+        "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+        "confidence": 0.2,
+        "supported_by": [],
+        "conflicts_with": [],
+        "required_evidence": [],
+        "metadata": {},
+    }])
+
+    updated = runtime.update_action_candidate_states(turn_index=2)[0]
+
+    assert updated["state"] == "blocked"
+    assert updated["metadata"]["unlock"] == {
+        "state": "blocked",
+        "turn_index": 2,
+        "reason": "insufficient_public_evidence",
+        "evidence_ids": [],
+    }
+
+
 def test_public_evidence_summary_includes_required_public_claim_only():
     claim = {
         "node_id": "claim:D1:1",
