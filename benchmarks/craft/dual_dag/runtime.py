@@ -260,6 +260,20 @@ class DualDAGRuntime:
             )
         return updated
 
+    def update_hypothesis_lifecycle(self, *, turn_index: int) -> list[dict]:
+        resolved_evidence_ids = _resolved_evidence_ids(self.resolved_facts().values())
+        updated = []
+        for hypothesis in self.hypotheses().values():
+            _update_hypothesis_lifecycle(
+                hypothesis=hypothesis,
+                epistemic_edges=self.epistemic_edges,
+                action_nodes=self.action_nodes,
+                resolved_evidence_ids=resolved_evidence_ids,
+                turn_index=turn_index,
+            )
+            updated.append(hypothesis)
+        return updated
+
     def retrieve_public_graph_context(
         self,
         *,
@@ -500,19 +514,25 @@ class DualDAGRuntime:
             content["keywords"] = sorted(set(content.get("keywords", [])) | set(keywords))
             content["last_updated_turn"] = turn_index
             existing["confidence"] = max(float(existing.get("confidence", 0.0) or 0.0), confidence)
+            content["base_confidence"] = max(float(content.get("base_confidence", 0.0) or 0.0), confidence)
             return
         self.epistemic_nodes[node_id] = {
             "node_id": node_id,
             "node_type": "hypothesis",
             "content": {
                 "hypothesis_type": hypothesis_type,
-                "status": "unresolved",
+                "status": "open",
                 "summary": summary,
                 "source_claim_ids": sorted(source_claim_ids),
                 "action_candidate_ids": sorted(action_candidate_ids),
                 "keywords": sorted(set(keywords)),
                 "created_turn": turn_index,
                 "last_updated_turn": turn_index,
+                "support_count": 0,
+                "conflict_count": 0,
+                "resolved_evidence_count": 0,
+                "resolution_ready": False,
+                "base_confidence": confidence,
             },
             "confidence": confidence,
             "provenance": {
@@ -726,6 +746,63 @@ def _action_candidate_state(
         return "executable", {"reason": "confidence_threshold", "evidence_ids": []}
 
     return "blocked", {"reason": "insufficient_public_evidence", "evidence_ids": []}
+
+
+def _update_hypothesis_lifecycle(
+    *,
+    hypothesis: dict,
+    epistemic_edges: list[dict],
+    action_nodes: dict[str, dict],
+    resolved_evidence_ids: set[str],
+    turn_index: int,
+) -> None:
+    content = hypothesis.setdefault("content", {})
+    hypothesis_id = hypothesis.get("node_id", "")
+    source_claim_ids = list(content.get("source_claim_ids", []) or [])
+    action_candidate_ids = list(content.get("action_candidate_ids", []) or [])
+
+    support_count = _hypothesis_edge_count(epistemic_edges, hypothesis_id, "supports")
+    conflict_count = _hypothesis_edge_count(epistemic_edges, hypothesis_id, "conflicts_with")
+    resolved_count = sum(1 for evidence_id in source_claim_ids if evidence_id in resolved_evidence_ids)
+    invalidated_action_count = sum(
+        1 for action_id in action_candidate_ids
+        if (action_nodes.get(action_id, {}) or {}).get("state") == "invalidated"
+    )
+
+    resolution_ready = bool(source_claim_ids) and resolved_count == len(set(source_claim_ids))
+    if invalidated_action_count:
+        status = "invalidated"
+    elif conflict_count:
+        status = "conflicted"
+    elif resolution_ready:
+        status = "resolved"
+    elif support_count or resolved_count:
+        status = "supported"
+    else:
+        status = "open"
+
+    base_confidence = float(content.setdefault("base_confidence", hypothesis.get("confidence", 0.0)) or 0.0)
+    hypothesis["confidence"] = round(_bounded_confidence(
+        base_confidence
+        + 0.15 * support_count
+        + 0.2 * resolved_count
+        - 0.2 * conflict_count
+        - 0.25 * invalidated_action_count
+    ), 6)
+    content["status"] = status
+    content["support_count"] = support_count
+    content["conflict_count"] = conflict_count
+    content["resolved_evidence_count"] = resolved_count
+    content["resolution_ready"] = resolution_ready
+    content["last_updated_turn"] = turn_index
+
+
+def _hypothesis_edge_count(epistemic_edges: list[dict], hypothesis_id: str, edge_type: str) -> int:
+    return sum(
+        1 for edge in epistemic_edges
+        if edge.get("edge_type") == edge_type
+        and (edge.get("source_id") == hypothesis_id or edge.get("target_id") == hypothesis_id)
+    )
 
 
 def _resolved_evidence_ids(resolved_facts) -> set[str]:

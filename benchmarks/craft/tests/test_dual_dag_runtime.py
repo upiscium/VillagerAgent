@@ -285,7 +285,7 @@ def test_runtime_creates_hypothesis_for_uncertain_claim():
     assert hypothesis["node_type"] == "hypothesis"
     assert hypothesis["content"]["hypothesis_type"] == "unresolved_claim"
     assert hypothesis["content"]["source_claim_ids"] == ["claim:D1:1"]
-    assert hypothesis["content"]["status"] == "unresolved"
+    assert hypothesis["content"]["status"] == "open"
     assert runtime.snapshot_summary()["hypothesis_count"] == 1
     assert runtime.epistemic_edges == [{
         "source_id": "claim:D1:1",
@@ -379,6 +379,112 @@ def test_runtime_creates_action_hypothesis_for_conflicting_evidence():
             "metadata": {"turn_index": 2, "source_claim_id": "claim:D1:1"},
         },
     ]
+
+
+def test_hypothesis_lifecycle_updates_supported_state_deterministically():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_reported_claim(
+        director_id="D1",
+        turn_index=1,
+        message="I am unsure whether the bottom left block is blue, please confirm.",
+    )
+    hypothesis_id = "hypothesis:unresolved_claim:claim:D1:1"
+    runtime.epistemic_edges.append({
+        "source_id": "claim:D1:1",
+        "target_id": hypothesis_id,
+        "edge_type": "supports",
+        "metadata": {"turn_index": 2},
+    })
+
+    first = runtime.update_hypothesis_lifecycle(turn_index=2)[0]
+    first_confidence = first["confidence"]
+    second = runtime.update_hypothesis_lifecycle(turn_index=3)[0]
+
+    assert first["content"]["status"] == "supported"
+    assert first["content"]["support_count"] == 1
+    assert first_confidence == 0.55
+    assert second["confidence"] == first_confidence
+    assert second["content"]["last_updated_turn"] == 3
+
+
+def test_hypothesis_lifecycle_marks_conflicted_hypothesis():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_reported_claim(
+        director_id="D1",
+        turn_index=1,
+        message="Bottom left is blue small.",
+    )
+    runtime.add_action_candidates(turn_index=2, candidates=[{
+        "node_id": "action:2:0",
+        "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+        "confidence": 0.4,
+        "supported_by": [],
+        "conflicts_with": ["claim:D1:1"],
+        "required_evidence": [],
+    }])
+
+    hypothesis = runtime.update_hypothesis_lifecycle(turn_index=2)[0]
+
+    assert hypothesis["content"]["status"] == "conflicted"
+    assert hypothesis["content"]["conflict_count"] == 2
+    assert hypothesis["confidence"] == 0.0
+
+
+def test_hypothesis_lifecycle_marks_resolution_ready_hypothesis_resolved():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_reported_claim(
+        director_id="D1",
+        turn_index=1,
+        message="I am unsure whether the top left block is blue, please confirm.",
+    )
+    runtime.add_resolved_fact(
+        fact_id="top_left_blue",
+        turn_index=2,
+        summary="Top left blue claim has enough public evidence.",
+        evidence_ids=["claim:D1:1"],
+        confidence=0.8,
+        content={"block": "bs"},
+    )
+
+    hypothesis = runtime.update_hypothesis_lifecycle(turn_index=2)[0]
+
+    assert hypothesis["content"]["status"] == "resolved"
+    assert hypothesis["content"]["resolved_evidence_count"] == 1
+    assert hypothesis["content"]["resolution_ready"] is True
+    assert hypothesis["confidence"] == 0.6
+
+
+def test_hypothesis_lifecycle_marks_invalidated_from_action_state_and_preserves_scores():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_reported_claim(
+        director_id="D1",
+        turn_index=1,
+        message="Bottom left may be blue small, please confirm.",
+    )
+    candidate = {
+        "node_id": "action:2:0",
+        "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+        "confidence": 0.4,
+        "supported_by": [],
+        "conflicts_with": [],
+        "required_evidence": ["claim:D1:1"],
+    }
+    runtime.add_action_candidates(turn_index=2, candidates=[candidate])
+    hypothesis = runtime.hypotheses()["hypothesis:required_evidence:claim:D1:1:action:2:0"]
+    hypothesis["content"].update({
+        "expected_progress_gain": 0.7,
+        "mistake_cost": 0.4,
+        "clarification_cost": 0.2,
+    })
+    runtime.action_nodes["action:2:0"]["state"] = "invalidated"
+
+    runtime.update_hypothesis_lifecycle(turn_index=3)
+    updated = runtime.hypotheses()["hypothesis:required_evidence:claim:D1:1:action:2:0"]
+
+    assert updated["content"]["status"] == "invalidated"
+    assert updated["content"]["expected_progress_gain"] == 0.7
+    assert updated["content"]["mistake_cost"] == 0.4
+    assert updated["content"]["clarification_cost"] == 0.2
 
 
 def test_serialized_hypothesis_excludes_hidden_state():
