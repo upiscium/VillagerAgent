@@ -5,6 +5,7 @@ from benchmarks.craft.dual_dag.epistemic_extractor import (
     observed_facts_from_private_view,
     public_facts_from_state,
     reported_claim_from_message,
+    suggested_constraints_from_message,
 )
 from benchmarks.craft.villager.villager_craft_agent import VillagerCraftDirectorGroup
 
@@ -137,6 +138,7 @@ def test_inactive_director_epistemic_metadata_is_empty():
         "observed_facts": [],
         "public_facts": [],
         "reported_claims": [],
+        "suggested_constraints": [],
         "hypotheses": [],
         "edges": [],
     }
@@ -160,6 +162,58 @@ def test_controller_attaches_epistemic_metadata_to_active_and_inactive_directors
     assert len(metadata["D1"]["epistemic"]["observed_facts"]) == 1
     assert metadata["D2"]["epistemic"] == empty_epistemic_metadata()
     assert metadata["D3"]["epistemic"] == empty_epistemic_metadata()
+
+
+def test_suggested_constraints_extract_public_structured_constraints():
+    constraints = suggested_constraints_from_message(
+        director_id="D2",
+        turn_index=4,
+        message="Please place yellow small at the bottom-left.",
+        claim_id="claim:D2:4",
+    )
+
+    assert constraints == [{
+        "node_id": "constraint:D2:4:0",
+        "node_type": "suggested_constraint",
+        "content": {
+            "director_id": "D2",
+            "source_claim_id": "claim:D2:4",
+            "message": "Please place yellow small at the bottom-left.",
+            "action": "place",
+            "keywords": ["place", "yellow", "small", "bottom", "left"],
+            "constraints": {
+                "blocks": [],
+                "colors": ["yellow"],
+                "sizes": ["small"],
+                "locations": ["bottom", "left"],
+            },
+            "uncertain": False,
+        },
+        "confidence": 0.6,
+        "provenance": {
+            "source": "director_message_constraint",
+            "director_id": "D2",
+            "turn_index": 4,
+            "visibility": "public",
+        },
+    }]
+
+
+def test_suggested_constraints_do_not_copy_hidden_state_terms():
+    constraints = suggested_constraints_from_message(
+        director_id="D1",
+        turn_index=1,
+        message="target_structure says oracle_moves should place blue at top right.",
+    )
+    serialized = str(constraints)
+
+    assert constraints[0]["content"]["constraints"]["colors"] == ["blue"]
+    assert "[redacted]" in constraints[0]["content"]["message"]
+    assert "target_structure" not in constraints[0]["content"]["keywords"]
+    assert "oracle_moves" not in constraints[0]["content"]["keywords"]
+    assert "target_structure" not in serialized
+    assert "oracle_moves" not in serialized
+    assert "raw_private_view" not in serialized
 
 
 def test_observed_facts_skip_empty_cells_and_include_complete_provenance():
