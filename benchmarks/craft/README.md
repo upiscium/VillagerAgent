@@ -130,7 +130,7 @@ Runs write to `result/craft/{run_name}/`:
 - `normalized/leakage_report.json`
 - `logs/run.log`
 
-See [`METRICS.md`](METRICS.md) for the meaning of normalized metrics, comparison report columns, Dual-DAG analysis fields, and compact experiment summary columns.
+See [`METRICS.md`](METRICS.md) for the meaning of normalized metrics, comparison report columns, Dual-DAG analysis fields, and compact experiment summary columns. See [`TASK_DAG_MAPPING.md`](TASK_DAG_MAPPING.md) for the narrow bridge between CRAFT action candidates and VillagerAgent Task DAG concepts.
 
 ## Compare Runs
 
