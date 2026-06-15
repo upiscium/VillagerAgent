@@ -8,6 +8,7 @@ from benchmarks.craft.dual_dag.epistemic_extractor import (
     observed_facts_from_private_view,
     public_facts_from_state,
     reported_claim_from_message,
+    suggested_constraints_from_message,
 )
 from benchmarks.craft.dual_dag.serialization import snapshot_to_dict
 
@@ -60,6 +61,25 @@ class DualDAGRuntime:
             message=message,
         )
         self.epistemic_nodes[claim["node_id"]] = claim
+        suggested_constraints = suggested_constraints_from_message(
+            director_id=director_id,
+            turn_index=turn_index,
+            message=message,
+            claim_id=claim["node_id"],
+        )
+        if suggested_constraints:
+            claim.setdefault("content", {})["suggested_constraint_ids"] = [
+                constraint["node_id"] for constraint in suggested_constraints
+            ]
+        for constraint in suggested_constraints:
+            self.epistemic_nodes[constraint["node_id"]] = constraint
+            self._add_epistemic_edge(
+                source_id=claim["node_id"],
+                target_id=constraint["node_id"],
+                edge_type="derived_from",
+                turn_index=turn_index,
+                metadata={"reason": "suggested_constraint"},
+            )
         self._link_observations_to_claim(claim)
         self._upsert_claim_hypothesis(claim)
         return claim
@@ -290,6 +310,13 @@ class DualDAGRuntime:
             node_id: node
             for node_id, node in self.epistemic_nodes.items()
             if node.get("node_type") == "resolved_fact"
+        }
+
+    def suggested_constraints(self) -> dict[str, dict]:
+        return {
+            node_id: node
+            for node_id, node in self.epistemic_nodes.items()
+            if node.get("node_type") == "suggested_constraint"
         }
 
     def add_resolved_fact(

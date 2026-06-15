@@ -85,12 +85,12 @@ def test_runtime_links_observations_to_matching_claims():
         message="Bottom left is yellow small.",
     )
 
-    assert runtime.epistemic_edges == [{
+    assert {
         "source_id": "observed:D1:1:row_0:0",
         "target_id": "claim:D1:1",
         "edge_type": "supports",
         "metadata": {"turn_index": 1, "matched_keywords": ["bottom", "left", "small", "yellow"]},
-    }]
+    } in runtime.epistemic_edges
 
 
 def test_runtime_keeps_all_reported_claims_by_node_id():
@@ -157,8 +157,12 @@ def test_runtime_reset_clears_all_node_and_edge_counts():
     )
     runtime.add_reported_claim(director_id="D1", turn_index=1, message="Bottom left is yellow small.")
 
-    assert sorted(runtime.epistemic_nodes) == ["claim:D1:1", "observed:D1:1:row_0:0"]
-    assert runtime.snapshot_summary()["epistemic_node_count"] == 2
+    assert sorted(runtime.epistemic_nodes) == [
+        "claim:D1:1",
+        "constraint:D1:1:0",
+        "observed:D1:1:row_0:0",
+    ]
+    assert runtime.snapshot_summary()["epistemic_node_count"] == 3
 
     runtime.reset()
 
@@ -287,12 +291,12 @@ def test_runtime_creates_hypothesis_for_uncertain_claim():
     assert hypothesis["content"]["source_claim_ids"] == ["claim:D1:1"]
     assert hypothesis["content"]["status"] == "open"
     assert runtime.snapshot_summary()["hypothesis_count"] == 1
-    assert runtime.epistemic_edges == [{
+    assert {
         "source_id": "claim:D1:1",
         "target_id": "hypothesis:unresolved_claim:claim:D1:1",
         "edge_type": "derived_from",
         "metadata": {"turn_index": 1, "reason": "uncertain_claim"},
-    }]
+    } in runtime.epistemic_edges
 
 
 def test_runtime_creates_and_updates_action_hypothesis_for_required_evidence():
@@ -320,7 +324,7 @@ def test_runtime_creates_and_updates_action_hypothesis_for_required_evidence():
     assert hypothesis["content"]["action_candidate_ids"] == ["action:2:0"]
     assert hypothesis["content"]["created_turn"] == 2
     assert hypothesis["content"]["last_updated_turn"] == 3
-    assert runtime.epistemic_edges == [
+    expected_edges = [
         {
             "source_id": "claim:D1:1",
             "target_id": "hypothesis:unresolved_claim:claim:D1:1",
@@ -340,6 +344,8 @@ def test_runtime_creates_and_updates_action_hypothesis_for_required_evidence():
             "metadata": {"turn_index": 2, "source_claim_id": "claim:D1:1", "last_updated_turn": 3},
         },
     ]
+    for edge in expected_edges:
+        assert edge in runtime.epistemic_edges
 
 
 def test_runtime_creates_action_hypothesis_for_conflicting_evidence():
@@ -365,7 +371,7 @@ def test_runtime_creates_action_hypothesis_for_conflicting_evidence():
     assert hypothesis["content"]["source_claim_ids"] == ["claim:D1:1"]
     assert hypothesis["content"]["action_candidate_ids"] == ["action:2:0"]
     assert hypothesis["confidence"] == 0.3
-    assert runtime.epistemic_edges == [
+    expected_edges = [
         {
             "source_id": "claim:D1:1",
             "target_id": "hypothesis:conflicting_evidence:claim:D1:1:action:2:0",
@@ -379,6 +385,8 @@ def test_runtime_creates_action_hypothesis_for_conflicting_evidence():
             "metadata": {"turn_index": 2, "source_claim_id": "claim:D1:1"},
         },
     ]
+    for edge in expected_edges:
+        assert edge in runtime.epistemic_edges
 
 
 def test_hypothesis_lifecycle_updates_supported_state_deterministically():
@@ -810,6 +818,33 @@ def test_runtime_persists_wait_for_evidence_action_candidate_without_hidden_stat
     assert wait["state"] == "waiting_for_evidence"
     assert wait["confidence"] == 1.0
     assert wait["action"]["action"] == "wait_for_evidence"
+    assert "target_structure" not in serialized
+    assert "oracle_moves" not in serialized
+
+
+def test_runtime_links_suggested_constraints_to_reported_claims_without_hidden_state():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+
+    claim = runtime.add_reported_claim(
+        director_id="D1",
+        turn_index=5,
+        message="Please place blue large at the top right.",
+    )
+    serialized = json.dumps(runtime.serialized_snapshot())
+
+    assert claim["content"]["suggested_constraint_ids"] == ["constraint:D1:5:0"]
+    assert runtime.suggested_constraints()["constraint:D1:5:0"]["content"]["constraints"] == {
+        "blocks": [],
+        "colors": ["blue"],
+        "sizes": ["large"],
+        "locations": ["top", "right"],
+    }
+    assert {
+        "source_id": "claim:D1:5",
+        "target_id": "constraint:D1:5:0",
+        "edge_type": "derived_from",
+        "metadata": {"turn_index": 5, "reason": "suggested_constraint"},
+    } in runtime.epistemic_edges
     assert "target_structure" not in serialized
     assert "oracle_moves" not in serialized
 

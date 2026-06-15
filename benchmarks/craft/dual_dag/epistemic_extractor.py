@@ -7,6 +7,14 @@ from benchmarks.craft.dual_dag.epistemic import EpistemicNode, Provenance, nodes
 SIZE_LABELS = {1: "small", 2: "large"}
 RELATIVE_VERTICAL = {"row_0": "bottom", "row_1": "middle", "row_2": "top"}
 RELATIVE_HORIZONTAL = {0: "left", 1: "middle", 2: "right"}
+CONSTRAINT_FORBIDDEN_TERMS = (
+    "target_structure",
+    "oracle_moves",
+    "raw_private_view",
+    "hidden_spans",
+    "hidden_labels",
+    "all_private_views",
+)
 
 
 def empty_epistemic_metadata() -> dict:
@@ -14,6 +22,7 @@ def empty_epistemic_metadata() -> dict:
         "observed_facts": [],
         "public_facts": [],
         "reported_claims": [],
+        "suggested_constraints": [],
         "hypotheses": [],
         "edges": [],
     }
@@ -37,6 +46,7 @@ def epistemic_metadata_for_director(
             public_state=public_state,
         )),
         "reported_claims": [],
+        "suggested_constraints": [],
         "hypotheses": [],
         "edges": [],
     }
@@ -139,6 +149,47 @@ def reported_claim_from_message(
     ).to_dict()
 
 
+def suggested_constraints_from_message(
+    *,
+    director_id: str,
+    turn_index: int,
+    message: str,
+    claim_id: str | None = None,
+) -> list[dict]:
+    keywords = _message_keywords(message)
+    if not keywords:
+        return []
+    action = _message_action(message)
+    if action == "unspecified" and not _constraint_keywords(keywords):
+        return []
+    constraint_id = f"constraint:{director_id}:{turn_index}:0"
+    return [EpistemicNode(
+        node_id=constraint_id,
+        node_type="suggested_constraint",
+        content={
+            "director_id": director_id,
+            "source_claim_id": claim_id or f"claim:{director_id}:{turn_index}",
+            "message": _public_constraint_message(message),
+            "action": action,
+            "keywords": keywords,
+            "constraints": {
+                "blocks": [keyword for keyword in keywords if keyword in _block_tokens()],
+                "colors": [keyword for keyword in keywords if keyword in _color_tokens()],
+                "sizes": [keyword for keyword in keywords if keyword in {"small", "large"}],
+                "locations": [keyword for keyword in keywords if keyword in {"bottom", "middle", "top", "left", "right"}],
+            },
+            "uncertain": _message_has_uncertainty(message),
+        },
+        confidence=0.6 if message.strip() else 0.0,
+        provenance=Provenance(
+            source="director_message_constraint",
+            director_id=director_id,
+            turn_index=turn_index,
+            visibility="public",
+        ),
+    ).to_dict()]
+
+
 def _message_keywords(message: str) -> list[str]:
     words = re.findall(r"[A-Za-z0-9_()]+", message.lower())
     keep = {
@@ -148,6 +199,34 @@ def _message_keywords(message: str) -> list[str]:
         "ys", "bs", "os", "gs", "rs", "yl", "bl", "ol", "gl", "rl",
     }
     return [word for word in words if word in keep]
+
+
+def _public_constraint_message(message: str) -> str:
+    public_message = message
+    for term in CONSTRAINT_FORBIDDEN_TERMS:
+        public_message = re.sub(term, "[redacted]", public_message, flags=re.IGNORECASE)
+    return public_message
+
+
+def _message_action(message: str) -> str:
+    lowered = message.lower()
+    if "remove" in lowered:
+        return "remove"
+    if "place" in lowered or "put" in lowered:
+        return "place"
+    return "unspecified"
+
+
+def _constraint_keywords(keywords: list[str]) -> bool:
+    return bool(set(keywords) & (_block_tokens() | _color_tokens() | {"bottom", "middle", "top", "left", "right"}))
+
+
+def _block_tokens() -> set[str]:
+    return {"ys", "bs", "os", "gs", "rs", "yl", "bl", "ol", "gl", "rl"}
+
+
+def _color_tokens() -> set[str]:
+    return {"yellow", "blue", "orange", "green", "red"}
 
 
 def _message_has_uncertainty(message: str) -> bool:
