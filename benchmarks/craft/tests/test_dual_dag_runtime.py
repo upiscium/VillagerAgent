@@ -169,6 +169,7 @@ def test_runtime_reset_clears_all_node_and_edge_counts():
         "action_edge_count": 0,
         "reported_claim_count": 0,
         "hypothesis_count": 0,
+        "resolved_fact_count": 0,
         "action_candidate_count": 0,
     }
 
@@ -394,6 +395,97 @@ def test_serialized_hypothesis_excludes_hidden_state():
     assert "target_structure" not in serialized
     assert "oracle_moves" not in serialized
     assert "raw_private_view" not in serialized
+
+
+def test_runtime_adds_resolved_fact_with_resolved_by_edges():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_reported_claim(
+        director_id="D1",
+        turn_index=1,
+        message="Bottom left is yellow small.",
+    )
+    runtime.update_public_state(
+        turn_index=2,
+        public_state=CraftPublicState(
+            turn_index=2,
+            public_messages=[],
+            builder_actions=[{"action": "place", "block": "ys", "position": "(0,0)", "layer": 0}],
+            visible_constructed_structure={},
+            progress_summary=None,
+        ),
+    )
+
+    resolved = runtime.add_resolved_fact(
+        fact_id="bottom_left_yellow",
+        turn_index=2,
+        summary="Bottom left can be treated as yellow small for action decisions.",
+        evidence_ids=["claim:D1:1", "public:builder_action:2:0", "claim:D1:1"],
+        confidence=0.92,
+        content={"position": "(0,0)", "block": "ys"},
+    )
+
+    assert resolved == {
+        "node_id": "resolved_fact:bottom_left_yellow",
+        "node_type": "resolved_fact",
+        "content": {
+            "summary": "Bottom left can be treated as yellow small for action decisions.",
+            "evidence_ids": ["claim:D1:1", "public:builder_action:2:0"],
+            "position": "(0,0)",
+            "block": "ys",
+        },
+        "confidence": 0.92,
+        "provenance": {
+            "source": "dual_dag_runtime",
+            "director_id": None,
+            "turn_index": 2,
+            "visibility": "public",
+        },
+    }
+    assert runtime.resolved_facts() == {"resolved_fact:bottom_left_yellow": resolved}
+    assert runtime.snapshot_summary()["resolved_fact_count"] == 1
+    assert runtime.epistemic_edges[-2:] == [
+        {
+            "source_id": "claim:D1:1",
+            "target_id": "resolved_fact:bottom_left_yellow",
+            "edge_type": "resolved_by",
+            "metadata": {"turn_index": 2, "resolved_fact_id": "resolved_fact:bottom_left_yellow"},
+        },
+        {
+            "source_id": "public:builder_action:2:0",
+            "target_id": "resolved_fact:bottom_left_yellow",
+            "edge_type": "resolved_by",
+            "metadata": {"turn_index": 2, "resolved_fact_id": "resolved_fact:bottom_left_yellow"},
+        },
+    ]
+
+
+def test_resolved_fact_serialization_excludes_hidden_state():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+
+    runtime.add_resolved_fact(
+        fact_id="safe_fact",
+        turn_index=3,
+        summary="Publicly resolved safe fact.",
+        evidence_ids=["claim:D1:1"],
+        confidence=1.2,
+        content={
+            "visible": "ok",
+            "target_structure": "hidden",
+            "oracle_moves": ["hidden"],
+            "nested": {"raw_private_view": "hidden", "public": True},
+            "_internal": "drop",
+        },
+    )
+
+    serialized = json.dumps(runtime.serialized_snapshot())
+
+    assert "resolved_fact" in serialized
+    assert "visible" in serialized
+    assert "target_structure" not in serialized
+    assert "oracle_moves" not in serialized
+    assert "raw_private_view" not in serialized
+    assert "_internal" not in serialized
+    assert runtime.resolved_facts()["resolved_fact:safe_fact"]["confidence"] == 1.0
 
 
 def test_public_evidence_summary_includes_required_public_claim_only():
