@@ -12,6 +12,15 @@ from benchmarks.craft.dual_dag.epistemic_extractor import (
 from benchmarks.craft.dual_dag.serialization import snapshot_to_dict
 
 
+RESOLVED_FACT_PRIVATE_KEYS = {
+    "target_structure",
+    "oracle_moves",
+    "raw_private_view",
+    "hidden_spans",
+    "hidden_labels",
+}
+
+
 class DualDAGRuntime:
     def __init__(self, *, director_ids: list[str], config: dict):
         self.director_ids = list(director_ids)
@@ -144,6 +153,52 @@ class DualDAGRuntime:
             if node.get("node_type") == "hypothesis"
         }
 
+    def resolved_facts(self) -> dict[str, dict]:
+        return {
+            node_id: node
+            for node_id, node in self.epistemic_nodes.items()
+            if node.get("node_type") == "resolved_fact"
+        }
+
+    def add_resolved_fact(
+        self,
+        *,
+        fact_id: str,
+        turn_index: int,
+        summary: str,
+        evidence_ids: list[str],
+        confidence: float,
+        content: dict | None = None,
+    ) -> dict:
+        node_id = f"resolved_fact:{fact_id}"
+        public_content = _public_resolved_fact_content(content or {})
+        node = {
+            "node_id": node_id,
+            "node_type": "resolved_fact",
+            "content": {
+                "summary": summary,
+                "evidence_ids": sorted(set(evidence_ids)),
+                **public_content,
+            },
+            "confidence": _bounded_confidence(float(confidence)),
+            "provenance": {
+                "source": "dual_dag_runtime",
+                "director_id": None,
+                "turn_index": turn_index,
+                "visibility": "public",
+            },
+        }
+        self.epistemic_nodes[node_id] = node
+        for evidence_id in sorted(set(evidence_ids)):
+            self._add_epistemic_edge(
+                source_id=evidence_id,
+                target_id=node_id,
+                edge_type="resolved_by",
+                turn_index=turn_index,
+                metadata={"resolved_fact_id": node_id},
+            )
+        return node
+
     def current_turn_decision_support(
         self,
         *,
@@ -249,6 +304,10 @@ class DualDAGRuntime:
             "hypothesis_count": sum(
                 1 for node in self.epistemic_nodes.values()
                 if node.get("node_type") == "hypothesis"
+            ),
+            "resolved_fact_count": sum(
+                1 for node in self.epistemic_nodes.values()
+                if node.get("node_type") == "resolved_fact"
             ),
             "action_candidate_count": len(self.action_nodes),
         }
@@ -525,6 +584,29 @@ def _public_claim_content(claim: dict) -> dict:
         "keywords": list(content.get("keywords", []) or []),
         "uncertain": bool(content.get("uncertain", False)),
     }
+
+
+def _public_resolved_fact_content(content: dict) -> dict:
+    return {
+        str(key): _public_resolved_fact_value(value)
+        for key, value in content.items()
+        if _is_public_resolved_fact_key(key)
+    }
+
+
+def _public_resolved_fact_value(value):
+    if isinstance(value, dict):
+        return _public_resolved_fact_content(value)
+    if isinstance(value, list):
+        return [_public_resolved_fact_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_public_resolved_fact_value(item) for item in value]
+    return value
+
+
+def _is_public_resolved_fact_key(key) -> bool:
+    key_text = str(key)
+    return not key_text.startswith("_") and key_text not in RESOLVED_FACT_PRIVATE_KEYS
 
 
 def _actions_share_location_or_type(action: dict, prior_action: dict, location_keywords: set[str]) -> bool:
