@@ -134,6 +134,38 @@ def build_minecraft_dual_dag_artifact_from_action_log(
     )
 
 
+def build_minecraft_runtime_decision_support(
+    artifact: dict,
+    *,
+    candidate_tasks: list | None = None,
+) -> dict:
+    """Return dry-run decision support from a Minecraft Dual-DAG artifact.
+
+    This is the lowest-risk runtime hook: callers can read the recommendation
+    without mutating Task, Graph, action logs, or Minecraft environment state.
+    """
+    nodes = list(artifact.get("nodes", []) or [])
+    edges = list(artifact.get("edges", []) or [])
+    task_rows = _decision_candidate_tasks(candidate_tasks, nodes)
+    scored = [
+        _score_task_candidate(task, nodes=nodes, edges=edges)
+        for task in task_rows
+    ]
+    recommended = max(scored, key=lambda row: row["score"]) if scored else {}
+    return {
+        "mode": "dry_run",
+        "mutates_runtime": False,
+        "recommended_task_id": recommended.get("task_id", ""),
+        "recommended_description": recommended.get("description", ""),
+        "candidates": scored,
+        "context": {
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "hook": "read_only_minecraft_dual_dag_artifact",
+        },
+    }
+
+
 def minecraft_dual_dag_mapping() -> dict:
     return {
         "observations": [
@@ -152,6 +184,10 @@ def minecraft_dual_dag_mapping() -> dict:
             "Minecraft artifacts are read-only projections and do not mutate type_define.graph.Graph.",
             "CRAFT DualDAGRuntime remains decoupled from Minecraft artifact capture.",
             "Private, internal, credential, and underscore-prefixed fields are dropped recursively.",
+        ],
+        "decision_support": [
+            "Runtime decision support is a dry-run read of Minecraft Dual-DAG artifacts.",
+            "Recommendations do not mutate Task, Graph, action logs, or environment state.",
         ],
     }
 
@@ -236,6 +272,88 @@ def sanitize_public_value(value):
     if isinstance(value, tuple):
         return [sanitize_public_value(child) for child in value]
     return value
+
+
+def _decision_candidate_tasks(candidate_tasks: list | None, nodes: list[dict]) -> list[dict]:
+    if candidate_tasks is not None:
+        rows = []
+        for index, task in enumerate(candidate_tasks):
+            if isinstance(task, str):
+                rows.append({"task_id": f"candidate:{index}", "description": task})
+            elif isinstance(task, dict):
+                rows.append({
+                    "task_id": str(task.get("task_id") or task.get("node_id") or f"candidate:{index}"),
+                    "description": str(task.get("description", "")),
+                })
+        return rows
+    return [
+        {
+            "task_id": node.get("node_id", ""),
+            "description": str((node.get("content", {}) or {}).get("description", "")),
+        }
+        for node in nodes
+        if node.get("node_type") == "minecraft_task"
+    ]
+
+
+def _score_task_candidate(task: dict, *, nodes: list[dict], edges: list[dict]) -> dict:
+    task_id = task.get("task_id", "")
+    description = task.get("description", "")
+    words = _keyword_set(description)
+    invoked_action_ids = [
+        edge.get("target_id", "")
+        for edge in edges
+        if edge.get("source_id") == task_id and edge.get("edge_type") == "task_invokes_action"
+    ]
+    observations = _observations_for_actions(invoked_action_ids, nodes=nodes, edges=edges)
+    failed_observations = [node for node in observations if _observation_status(node) is False]
+    successful_observations = [node for node in observations if _observation_status(node) is True]
+    related_claims = [
+        node for node in nodes
+        if node.get("node_type") == "minecraft_claim"
+        and words
+        and words & _keyword_set(str((node.get("content", {}) or {}).get("message", "")))
+    ]
+    score = 0.0
+    score += len(successful_observations)
+    score += 0.5 * len(related_claims)
+    score -= 2.0 * len(failed_observations)
+    if not invoked_action_ids:
+        score += 0.1
+    return {
+        "task_id": task_id,
+        "description": description,
+        "score": score,
+        "recommendation": "retry_or_replan" if failed_observations else "candidate",
+        "supporting_claim_ids": [node.get("node_id", "") for node in related_claims],
+        "successful_observation_ids": [node.get("node_id", "") for node in successful_observations],
+        "failed_observation_ids": [node.get("node_id", "") for node in failed_observations],
+    }
+
+
+def _observations_for_actions(action_ids: list[str], *, nodes: list[dict], edges: list[dict]) -> list[dict]:
+    observation_ids = {
+        edge.get("target_id", "")
+        for edge in edges
+        if edge.get("source_id") in action_ids and edge.get("edge_type") == "produces_observation"
+    }
+    return [node for node in nodes if node.get("node_id") in observation_ids]
+
+
+def _observation_status(node: dict):
+    content = node.get("content", {}) if isinstance(node, dict) else {}
+    result = content.get("result") if isinstance(content, dict) else None
+    if isinstance(result, dict):
+        return result.get("status")
+    return None
+
+
+def _keyword_set(text: str) -> set[str]:
+    return {
+        word.strip(".,:;!?()[]{}\"'").lower()
+        for word in text.split()
+        if len(word.strip(".,:;!?()[]{}\"'")) > 2
+    }
 
 
 def _claim_content(entry: dict) -> dict:

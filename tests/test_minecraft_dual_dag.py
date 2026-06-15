@@ -3,6 +3,7 @@ import json
 from env.minecraft_dual_dag import (
     build_minecraft_dual_dag_artifact,
     build_minecraft_dual_dag_artifact_from_action_log,
+    build_minecraft_runtime_decision_support,
     minecraft_dual_dag_mapping,
     sanitize_public_value,
 )
@@ -132,3 +133,49 @@ def test_minecraft_dual_dag_mapping_documents_boundaries():
     assert any("action_log.json" in item for item in mapping["actions"])
     assert any("final answers" in item for item in mapping["claims"])
     assert any("CRAFT DualDAGRuntime remains decoupled" in item for item in mapping["boundaries"])
+    assert any("dry-run" in item for item in mapping["decision_support"])
+
+
+def test_minecraft_runtime_decision_support_uses_artifact_context_without_mutation():
+    failed_task = Task("Open locked door", {})
+    failed_task._agent = ["Alice"]
+    claim_supported_task = Task("Find chest", {})
+    graph = Graph()
+    graph.add_node(failed_task)
+    graph.add_node(claim_supported_task)
+    action_log = {
+        "Alice": [{
+            "action": "openContainer",
+            "kwargs": {"player_name": "Alice", "item_name": "door"},
+            "result": {"status": False, "message": "door is locked"},
+        }],
+        "Bob": [{
+            "action": "talkTo",
+            "kwargs": {
+                "player_name": "Bob",
+                "entity_name": "Alice",
+                "message": "The chest is north of the door.",
+            },
+            "result": {"status": True},
+        }],
+    }
+    artifact = build_minecraft_dual_dag_artifact(action_log=action_log, graph=graph)
+    before_artifact = json.dumps(artifact, sort_keys=True)
+    before_statuses = [failed_task.status, claim_supported_task.status]
+
+    support = build_minecraft_runtime_decision_support(
+        artifact,
+        candidate_tasks=[
+            {"node_id": f"minecraft:task:{failed_task.id}", "description": failed_task.description},
+            {"node_id": f"minecraft:task:{claim_supported_task.id}", "description": claim_supported_task.description},
+        ],
+    )
+
+    assert support["mode"] == "dry_run"
+    assert support["mutates_runtime"] is False
+    assert support["recommended_task_id"] == f"minecraft:task:{claim_supported_task.id}"
+    assert support["candidates"][0]["recommendation"] == "retry_or_replan"
+    assert support["candidates"][0]["failed_observation_ids"] == ["minecraft:observation:Alice:0"]
+    assert support["candidates"][1]["supporting_claim_ids"] == ["minecraft:claim:Bob:0"]
+    assert json.dumps(artifact, sort_keys=True) == before_artifact
+    assert [failed_task.status, claim_supported_task.status] == before_statuses
