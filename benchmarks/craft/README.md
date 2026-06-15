@@ -193,6 +193,7 @@ The compact summary table is the easiest artifact to inspect first. Read it as f
 - `mean_final_progress` and `completion_rate` summarize task outcome.
 - `builder_fallback_rate` indicates how often Builder output had to be replaced with a verified fallback candidate.
 - `gated_clarification_rate` indicates how often the Dual-DAG gate intervened with `CLARIFY`.
+- `clarification_resolution_rate`, `mean_clarification_quality_score`, and `mean_post_clarification_progress_delta` summarize whether clarification turns were specific and followed by improved downstream evidence or progress.
 - `claim_support_count`, `claim_conflict_count`, and `claim_required_evidence_count` summarize Director coordination evidence for chosen actions.
 - `dual_dag_node_count` and `dual_dag_edge_count` show runtime graph size.
 - `supported_action_count`, `conflicted_action_count`, and `required_evidence_action_count` summarize action-level graph evidence.

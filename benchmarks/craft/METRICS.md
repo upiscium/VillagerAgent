@@ -48,6 +48,10 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 - `clarification_count`: Number of turns where the final Builder action is `clarify`. This includes direct Builder clarifications and gate-induced clarifications.
 - `gated_clarification_count`: Number of turns where the Dual-DAG gate replaced a candidate action with `clarify`.
 - `gated_clarification_rate`: `gated_clarification_count / turn_count`.
+- `clarification_resolution_count`: Number of clarification turns whose next non-clarify action shows downstream resolution. Resolution is heuristic-based: progress increases, chosen action confidence improves, or conflict/required-evidence counts decrease.
+- `clarification_resolution_rate`: `clarification_resolution_count / clarification_count`.
+- `mean_clarification_quality_score`: Mean heuristic specificity score for clarification turns. The score rewards explicit clarification wording, concrete gate reasons, conflict/required-evidence/span reasons, and public evidence context.
+- `mean_post_clarification_progress_delta`: Mean progress change from a clarification turn to the next non-clarify action turn.
 - `mean_risk_score`: Mean risk score over gated clarification decisions. The current score is based primarily on `1.0 - chosen_confidence`.
 - `low_confidence_gate_count`: Number of gated clarifications caused by low action confidence.
 - `conflict_gate_count`: Number of gated clarifications caused by hard claim conflicts whose risk exceeds clarification cost.
@@ -79,7 +83,7 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 For paper-facing or quick inspection tables, focus on:
 
 - Task performance: `mean_final_progress`, `completion_rate`
-- Runtime stability: `builder_fallback_rate`, `gated_clarification_rate`
+- Runtime stability: `builder_fallback_rate`, `gated_clarification_rate`, `clarification_resolution_rate`
 - Coordination quality: `claim_support_count`, `claim_conflict_count`, `claim_required_evidence_count`
 - Graph richness: `dual_dag_node_count`, `dual_dag_edge_count`, `supported_action_count`, `conflicted_action_count`, `required_evidence_action_count`
 - Safety: `leakage_passed`

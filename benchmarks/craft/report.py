@@ -39,6 +39,10 @@ REPORT_FIELDS = [
     "clarification_count",
     "gated_clarification_count",
     "gated_clarification_rate",
+    "clarification_resolution_count",
+    "clarification_resolution_rate",
+    "mean_clarification_quality_score",
+    "mean_post_clarification_progress_delta",
     "mean_risk_score",
     "low_confidence_gate_count",
     "conflict_gate_count",
@@ -151,6 +155,22 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
         "gated_clarification_rate": runtime.get(
             "gated_clarification_rate",
             _mean_metric_rows(metrics_rows, "gated_clarification_rate"),
+        ),
+        "clarification_resolution_count": runtime.get(
+            "clarification_resolution_count",
+            _sum_metric_rows(metrics_rows, "clarification_resolution_count"),
+        ),
+        "clarification_resolution_rate": runtime.get(
+            "clarification_resolution_rate",
+            _mean_metric_rows(metrics_rows, "clarification_resolution_rate"),
+        ),
+        "mean_clarification_quality_score": runtime.get(
+            "mean_clarification_quality_score",
+            _mean_metric_rows(metrics_rows, "mean_clarification_quality_score"),
+        ),
+        "mean_post_clarification_progress_delta": runtime.get(
+            "mean_post_clarification_progress_delta",
+            _mean_metric_rows(metrics_rows, "mean_post_clarification_progress_delta"),
         ),
         "mean_risk_score": runtime.get(
             "mean_risk_score",

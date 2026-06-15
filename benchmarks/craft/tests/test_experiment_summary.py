@@ -24,6 +24,8 @@ def test_experiment_summary_combines_runtime_and_analysis_metrics(tmp_path):
     assert rows[0]["seed"] == 3
     assert rows[0]["structures"] == "0,1"
     assert rows[0]["mean_final_progress"] == 0.25
+    assert rows[0]["clarification_resolution_rate"] == 0.5
+    assert rows[0]["mean_clarification_quality_score"] == 0.75
     assert rows[0]["claim_required_evidence_count"] == 3
     assert rows[0]["supported_action_count"] == 2
     assert rows[0]["required_evidence_action_count"] == 1
@@ -160,6 +162,9 @@ def _write_run(
         "runtime": {
             "builder_fallback_rate": 0.2,
             "gated_clarification_rate": 0.1,
+            "clarification_resolution_rate": 0.5,
+            "mean_clarification_quality_score": 0.75,
+            "mean_post_clarification_progress_delta": 0.2,
             "mean_action_confidence": 0.8,
             "claim_support_count": 5,
             "claim_conflict_count": 1,
