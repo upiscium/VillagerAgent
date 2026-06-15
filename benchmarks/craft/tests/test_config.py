@@ -96,6 +96,7 @@ def test_dual_dag_qwen_configs_share_eval_axis():
     for config_path in (
         "configs/craft/eval_qwen_ollama_dual_dag.yaml",
         "configs/craft/single_director_qwen_ollama_dual_dag.yaml",
+        "configs/craft/eval_qwen_ollama_dual_dag_adaptive.yaml",
     ):
         config = load_config(config_path)
         assert config["run"]["structures"] == baseline["run"]["structures"]
@@ -107,3 +108,12 @@ def test_dual_dag_qwen_configs_share_eval_axis():
         assert config["dual_dag"]["gated_clarification"]["clarification_cost"] == 0.4
         assert config["models"]["director"]["provider"] == "ollama_native"
         assert config["models"]["builder"]["provider"] == "ollama_native"
+
+
+def test_adaptive_dual_dag_config_keeps_static_gate_config_explicit():
+    config = load_config("configs/craft/eval_qwen_ollama_dual_dag_adaptive.yaml")
+    gate = config["dual_dag"]["gated_clarification"]
+    assert gate["adaptive_thresholds"]["enabled"] is True
+    assert gate["min_action_confidence"] == 0.55
+    assert gate["clarification_cost"] == 0.4
+    assert gate["clarify_on_required_evidence"] is True

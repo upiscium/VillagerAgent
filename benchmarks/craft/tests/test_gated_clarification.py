@@ -1,3 +1,5 @@
+import pytest
+
 from benchmarks.craft.craft_env_adapter import (
     _apply_clarification_gate,
     _prioritize_supported_candidates,
@@ -58,6 +60,57 @@ def test_gate_allows_medium_confidence_after_tuning():
 
     assert should_gate is False
     assert metadata["thresholds"]["min_action_confidence"] == 0.55
+    assert metadata["thresholds"]["adaptive_thresholds"]["enabled"] is False
+
+
+def test_adaptive_gate_lowers_confidence_threshold_with_support():
+    should_gate, metadata = should_clarify(
+        candidate_metadata={
+            "chosen_confidence": 0.5,
+            "claim_support_count": 2,
+            "claim_conflict_count": 0,
+        },
+        config={
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {
+                    "enabled": True,
+                    "adaptive_thresholds": {"enabled": True},
+                },
+            }
+        },
+    )
+
+    assert should_gate is False
+    assert metadata["thresholds"]["min_action_confidence"] == pytest.approx(0.45)
+    assert metadata["thresholds"]["adaptive_thresholds"]["applied"] is True
+
+
+def test_adaptive_gate_raises_threshold_and_lowers_cost_for_uncertainty():
+    should_gate, metadata = should_clarify(
+        candidate_metadata={
+            "chosen_confidence": 0.6,
+            "claim_support_count": 0,
+            "claim_conflict_count": 1,
+            "claim_required_evidence_count": 1,
+        },
+        config={
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {
+                    "enabled": True,
+                    "min_action_confidence": 0.55,
+                    "clarify_on_required_evidence": True,
+                    "adaptive_thresholds": {"enabled": True},
+                },
+            }
+        },
+    )
+
+    assert should_gate is True
+    assert metadata["thresholds"]["min_action_confidence"] == pytest.approx(0.7)
+    assert metadata["thresholds"]["clarification_cost"] == pytest.approx(0.32)
+    assert "low_action_confidence" in metadata["reasons"]
 
 
 def test_gate_ignores_required_evidence_when_configured_off():

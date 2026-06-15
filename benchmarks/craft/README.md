@@ -87,6 +87,14 @@ python -m benchmarks.craft.experiment --config configs/craft/experiments/qwen_ro
 
 This robustness manifest runs the qwen baseline, Dual-DAG condition, single-Director Dual-DAG ablation, and comparable official baseline artifact over seeds `1, 3, 5` and structures `0, 1, 2, 3, 4`. It writes comparison, compact summary, and variance summary artifacts under `result/craft/`.
 
+To compare static and experimental adaptive gated clarification thresholds, use:
+
+```bash
+python -m benchmarks.craft.experiment --config configs/craft/experiments/qwen_adaptive_gating_v1.yaml
+```
+
+Adaptive gating is opt-in via `dual_dag.gated_clarification.adaptive_thresholds.enabled`. Static thresholds remain the default. Inspect the generated compact summary first, especially `gated_clarification_rate`, `clarification_resolution_rate`, `mean_clarification_quality_score`, and `mean_post_clarification_progress_delta`.
+
 To run the full official CRAFT baseline through `external/CRAFT/run_craft.py`, use:
 
 ```bash
