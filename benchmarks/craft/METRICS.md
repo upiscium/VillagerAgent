@@ -48,6 +48,7 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 - `clarification_count`: Number of turns where the final Builder action is `clarify`. This includes direct Builder clarifications and gate-induced clarifications.
 - `gated_clarification_count`: Number of turns where the Dual-DAG gate replaced a candidate action with `clarify`.
 - `gated_clarification_rate`: `gated_clarification_count / turn_count`.
+- Adaptive gated clarification is experimental and opt-in. When `dual_dag.gated_clarification.adaptive_thresholds.enabled=true`, the gate adjusts `min_action_confidence` and `clarification_cost` from public action metadata: support lowers intervention pressure, while conflicts and required evidence raise it. Static thresholds remain the default.
 - `clarification_resolution_count`: Number of clarification turns whose next non-clarify action shows downstream resolution. Resolution is heuristic-based: progress increases, chosen action confidence improves, or conflict/required-evidence counts decrease.
 - `clarification_resolution_rate`: `clarification_resolution_count / clarification_count`.
 - `mean_clarification_quality_score`: Mean heuristic specificity score for clarification turns. The score rewards explicit clarification wording, concrete gate reasons, conflict/required-evidence/span reasons, and public evidence context.

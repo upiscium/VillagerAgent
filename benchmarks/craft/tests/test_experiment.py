@@ -67,6 +67,17 @@ def test_load_qwen_robustness_manifest():
     assert experiment["report"]["variance_summary_output"].endswith("variance_qwen_robustness_v1.csv")
 
 
+def test_load_qwen_adaptive_gating_manifest():
+    manifest = load_experiment("configs/craft/experiments/qwen_adaptive_gating_v1.yaml")
+    experiment = manifest["experiment"]
+    assert experiment["name"] == "craft_qwen_adaptive_gating_v1"
+    assert experiment["runs"] == [
+        "configs/craft/eval_qwen_ollama_dual_dag.yaml",
+        "configs/craft/eval_qwen_ollama_dual_dag_adaptive.yaml",
+    ]
+    assert experiment["report"]["compact_summary_output"].endswith("summary_qwen_adaptive_gating_v1.csv")
+
+
 def test_load_experiment_rejects_empty_runs(tmp_path):
     manifest_path = tmp_path / "empty.yaml"
     manifest_path.write_text(yaml.safe_dump({"experiment": {"runs": []}}), encoding="utf-8")
