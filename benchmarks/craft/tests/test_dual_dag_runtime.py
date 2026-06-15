@@ -814,6 +814,82 @@ def test_runtime_persists_wait_for_evidence_action_candidate_without_hidden_stat
     assert "oracle_moves" not in serialized
 
 
+def test_clarification_response_resolves_required_evidence_and_updates_candidate():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_action_candidates(turn_index=2, candidates=[{
+        "node_id": "action:2:0",
+        "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+        "confidence": 0.4,
+        "supported_by": [],
+        "conflicts_with": [],
+        "required_evidence": ["claim:D1:1"],
+        "metadata": {},
+    }])
+    runtime.add_coordination_action_candidate(
+        turn_index=2,
+        action_type="clarify",
+        reason="required_evidence",
+        related_candidate_ids=["action:2:0"],
+        required_evidence_ids=["claim:D1:1"],
+        question="Please confirm bottom left.",
+    )
+
+    result = runtime.ingest_clarification_response(
+        clarify_candidate_id="coordination:clarify:2:0",
+        director_id="D1",
+        turn_index=3,
+        message="Bottom left is yellow small.",
+    )
+
+    candidate = runtime.action_nodes["action:2:0"]
+    assert result["reported_claim"]["node_id"] == "claim:D1:3"
+    assert result["resolved_fact"]["node_type"] == "resolved_fact"
+    assert result["resolved_fact"]["content"]["evidence_ids"] == ["claim:D1:1", "claim:D1:3"]
+    assert candidate["supported_by"] == ["claim:D1:3"]
+    assert candidate["state"] == "executable"
+    assert candidate["metadata"]["unlock"]["reason"] == "required_evidence_resolved"
+    assert runtime.hypotheses()["hypothesis:required_evidence:claim:D1:1:action:2:0"]["content"]["status"] == "resolved"
+    assert {
+        "source_id": "claim:D1:3",
+        "target_id": "coordination:clarify:2:0",
+        "edge_type": "clarification_response",
+        "metadata": {"turn_index": 3, "director_id": "D1"},
+    } in runtime.action_edges
+
+
+def test_clarification_response_can_introduce_conflict_and_invalidate_candidate():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_action_candidates(turn_index=2, candidates=[{
+        "node_id": "action:2:0",
+        "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+        "confidence": 0.7,
+        "supported_by": [],
+        "conflicts_with": [],
+        "required_evidence": [],
+        "metadata": {},
+    }])
+    runtime.add_coordination_action_candidate(
+        turn_index=2,
+        action_type="clarify",
+        reason="low_action_confidence",
+        related_candidate_ids=["action:2:0"],
+        question="Please confirm bottom left.",
+    )
+
+    result = runtime.ingest_clarification_response(
+        clarify_candidate_id="coordination:clarify:2:0",
+        director_id="D2",
+        turn_index=3,
+        message="Bottom left is blue small.",
+    )
+
+    candidate = runtime.action_nodes["action:2:0"]
+    assert result["resolved_fact"] is None
+    assert candidate["conflicts_with"] == ["claim:D2:3"]
+    assert candidate["state"] == "invalidated"
+    assert candidate["metadata"]["unlock"]["reason"] == "conflicting_evidence"
+
+
 def test_public_evidence_summary_includes_required_public_claim_only():
     claim = {
         "node_id": "claim:D1:1",
