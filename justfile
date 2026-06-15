@@ -4,7 +4,7 @@ default:
     just --list
 
 validate:
-    python -m compileall -q benchmarks/craft
+    python -m compileall -q benchmarks/craft env
 
 test:
     pytest

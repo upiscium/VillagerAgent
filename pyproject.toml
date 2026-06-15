@@ -33,5 +33,5 @@ dependencies = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-testpaths = ["benchmarks/craft/tests"]
+testpaths = ["benchmarks/craft/tests", "tests"]
 norecursedirs = ["external"]
