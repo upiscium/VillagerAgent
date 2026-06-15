@@ -4,9 +4,9 @@
 
 この文書は最終的に目指す Dual-DAG アーキテクチャを含む提案であり，現時点の実装はそのうち CRAFT 向け MVP を中心に進んでいる．
 
-現状は，Director の発話を `ReportedClaim` として保持し，Builder の候補行動に support/conflict/required-evidence/confidence を付け，必要なら `CLARIFY` に倒すところまで実装済みである．また，`DualDAGRuntime` により `Epistemic DAG` と `Action Candidate DAG` のノード・エッジを CRAFT ローカルに保持し，過去の public claim/action を検索して action scoring に使う runtime retrieval も実装済みである．
+現状は，Director の発話を `ReportedClaim` として保持し，Builder の候補行動に support/conflict/required-evidence/confidence を付け，必要なら `CLARIFY` に倒すところまで実装済みである．また，`DualDAGRuntime` により `Epistemic DAG` と `Action Candidate DAG` のノード・エッジを CRAFT ローカルに保持し，過去の public claim/action を検索して action scoring に使う runtime retrieval も実装済みである．さらに，CRAFT の action candidate を VillagerAgent Task DAG 向け projection に写す橋渡しと，Minecraft の task/action/observation/claim を read-only Dual-DAG artifact として出力する最小 projection も実装済みである．
 
-一方で，提案の中核である `Hypothesis` と `ResolvedFact` による知識解決はまだ部分実装である．`Hypothesis` node は unresolved/conflicting evidence から生成・更新され，`supports` / `conflicts_with` / `derived_from` / `requires_confirmation_from` の一部 epistemic edge も populated されるが，`ResolvedFact`，`resolved_by`，graph traversal による action unlock，および Minecraft 実環境での VillagerAgent Task DAG 接続は未実装である．
+一方で，提案の中核である `Hypothesis` と `ResolvedFact` による知識解決はまだ部分実装である．`Hypothesis` node は unresolved/conflicting evidence から生成・更新され，`supports` / `conflicts_with` / `derived_from` / `requires_confirmation_from` の一部 epistemic edge も populated されるが，`ResolvedFact`，`resolved_by`，graph traversal による action unlock，clarification response 取り込みと再評価，および Minecraft 実環境での runtime decision support への接続は未実装である．
 
 | 領域 | 現状 |
 | --- | --- |
@@ -14,14 +14,17 @@
 | Action candidate metadata | 実装済み．候補行動に support/conflict/required-evidence/confidence を付与する |
 | Runtime graph object | 部分実装済み．`DualDAGRuntime` がノード・エッジ・snapshot・public retrieval を持つ |
 | Gated clarification | 実装済み．confidence/conflict/required evidence/span uncertainty に基づき `CLARIFY` を選ぶ |
+| Adaptive gated clarification | 実装済み．状態に応じて clarification threshold を調整する |
 | Evidence-aware Builder prompting | 実装済み．public evidence summary を Builder prompt に追加する |
 | Partial-information safety | 実装済み．hidden target/oracle/private view の prompt/artifact leakage を検査する |
 | Hypothesis / ResolvedFact | 部分実装済み．`Hypothesis` は生成・更新されるが，`ResolvedFact` と解決処理はまだない |
 | Epistemic edge population | 部分実装済み．observation/claim/hypothesis/action 間に一部 edge を張る |
+| Clarification metrics | 実装済み．resolution count/rate，quality score，post-clarification progress delta を集計する |
+| CRAFT Action Candidate DAG と Task DAG projection | 実装済み．CRAFT action candidate を read-only Task DAG projection に写す |
 | Graph traversal unlock | 未実装．action state を traversal で `blocked` から `executable` にする処理はない |
-| Minecraft Task DAG 接続 | 未実装 |
+| Minecraft Task DAG 接続 | 部分実装済み．Minecraft task/action/observation/claim の read-only artifact projection はあるが，実行時 decision support への接続はまだない |
 
-したがって，現在の実装は「完全な知識解決 Dual-DAG」ではなく，「CRAFT 上で claim と action candidate を構造化し，根拠付き scoring と gated clarification を行う Dual-DAG MVP」と位置づける．
+したがって，現在の実装は「完全な知識解決 Dual-DAG」ではなく，「CRAFT 上で claim と action candidate を構造化し，根拠付き scoring，runtime retrieval，gated/adaptive clarification，artifact analysis を行い，VillagerAgent Task DAG / Minecraft artifact への最小 projection まで備えた Dual-DAG MVP」と位置づける．
 
 ## 1. 目的
 
@@ -40,7 +43,7 @@ CRAFT は，3人の Director がそれぞれ異なる部分観測しか持たず
 - `Epistemic DAG`: 知識，不確実性，他者発話，仮説，解決済み事実を管理する認識論的 DAG
 - `Action Candidate DAG`: Builder が取り得る候補行動と，それらを支える根拠・依存関係を管理する実行候補 DAG
 
-CRAFT では Director は直接ブロックを置かないため，第2層は一般的な物理タスク DAG ではなく，まず Builder の候補行動を扱う `Action Candidate DAG` として実装する．Minecraft 実環境へ拡張する段階では，この層を VillagerAgent の既存 Task DAG に接続する．
+CRAFT では Director は直接ブロックを置かないため，第2層は一般的な物理タスク DAG ではなく，まず Builder の候補行動を扱う `Action Candidate DAG` として実装する．Minecraft 実環境へ拡張する段階では，この層を VillagerAgent の既存 Task DAG に接続する．現時点では，CRAFT action candidate から Task DAG projection への橋渡しと，Minecraft task/action/observation/claim から read-only Dual-DAG artifact への projection まで実装済みであり，Minecraft 実行制御そのものへの graph traversal / unlock 統合は今後の対象である．
 
 ## 3. Layer 1: Epistemic DAG
 
@@ -274,16 +277,29 @@ AgentNet などの分散 DAG 型フレームワークは，主にタスク分割
 - action unlock 条件を graph traversal として扱う
 - Minecraft 実環境では Action Candidate DAG を VillagerAgent Task DAG に接続する
 
-現状: 部分実装済み．`DualDAGRuntime` は CRAFT ローカルの graph object として，epistemic/action nodes，action support/conflict edges，hypothesis nodes，epistemic edges，snapshot，serialization，public graph retrieval を持つ．ただし `ResolvedFact`, `resolved_by`, action state transition, graph traversal unlock, Minecraft Task DAG 接続は未実装である．
+現状: 部分実装済み．`DualDAGRuntime` は CRAFT ローカルの graph object として，epistemic/action nodes，action support/conflict edges，hypothesis nodes，epistemic edges，snapshot，serialization，public graph retrieval を持つ．CRAFT action candidate と VillagerAgent Task DAG の read-only projection，および Minecraft task/action/observation/claim の read-only artifact projection も実装済みである．ただし `ResolvedFact`, `resolved_by`, action state transition, graph traversal unlock, clarification response ingestion, Minecraft runtime decision support への接続は未実装である．
 
-次の実装対象は以下である．
+次の実装対象は以下である．これらは GitHub Issue として分割して管理する．
 
-- `Hypothesis` node の confidence/update/resolution semantics を拡張する
-- `resolved_by` と ResolvedFact 生成を Epistemic DAG 側に追加する
-- `ResolvedFact` または public evidence threshold による action unlock 条件を実装する
+- `Hypothesis` node の confidence/update/resolution lifecycle を定義・拡張する
+- `ResolvedFact` node と `resolved_by` edge を Epistemic DAG 側に追加する
+- `ResolvedFact` または public evidence threshold による action unlock 条件を graph traversal として実装する
 - `Clarify` / `WaitForEvidence` を明示的な action candidate として graph に残す
 - clarification response を `ReportedClaim` / `ResolvedFact` として取り込み，候補行動を再評価する
-- Minecraft 実環境では Action Candidate DAG を VillagerAgent Task DAG に接続する
+- Minecraft artifact projection を runtime decision support に接続する
+- Director output から `suggested_constraints` を独立した構造として抽出する
+
+対応する未実装 Issue は以下である．
+
+| Issue | 対象 |
+| --- | --- |
+| #77 | `ResolvedFact` node と `resolved_by` edge を Epistemic DAG に追加する |
+| #78 | `Hypothesis` confidence/update/resolution lifecycle を定義する |
+| #79 | graph traversal による CRAFT action candidate unlock を実装する |
+| #80 | clarification response を取り込み，action candidate を再評価する |
+| #81 | Minecraft Dual-DAG artifact を runtime decision support に接続する |
+| #82 | `Clarify` / `WaitForEvidence` を明示的な action candidate として保持する |
+| #83 | Director output から `suggested_constraints` を構造化抽出する |
 
 ## 9. CRAFT で守るべき制約
 
