@@ -200,6 +200,104 @@ def test_runtime_public_builder_action_strips_prefixed_private_metadata():
     }
 
 
+def test_runtime_marks_chosen_action_candidate_executed_after_builder_action():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_action_candidates(turn_index=2, candidates=[{
+        "node_id": "action:2:0",
+        "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+        "confidence": 0.9,
+        "supported_by": [],
+        "conflicts_with": [],
+        "required_evidence": [],
+        "metadata": {},
+    }])
+
+    runtime.add_public_builder_action(
+        turn_index=2,
+        action={
+            "action": "place",
+            "block": "ys",
+            "position": "(0,0)",
+            "layer": 0,
+            "_action_candidate_metadata": {
+                "chosen_candidate_id": "action:2:0",
+                "oracle_moves": ["hidden"],
+            },
+        },
+    )
+
+    candidate = runtime.action_nodes["action:2:0"]
+    assert candidate["state"] == "executed"
+    assert candidate["metadata"]["execution"] == {
+        "state": "executed",
+        "turn_index": 2,
+        "public_action_id": "public:builder_action:2:0",
+        "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+    }
+    assert {
+        "source_id": "public:builder_action:2:0",
+        "target_id": "action:2:0",
+        "edge_type": "executes_action",
+        "metadata": {"turn_index": 2, "state": "executed"},
+    } in runtime.action_edges
+    assert runtime.update_action_candidate_states(turn_index=3)[0]["state"] == "executed"
+    assert not any(edge.get("edge_type") == "blocks_action" for edge in runtime.action_edges)
+    assert "oracle_moves" not in json.dumps(runtime.serialized_snapshot())
+
+
+def test_runtime_marks_matching_action_candidate_executed_without_chosen_id():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_action_candidates(turn_index=2, candidates=[{
+        "node_id": "action:2:0",
+        "action": {"action": "remove", "position": "(1,1)", "layer": 0},
+        "confidence": 0.8,
+        "supported_by": [],
+        "conflicts_with": [],
+        "required_evidence": [],
+        "metadata": {},
+    }])
+
+    runtime.add_public_builder_action(
+        turn_index=2,
+        action={"action": "remove", "position": "(1,1)", "layer": 0},
+    )
+
+    assert runtime.action_nodes["action:2:0"]["state"] == "executed"
+    assert runtime.action_edges[-1]["edge_type"] == "executes_action"
+
+
+def test_runtime_does_not_mark_non_matching_or_unexecuted_builder_action():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    runtime.add_action_candidates(turn_index=2, candidates=[{
+        "node_id": "action:2:0",
+        "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+        "confidence": 0.9,
+        "supported_by": [],
+        "conflicts_with": [],
+        "required_evidence": [],
+        "metadata": {},
+    }])
+
+    runtime.add_public_builder_action(
+        turn_index=2,
+        action={"action": "place", "block": "bs", "position": "(1,1)", "layer": 0},
+    )
+    runtime.add_public_builder_action(
+        turn_index=3,
+        action={
+            "action": "place",
+            "block": "ys",
+            "position": "(0,0)",
+            "layer": 0,
+            "_action_candidate_metadata": {"chosen_candidate_id": "action:2:0"},
+        },
+        executed=False,
+    )
+
+    assert runtime.action_nodes["action:2:0"].get("state") != "executed"
+    assert not any(edge.get("edge_type") == "executes_action" for edge in runtime.action_edges)
+
+
 def test_serialized_snapshot_removes_forbidden_hidden_keys_recursively():
     runtime = DualDAGRuntime(director_ids=["D1"], config={})
     runtime.epistemic_nodes["bad"] = {

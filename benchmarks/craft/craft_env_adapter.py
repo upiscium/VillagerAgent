@@ -228,7 +228,11 @@ class CraftEnvAdapter:
                 success, progress_data, *_ = game_state.execute_move(builder_action)
                 move_executed = bool(success)
                 progress = progress_data
-            dual_dag_runtime.add_public_builder_action(turn_index=turn_index, action=builder_action)
+            dual_dag_runtime.add_public_builder_action(
+                turn_index=turn_index,
+                action=builder_action,
+                executed=move_executed,
+            )
 
             turns.append({
                 "structure_id": structure_index,
