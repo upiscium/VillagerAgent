@@ -312,6 +312,7 @@ def test_serialized_snapshot_removes_forbidden_hidden_keys_recursively():
 
     snapshot = runtime.serialized_snapshot()
 
+    assert snapshot["schema_version"] == "1.0.0"
     assert snapshot["epistemic_nodes"] == [
         {"node_id": "bad", "content": {"safe": "value", "nested": {"visible": 1}}}
     ]

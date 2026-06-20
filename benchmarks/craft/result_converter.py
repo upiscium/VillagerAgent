@@ -2,6 +2,8 @@ import csv
 import json
 from pathlib import Path
 
+from benchmarks.craft.dual_dag.schema import DUAL_DAG_SCHEMA_VERSION, dual_dag_schema_registry
+
 
 def normalize_results(*, config: dict, condition: str, raw_result: dict, output_dir: Path) -> None:
     normalized_dir = output_dir / "normalized"
@@ -482,9 +484,11 @@ _COORDINATION_ACTION_TYPES = ["clarify", "wait_for_evidence"]
 
 def _write_dual_dag_artifacts(*, normalized_dir: Path, games: list[dict]) -> None:
     summary = {
+        "schema_version": DUAL_DAG_SCHEMA_VERSION,
         "game_count": len(games),
         "node_count": 0,
         "edge_count": 0,
+        "schema": dual_dag_schema_registry(),
         "games": [],
     }
     nodes_path = normalized_dir / "dual_dag_nodes.jsonl"

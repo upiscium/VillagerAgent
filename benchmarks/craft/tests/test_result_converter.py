@@ -326,6 +326,9 @@ def test_result_converter_writes_dual_dag_artifacts(tmp_path):
     assert summary["runtime"]["coordination_action_count"] == 2
     assert summary["runtime"]["clarify_coordination_action_count"] == 1
     assert summary["runtime"]["wait_for_evidence_coordination_action_count"] == 1
+    assert dag_summary["schema_version"] == "1.0.0"
+    assert "resolved_fact" in dag_summary["schema"]["node_types"]
+    assert "executes_action" in dag_summary["schema"]["edge_types"]
     assert dag_summary["node_count"] == 6
     assert "claim:D1:1" in nodes_text
     assert "coordination:clarify:1:0" in nodes_text
