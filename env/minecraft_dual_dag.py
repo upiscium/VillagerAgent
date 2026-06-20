@@ -2,6 +2,8 @@ from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 
+from benchmarks.craft.dual_dag.schema import DUAL_DAG_SCHEMA_VERSION, dual_dag_schema_registry
+
 
 SENSITIVE_KEYS = {
     "api_key",
@@ -104,6 +106,7 @@ def build_minecraft_dual_dag_artifact(
                 ).to_dict())
 
     return {
+        "schema_version": DUAL_DAG_SCHEMA_VERSION,
         "runtime": "minecraft_dual_dag_artifact",
         "summary": {
             "node_count": len(nodes),
@@ -116,6 +119,7 @@ def build_minecraft_dual_dag_artifact(
         "nodes": nodes,
         "edges": edges,
         "mapping": minecraft_dual_dag_mapping(),
+        "schema": dual_dag_schema_registry(),
     }
 
 

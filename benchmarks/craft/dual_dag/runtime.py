@@ -11,6 +11,7 @@ from benchmarks.craft.dual_dag.epistemic_extractor import (
     suggested_constraints_from_message,
 )
 from benchmarks.craft.dual_dag.serialization import snapshot_to_dict
+from benchmarks.craft.dual_dag.schema import DUAL_DAG_SCHEMA_VERSION
 
 
 RESOLVED_FACT_PRIVATE_KEYS = {
@@ -535,6 +536,7 @@ class DualDAGRuntime:
 
     def snapshot(self) -> dict:
         return {
+            "schema_version": DUAL_DAG_SCHEMA_VERSION,
             "director_ids": self.director_ids,
             "summary": self.snapshot_summary(),
             "epistemic_nodes": list(self.epistemic_nodes.values()),

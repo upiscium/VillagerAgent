@@ -27,6 +27,9 @@ def test_minecraft_dual_dag_maps_tasks_actions_and_observations():
 
     artifact = build_minecraft_dual_dag_artifact(action_log=action_log, tasks=[task])
 
+    assert artifact["schema_version"] == "1.0.0"
+    assert "minecraft_task" in artifact["schema"]["node_types"]
+    assert "task_invokes_action" in artifact["schema"]["edge_types"]
     assert artifact["summary"] == {
         "node_count": 3,
         "edge_count": 2,
