@@ -70,6 +70,21 @@ def analyze_run(run_name: str, *, result_root: Path) -> dict:
     action_support_counts: Counter[str] = Counter()
     action_conflict_counts: Counter[str] = Counter()
     action_required_evidence_counts: Counter[str] = Counter()
+    hypothesis_status_counts: Counter[str] = Counter()
+    action_state_counts: Counter[str] = Counter()
+    coordination_action_counts: Counter[str] = Counter()
+    resolved_fact_count = 0
+    for node in nodes:
+        node_type = node.get("node_type", "")
+        if node_type == "resolved_fact":
+            resolved_fact_count += 1
+        if node_type == "hypothesis":
+            hypothesis_status_counts[(node.get("content") or {}).get("status", "open")] += 1
+        if _is_action_node(node):
+            action_state_counts[node.get("state", "candidate")] += 1
+            action_type = node.get("action_type")
+            if action_type in {"clarify", "wait_for_evidence"}:
+                coordination_action_counts[action_type] += 1
     for edge in edges:
         if _edge_graph_type(edge, nodes_by_id) != "action":
             continue
@@ -115,6 +130,10 @@ def analyze_run(run_name: str, *, result_root: Path) -> dict:
         "director_support_counts": dict(director_support_counts),
         "director_conflict_counts": dict(director_conflict_counts),
         "director_required_evidence_counts": dict(director_required_evidence_counts),
+        "resolved_fact_count": resolved_fact_count,
+        "hypothesis_status_counts": dict(hypothesis_status_counts),
+        "action_state_counts": dict(action_state_counts),
+        "coordination_action_counts": dict(coordination_action_counts),
         "supported_action_count": sum(1 for count in action_support_counts.values() if count > 0),
         "conflicted_action_count": sum(1 for count in action_conflict_counts.values() if count > 0),
         "required_evidence_action_count": sum(1 for count in action_required_evidence_counts.values() if count > 0),
@@ -317,6 +336,14 @@ def _hidden_key_hits(normalized_dir: Path, artifact_files: list[str]) -> list[di
 
 def _node_kind(node: dict) -> str:
     return node.get("node_type") or node.get("action_type") or "unknown"
+
+
+def _is_action_node(node: dict) -> bool:
+    if not isinstance(node, dict):
+        return False
+    if node.get("action_type"):
+        return True
+    return node.get("node_type") in {"place_block", "remove_block", "clarify", "wait_for_evidence"}
 
 
 def _edge_graph_type(edge: dict, nodes_by_id: dict[str, dict]) -> str:

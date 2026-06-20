@@ -287,12 +287,20 @@ def test_result_converter_writes_dual_dag_artifacts(tmp_path):
             "turns": [],
             "dual_dag": {
                 "summary": {"epistemic_node_count": 1},
-                "epistemic_nodes": [{"node_id": "claim:D1:1", "node_type": "reported_claim"}],
+                "epistemic_nodes": [
+                    {"node_id": "claim:D1:1", "node_type": "reported_claim"},
+                    {"node_id": "resolved_fact:1", "node_type": "resolved_fact"},
+                    {"node_id": "hypothesis:1", "node_type": "hypothesis", "content": {"status": "resolved"}},
+                ],
                 "epistemic_edges": [{"source_id": "claim:D1:1", "target_id": "hypothesis:1"}],
                 "action_nodes": [
-                    {"node_id": "action:1:0"},
-                    {"node_id": "coordination:clarify:1:0", "action_type": "clarify"},
-                    {"node_id": "coordination:wait_for_evidence:1:0", "action_type": "wait_for_evidence"},
+                    {"node_id": "action:1:0", "state": "executed"},
+                    {"node_id": "coordination:clarify:1:0", "action_type": "clarify", "state": "candidate"},
+                    {
+                        "node_id": "coordination:wait_for_evidence:1:0",
+                        "action_type": "wait_for_evidence",
+                        "state": "waiting_for_evidence",
+                    },
                 ],
                 "action_edges": [
                     {"source_id": "claim:D1:1", "target_id": "action:1:0"},
@@ -309,9 +317,16 @@ def test_result_converter_writes_dual_dag_artifacts(tmp_path):
     dag_summary = json.loads((tmp_path / "normalized" / "dual_dag_summary.json").read_text())
     nodes_text = (tmp_path / "normalized" / "dual_dag_nodes.jsonl").read_text()
     edges_text = (tmp_path / "normalized" / "dual_dag_edges.jsonl").read_text()
-    assert summary["runtime"]["dual_dag_node_count"] == 4
+    assert summary["runtime"]["dual_dag_node_count"] == 6
     assert summary["runtime"]["dual_dag_edge_count"] == 3
-    assert dag_summary["node_count"] == 4
+    assert summary["runtime"]["resolved_fact_count"] == 1
+    assert summary["runtime"]["hypothesis_resolved_count"] == 1
+    assert summary["runtime"]["action_candidate_executed_count"] == 1
+    assert summary["runtime"]["action_candidate_waiting_for_evidence_count"] == 1
+    assert summary["runtime"]["coordination_action_count"] == 2
+    assert summary["runtime"]["clarify_coordination_action_count"] == 1
+    assert summary["runtime"]["wait_for_evidence_coordination_action_count"] == 1
+    assert dag_summary["node_count"] == 6
     assert "claim:D1:1" in nodes_text
     assert "coordination:clarify:1:0" in nodes_text
     assert "coordination:wait_for_evidence:1:0" in nodes_text

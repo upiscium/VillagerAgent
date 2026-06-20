@@ -17,9 +17,15 @@ def test_dual_dag_analysis_summarizes_claim_edges_and_turns(tmp_path):
 
     analysis = analyze_run("craft_dual_dag", result_root=tmp_path)
 
-    assert analysis["node_count"] == 4
+    assert analysis["node_count"] == 6
     assert analysis["edge_count"] == 4
-    assert analysis["node_type_counts"] == {"reported_claim": 2, "hypothesis": 1, "place_block": 1}
+    assert analysis["node_type_counts"] == {
+        "reported_claim": 2,
+        "hypothesis": 1,
+        "resolved_fact": 1,
+        "place_block": 1,
+        "wait_for_evidence": 1,
+    }
     assert analysis["edge_type_counts"] == {"supports": 1, "conflicts_with": 2, "derived_from": 1}
     assert analysis["epistemic_edge_type_counts"] == {"derived_from": 1, "conflicts_with": 1}
     assert analysis["action_edge_type_counts"] == {"supports": 1, "conflicts_with": 1}
@@ -30,6 +36,10 @@ def test_dual_dag_analysis_summarizes_claim_edges_and_turns(tmp_path):
     assert analysis["supported_action_count"] == 1
     assert analysis["conflicted_action_count"] == 1
     assert analysis["required_evidence_action_count"] == 1
+    assert analysis["resolved_fact_count"] == 1
+    assert analysis["hypothesis_status_counts"] == {"conflicted": 1}
+    assert analysis["action_state_counts"] == {"invalidated": 1, "waiting_for_evidence": 1}
+    assert analysis["coordination_action_counts"] == {"wait_for_evidence": 1}
     assert analysis["gated_clarification_count"] == 1
     assert analysis["builder_fallback_count"] == 1
     assert analysis["artifact_health"]["passed"] is True
@@ -110,7 +120,7 @@ def _write_normalized_run(tmp_path, run_name):
         encoding="utf-8",
     )
     (normalized / "dual_dag_summary.json").write_text(
-        json.dumps({"node_count": 4, "edge_count": 4}),
+        json.dumps({"node_count": 6, "edge_count": 4}),
         encoding="utf-8",
     )
     _write_jsonl(
@@ -129,9 +139,20 @@ def _write_normalized_run(tmp_path, run_name):
             {
                 "node_id": "hypothesis:conflicting_evidence:claim:D2:1:action:1:0",
                 "node_type": "hypothesis",
-                "content": {"source_claim_ids": ["claim:D2:1"]},
+                "content": {"source_claim_ids": ["claim:D2:1"], "status": "conflicted"},
             },
-            {"node_id": "action:1:0", "node_type": "place_block", "required_evidence": ["claim:D2:1"]},
+            {"node_id": "resolved_fact:1", "node_type": "resolved_fact"},
+            {
+                "node_id": "action:1:0",
+                "node_type": "place_block",
+                "state": "invalidated",
+                "required_evidence": ["claim:D2:1"],
+            },
+            {
+                "node_id": "coordination:wait_for_evidence:1:0",
+                "action_type": "wait_for_evidence",
+                "state": "waiting_for_evidence",
+            },
         ],
     )
     _write_jsonl(
