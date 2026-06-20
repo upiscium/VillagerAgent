@@ -47,6 +47,10 @@ def test_report_aggregates_multiple_runs(tmp_path):
     assert rows[1]["mean_action_confidence"] == 0.6
     assert rows[1]["claim_support_count"] == 2
     assert rows[1]["claim_required_evidence_count"] == 3
+    assert rows[1]["resolved_fact_count"] == 2
+    assert rows[1]["hypothesis_resolved_count"] == 1
+    assert rows[1]["action_candidate_executed_count"] == 1
+    assert rows[1]["coordination_action_count"] == 2
     assert rows[1]["gated_clarification_count"] == 1
     assert rows[1]["clarification_resolution_rate"] == 0.5
     assert rows[1]["mean_clarification_quality_score"] == 0.75
@@ -61,6 +65,7 @@ def test_report_aggregates_multiple_runs(tmp_path):
         csv_rows = list(csv.DictReader(f))
     assert len(csv_rows) == 2
     assert csv_rows[1]["run_name"] == "craft_villageragent_qwen"
+    assert csv_rows[1]["action_candidate_executed_count"] == "1"
     assert json.loads(json_path.read_text(encoding="utf-8"))["runs"][0]["condition"] == "official_baseline"
 
 
@@ -115,6 +120,10 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "mean_action_confidence",
                 "claim_support_count",
                 "claim_required_evidence_count",
+                "resolved_fact_count",
+                "hypothesis_resolved_count",
+                "action_candidate_executed_count",
+                "coordination_action_count",
                 "gated_clarification_count",
                 "clarification_resolution_count",
                 "clarification_resolution_rate",
@@ -130,6 +139,10 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "mean_action_confidence": "0.6",
                 "claim_support_count": "2",
                 "claim_required_evidence_count": "3",
+                "resolved_fact_count": "2",
+                "hypothesis_resolved_count": "1",
+                "action_candidate_executed_count": "1",
+                "coordination_action_count": "2",
                 "gated_clarification_count": "1",
                 "clarification_resolution_count": "1",
                 "clarification_resolution_rate": "0.5",

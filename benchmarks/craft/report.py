@@ -31,6 +31,21 @@ REPORT_FIELDS = [
     "observed_fact_count",
     "reported_claim_count",
     "hypothesis_count",
+    "resolved_fact_count",
+    "hypothesis_open_count",
+    "hypothesis_supported_count",
+    "hypothesis_conflicted_count",
+    "hypothesis_resolved_count",
+    "hypothesis_invalidated_count",
+    "action_candidate_candidate_count",
+    "action_candidate_executable_count",
+    "action_candidate_waiting_for_evidence_count",
+    "action_candidate_blocked_count",
+    "action_candidate_invalidated_count",
+    "action_candidate_executed_count",
+    "coordination_action_count",
+    "clarify_coordination_action_count",
+    "wait_for_evidence_coordination_action_count",
     "mean_action_confidence",
     "claim_support_count",
     "claim_conflict_count",
@@ -123,6 +138,66 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
         "hypothesis_count": runtime.get(
             "hypothesis_count",
             _sum_metric_rows(metrics_rows, "hypothesis_count"),
+        ),
+        "resolved_fact_count": runtime.get(
+            "resolved_fact_count",
+            _sum_metric_rows(metrics_rows, "resolved_fact_count"),
+        ),
+        "hypothesis_open_count": runtime.get(
+            "hypothesis_open_count",
+            _sum_metric_rows(metrics_rows, "hypothesis_open_count"),
+        ),
+        "hypothesis_supported_count": runtime.get(
+            "hypothesis_supported_count",
+            _sum_metric_rows(metrics_rows, "hypothesis_supported_count"),
+        ),
+        "hypothesis_conflicted_count": runtime.get(
+            "hypothesis_conflicted_count",
+            _sum_metric_rows(metrics_rows, "hypothesis_conflicted_count"),
+        ),
+        "hypothesis_resolved_count": runtime.get(
+            "hypothesis_resolved_count",
+            _sum_metric_rows(metrics_rows, "hypothesis_resolved_count"),
+        ),
+        "hypothesis_invalidated_count": runtime.get(
+            "hypothesis_invalidated_count",
+            _sum_metric_rows(metrics_rows, "hypothesis_invalidated_count"),
+        ),
+        "action_candidate_candidate_count": runtime.get(
+            "action_candidate_candidate_count",
+            _sum_metric_rows(metrics_rows, "action_candidate_candidate_count"),
+        ),
+        "action_candidate_executable_count": runtime.get(
+            "action_candidate_executable_count",
+            _sum_metric_rows(metrics_rows, "action_candidate_executable_count"),
+        ),
+        "action_candidate_waiting_for_evidence_count": runtime.get(
+            "action_candidate_waiting_for_evidence_count",
+            _sum_metric_rows(metrics_rows, "action_candidate_waiting_for_evidence_count"),
+        ),
+        "action_candidate_blocked_count": runtime.get(
+            "action_candidate_blocked_count",
+            _sum_metric_rows(metrics_rows, "action_candidate_blocked_count"),
+        ),
+        "action_candidate_invalidated_count": runtime.get(
+            "action_candidate_invalidated_count",
+            _sum_metric_rows(metrics_rows, "action_candidate_invalidated_count"),
+        ),
+        "action_candidate_executed_count": runtime.get(
+            "action_candidate_executed_count",
+            _sum_metric_rows(metrics_rows, "action_candidate_executed_count"),
+        ),
+        "coordination_action_count": runtime.get(
+            "coordination_action_count",
+            _sum_metric_rows(metrics_rows, "coordination_action_count"),
+        ),
+        "clarify_coordination_action_count": runtime.get(
+            "clarify_coordination_action_count",
+            _sum_metric_rows(metrics_rows, "clarify_coordination_action_count"),
+        ),
+        "wait_for_evidence_coordination_action_count": runtime.get(
+            "wait_for_evidence_coordination_action_count",
+            _sum_metric_rows(metrics_rows, "wait_for_evidence_coordination_action_count"),
         ),
         "mean_action_confidence": runtime.get(
             "mean_action_confidence",

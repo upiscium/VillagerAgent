@@ -27,6 +27,10 @@ def test_experiment_summary_combines_runtime_and_analysis_metrics(tmp_path):
     assert rows[0]["clarification_resolution_rate"] == 0.5
     assert rows[0]["mean_clarification_quality_score"] == 0.75
     assert rows[0]["claim_required_evidence_count"] == 3
+    assert rows[0]["resolved_fact_count"] == 2
+    assert rows[0]["hypothesis_resolved_count"] == 1
+    assert rows[0]["action_candidate_executed_count"] == 1
+    assert rows[0]["coordination_action_count"] == 2
     assert rows[0]["supported_action_count"] == 2
     assert rows[0]["required_evidence_action_count"] == 1
     assert rows[0]["leakage_passed"] is True
@@ -69,6 +73,7 @@ def test_experiment_summary_writes_csv_and_json(tmp_path):
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         csv_rows = list(csv.DictReader(f))
     assert csv_rows[0]["claim_required_evidence_count"] == "3"
+    assert csv_rows[0]["action_candidate_executed_count"] == "1"
     assert json.loads(json_path.read_text(encoding="utf-8"))["runs"][0]["run_name"] == "craft_dual_dag"
 
 
@@ -171,6 +176,21 @@ def _write_run(
             "claim_required_evidence_count": 3,
             "dual_dag_node_count": 42,
             "dual_dag_edge_count": 6,
+            "resolved_fact_count": 2,
+            "hypothesis_open_count": 0,
+            "hypothesis_supported_count": 1,
+            "hypothesis_conflicted_count": 0,
+            "hypothesis_resolved_count": 1,
+            "hypothesis_invalidated_count": 0,
+            "action_candidate_candidate_count": 0,
+            "action_candidate_executable_count": 2,
+            "action_candidate_waiting_for_evidence_count": 1,
+            "action_candidate_blocked_count": 0,
+            "action_candidate_invalidated_count": 0,
+            "action_candidate_executed_count": 1,
+            "coordination_action_count": 2,
+            "clarify_coordination_action_count": 1,
+            "wait_for_evidence_coordination_action_count": 1,
         },
     }
     analysis = {

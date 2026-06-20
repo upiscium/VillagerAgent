@@ -100,6 +100,21 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
         "observed_fact_count",
         "reported_claim_count",
         "hypothesis_count",
+        "resolved_fact_count",
+        "hypothesis_open_count",
+        "hypothesis_supported_count",
+        "hypothesis_conflicted_count",
+        "hypothesis_resolved_count",
+        "hypothesis_invalidated_count",
+        "action_candidate_candidate_count",
+        "action_candidate_executable_count",
+        "action_candidate_waiting_for_evidence_count",
+        "action_candidate_blocked_count",
+        "action_candidate_invalidated_count",
+        "action_candidate_executed_count",
+        "coordination_action_count",
+        "clarify_coordination_action_count",
+        "wait_for_evidence_coordination_action_count",
         "mean_action_confidence",
         "claim_support_count",
         "claim_conflict_count",
@@ -158,6 +173,21 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
                 "observed_fact_count": game_epistemic_counts["observed_fact_count"],
                 "reported_claim_count": game_epistemic_counts["reported_claim_count"],
                 "hypothesis_count": game_hypothesis_count,
+                "resolved_fact_count": game_dual_dag_metrics["resolved_fact_count"],
+                "hypothesis_open_count": game_dual_dag_metrics["hypothesis_open_count"],
+                "hypothesis_supported_count": game_dual_dag_metrics["hypothesis_supported_count"],
+                "hypothesis_conflicted_count": game_dual_dag_metrics["hypothesis_conflicted_count"],
+                "hypothesis_resolved_count": game_dual_dag_metrics["hypothesis_resolved_count"],
+                "hypothesis_invalidated_count": game_dual_dag_metrics["hypothesis_invalidated_count"],
+                "action_candidate_candidate_count": game_dual_dag_metrics["action_candidate_candidate_count"],
+                "action_candidate_executable_count": game_dual_dag_metrics["action_candidate_executable_count"],
+                "action_candidate_waiting_for_evidence_count": game_dual_dag_metrics["action_candidate_waiting_for_evidence_count"],
+                "action_candidate_blocked_count": game_dual_dag_metrics["action_candidate_blocked_count"],
+                "action_candidate_invalidated_count": game_dual_dag_metrics["action_candidate_invalidated_count"],
+                "action_candidate_executed_count": game_dual_dag_metrics["action_candidate_executed_count"],
+                "coordination_action_count": game_dual_dag_metrics["coordination_action_count"],
+                "clarify_coordination_action_count": game_dual_dag_metrics["clarify_coordination_action_count"],
+                "wait_for_evidence_coordination_action_count": game_dual_dag_metrics["wait_for_evidence_coordination_action_count"],
                 "mean_action_confidence": game_action_candidate_metrics["mean_action_confidence"],
                 "claim_support_count": game_action_candidate_metrics["claim_support_count"],
                 "claim_conflict_count": game_action_candidate_metrics["claim_conflict_count"],
@@ -404,19 +434,50 @@ def _dual_dag_metrics(games: list[dict]) -> dict:
     node_count = 0
     edge_count = 0
     hypothesis_count = 0
+    resolved_fact_count = 0
+    hypothesis_status_counts = {status: 0 for status in _HYPOTHESIS_STATUSES}
+    action_state_counts = {state: 0 for state in _ACTION_CANDIDATE_STATES}
+    coordination_counts = {action_type: 0 for action_type in _COORDINATION_ACTION_TYPES}
     for game in games:
         dual_dag = game.get("dual_dag", {})
         epistemic_nodes = list(dual_dag.get("epistemic_nodes", []))
+        action_nodes = list(dual_dag.get("action_nodes", []))
         node_count += len(epistemic_nodes)
-        node_count += len(dual_dag.get("action_nodes", []))
+        node_count += len(action_nodes)
         edge_count += len(dual_dag.get("epistemic_edges", []))
         edge_count += len(dual_dag.get("action_edges", []))
-        hypothesis_count += sum(1 for node in epistemic_nodes if node.get("node_type") == "hypothesis")
+        for node in epistemic_nodes:
+            node_type = node.get("node_type")
+            if node_type == "hypothesis":
+                hypothesis_count += 1
+                status = (node.get("content") or {}).get("status", "open")
+                if status in hypothesis_status_counts:
+                    hypothesis_status_counts[status] += 1
+            if node_type == "resolved_fact":
+                resolved_fact_count += 1
+        for node in action_nodes:
+            state = node.get("state", "candidate")
+            if state in action_state_counts:
+                action_state_counts[state] += 1
+            action_type = node.get("action_type")
+            if action_type in coordination_counts:
+                coordination_counts[action_type] += 1
     return {
         "dual_dag_node_count": node_count,
         "dual_dag_edge_count": edge_count,
         "hypothesis_count": hypothesis_count,
+        "resolved_fact_count": resolved_fact_count,
+        **{f"hypothesis_{status}_count": count for status, count in hypothesis_status_counts.items()},
+        **{f"action_candidate_{state}_count": count for state, count in action_state_counts.items()},
+        "coordination_action_count": sum(coordination_counts.values()),
+        "clarify_coordination_action_count": coordination_counts["clarify"],
+        "wait_for_evidence_coordination_action_count": coordination_counts["wait_for_evidence"],
     }
+
+
+_HYPOTHESIS_STATUSES = ["open", "supported", "conflicted", "resolved", "invalidated"]
+_ACTION_CANDIDATE_STATES = ["candidate", "executable", "waiting_for_evidence", "blocked", "invalidated", "executed"]
+_COORDINATION_ACTION_TYPES = ["clarify", "wait_for_evidence"]
 
 
 def _write_dual_dag_artifacts(*, normalized_dir: Path, games: list[dict]) -> None:
