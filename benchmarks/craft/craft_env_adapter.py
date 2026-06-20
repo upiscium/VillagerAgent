@@ -417,9 +417,9 @@ class CraftEnvAdapter:
             reported_claims=epistemic_claims,
             turn_index=turn_index,
         )
-        decision_support = _runtime_decision_support(
+        decision_support = _prepare_runtime_action_candidates(
             runtime=dual_dag_runtime,
-            candidates=[candidate.to_dict() for candidate in action_candidates],
+            action_candidates=action_candidates,
             config=self.config,
             turn_index=turn_index,
         )
@@ -496,9 +496,9 @@ class CraftEnvAdapter:
                 reported_claims=epistemic_claims,
                 turn_index=turn_index,
             )]
-            decision_support = _runtime_decision_support(
+            decision_support = _prepare_runtime_action_candidates(
                 runtime=dual_dag_runtime,
-                candidates=[candidate.to_dict() for candidate in action_candidates],
+                action_candidates=action_candidates,
                 config=self.config,
                 turn_index=turn_index,
             )
@@ -623,6 +623,13 @@ def _runtime_decision_support(
     enabled = bool(dual_dag.get("enabled", False) and query_config.get("enabled", False))
     if not enabled or runtime is None or not candidates:
         return {}
+    runtime.add_action_candidates(turn_index=turn_index, candidates=candidates)
+    runtime.update_action_candidate_states(turn_index=turn_index)
+    runtime.update_hypothesis_lifecycle(turn_index=turn_index)
+    candidates = [
+        runtime.action_nodes.get(candidate.get("node_id", ""), candidate)
+        for candidate in candidates
+    ]
     return runtime.current_turn_decision_support(
         turn_index=turn_index,
         candidates=candidates,
@@ -630,6 +637,34 @@ def _runtime_decision_support(
             query_config.get("historical_retrieval", {}).get("enabled", False)
         ),
     )
+
+
+def _prepare_runtime_action_candidates(
+    *,
+    runtime: DualDAGRuntime | None,
+    action_candidates: list,
+    config: dict,
+    turn_index: int,
+) -> dict:
+    decision_support = _runtime_decision_support(
+        runtime=runtime,
+        candidates=[candidate.to_dict() for candidate in action_candidates],
+        config=config,
+        turn_index=turn_index,
+    )
+    if runtime is None:
+        return decision_support
+    for candidate in action_candidates:
+        updated = runtime.action_nodes.get(candidate.node_id)
+        if not isinstance(updated, dict):
+            continue
+        candidate.state = updated.get("state", candidate.state)
+        candidate.confidence = updated.get("confidence", candidate.confidence)
+        candidate.supported_by = list(updated.get("supported_by", candidate.supported_by) or [])
+        candidate.conflicts_with = list(updated.get("conflicts_with", candidate.conflicts_with) or [])
+        candidate.required_evidence = list(updated.get("required_evidence", candidate.required_evidence) or [])
+        candidate.metadata = dict(updated.get("metadata", candidate.metadata) or {})
+    return decision_support
 
 
 def _prioritize_supported_candidates(

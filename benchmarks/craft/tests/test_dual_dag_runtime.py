@@ -265,6 +265,7 @@ def test_runtime_current_turn_decision_support_recommends_public_candidate():
     assert support["candidates"][0] == {
         "node_id": "action:1:0",
         "action": {"action": "place", "block": "bs", "position": "(0,0)", "layer": 0, "span_to": None},
+        "state": "candidate",
         "confidence": 0.4,
         "claim_support_count": 0,
         "claim_conflict_count": 1,
