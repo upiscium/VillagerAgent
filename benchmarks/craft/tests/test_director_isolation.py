@@ -56,8 +56,8 @@ def test_controller_returns_three_director_messages():
     assert set(messages) == {"D1", "D2", "D3"}
     assert all(messages.values())
     snapshot = group.controller.state_manager.snapshot_for_metadata()
-    assert snapshot["stores_target_structure"] is False
-    assert snapshot["stores_oracle_moves"] is False
+    assert snapshot["stores_target_blueprint"] is False
+    assert snapshot["stores_oracle_plan"] is False
     assert snapshot["private_state_agents"] == ["D1", "D2", "D3"]
 
 

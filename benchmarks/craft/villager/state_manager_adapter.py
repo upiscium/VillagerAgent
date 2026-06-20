@@ -44,9 +44,9 @@ class CraftStateManagerAdapter:
             "director_ids": list(self.director_ids),
             "private_state_agents": sorted(self._private_states.keys()),
             "public_turn_index": self._public_state.turn_index if self._public_state else None,
-            "stores_target_structure": False,
-            "stores_oracle_moves": False,
-            "stores_all_private_views": False,
+            "stores_target_blueprint": False,
+            "stores_oracle_plan": False,
+            "stores_cross_director_views": False,
         }
 
 
