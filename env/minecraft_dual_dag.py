@@ -170,6 +170,51 @@ def build_minecraft_runtime_decision_support(
     }
 
 
+def rank_minecraft_runtime_tasks(
+    tasks: list,
+    *,
+    graph=None,
+    action_log: dict | None = None,
+    config: dict | None = None,
+) -> dict:
+    """Return a config-gated task ordering influenced by Dual-DAG decision support."""
+    selection_config = _runtime_task_selection_config(config or {})
+    enabled = bool(selection_config.get("enabled", False))
+    original_tasks = list(tasks or [])
+    if not enabled or not original_tasks:
+        return {
+            "enabled": False,
+            "tasks": original_tasks,
+            "decision_support": {},
+            "mutates_runtime": False,
+        }
+
+    artifact = build_minecraft_dual_dag_artifact(
+        action_log=action_log,
+        tasks=original_tasks,
+        graph=graph,
+    )
+    support = build_minecraft_runtime_decision_support(
+        artifact,
+        candidate_tasks=original_tasks,
+    )
+    score_by_id = {
+        row.get("task_id", ""): row.get("score", 0.0)
+        for row in support.get("candidates", [])
+    }
+    ranked_tasks = sorted(
+        original_tasks,
+        key=lambda task: score_by_id.get(_task_node_id(task), 0.0),
+        reverse=True,
+    )
+    return {
+        "enabled": True,
+        "tasks": ranked_tasks,
+        "decision_support": support,
+        "mutates_runtime": False,
+    }
+
+
 def minecraft_dual_dag_mapping() -> dict:
     return {
         "observations": [
@@ -192,8 +237,19 @@ def minecraft_dual_dag_mapping() -> dict:
         "decision_support": [
             "Runtime decision support is a dry-run read of Minecraft Dual-DAG artifacts.",
             "Recommendations do not mutate Task, Graph, action logs, or environment state.",
+            "Config-gated task selection may reorder candidate task lists using read-only recommendations.",
         ],
     }
+
+
+def _runtime_task_selection_config(config: dict) -> dict:
+    if not isinstance(config, dict):
+        return {}
+    if "runtime_task_selection" in config:
+        return config.get("runtime_task_selection", {}) or {}
+    dual_dag = config.get("dual_dag", {}) if isinstance(config.get("dual_dag", {}), dict) else {}
+    minecraft = dual_dag.get("minecraft", {}) if isinstance(dual_dag.get("minecraft", {}), dict) else {}
+    return minecraft.get("runtime_task_selection", {}) or {}
 
 
 def _task_node(task) -> MinecraftDAGNode:
@@ -288,6 +344,11 @@ def _decision_candidate_tasks(candidate_tasks: list | None, nodes: list[dict]) -
                 rows.append({
                     "task_id": str(task.get("task_id") or task.get("node_id") or f"candidate:{index}"),
                     "description": str(task.get("description", "")),
+                })
+            else:
+                rows.append({
+                    "task_id": _task_node_id(task),
+                    "description": str(getattr(task, "description", "")),
                 })
         return rows
     return [

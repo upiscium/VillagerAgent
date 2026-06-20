@@ -5,6 +5,7 @@ from env.minecraft_dual_dag import (
     build_minecraft_dual_dag_artifact_from_action_log,
     build_minecraft_runtime_decision_support,
     minecraft_dual_dag_mapping,
+    rank_minecraft_runtime_tasks,
     sanitize_public_value,
 )
 from type_define.graph import Graph, Task
@@ -182,3 +183,52 @@ def test_minecraft_runtime_decision_support_uses_artifact_context_without_mutati
     assert support["candidates"][1]["supporting_claim_ids"] == ["minecraft:claim:Bob:0"]
     assert json.dumps(artifact, sort_keys=True) == before_artifact
     assert [failed_task.status, claim_supported_task.status] == before_statuses
+
+
+def test_minecraft_runtime_task_ranking_is_config_gated_and_read_only():
+    failed_task = Task("Open locked door", {})
+    failed_task._agent = ["Alice"]
+    claim_supported_task = Task("Find chest", {})
+    original_tasks = [failed_task, claim_supported_task]
+    graph = Graph()
+    graph.add_node(failed_task)
+    graph.add_node(claim_supported_task)
+    action_log = {
+        "Alice": [{
+            "action": "openContainer",
+            "kwargs": {"player_name": "Alice", "item_name": "door"},
+            "result": {"status": False, "message": "door is locked"},
+        }],
+        "Bob": [{
+            "action": "talkTo",
+            "kwargs": {
+                "player_name": "Bob",
+                "entity_name": "Alice",
+                "message": "The chest is north of the door.",
+            },
+            "result": {"status": True},
+        }],
+    }
+    before_edges = list(graph.edge)
+    before_statuses = [task.status for task in original_tasks]
+
+    disabled = rank_minecraft_runtime_tasks(
+        original_tasks,
+        graph=graph,
+        action_log=action_log,
+        config={"runtime_task_selection": {"enabled": False}},
+    )
+    enabled = rank_minecraft_runtime_tasks(
+        original_tasks,
+        graph=graph,
+        action_log=action_log,
+        config={"runtime_task_selection": {"enabled": True}},
+    )
+
+    assert disabled["enabled"] is False
+    assert disabled["tasks"] == original_tasks
+    assert enabled["enabled"] is True
+    assert enabled["tasks"][0] is claim_supported_task
+    assert enabled["decision_support"]["recommended_task_id"] == f"minecraft:task:{claim_supported_task.id}"
+    assert graph.edge == before_edges
+    assert [task.status for task in original_tasks] == before_statuses
