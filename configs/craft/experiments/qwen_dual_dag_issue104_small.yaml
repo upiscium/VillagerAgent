@@ -1,0 +1,22 @@
+experiment:
+  name: "craft_qwen_dual_dag_issue104_small"
+  result_root: "result/craft"
+  overrides:
+    turns: 2
+    run_name_suffix: "_issue104_small"
+  runs:
+    - config: "configs/craft/eval_qwen_ollama.yaml"
+      suffix: "_baseline"
+      seeds: [3]
+      structures: [0, 1]
+    - config: "configs/craft/eval_qwen_ollama_dual_dag.yaml"
+      suffix: "_dual_dag"
+      seeds: [3]
+      structures: [0, 1]
+  report:
+    output: "result/craft/comparison_qwen_dual_dag_issue104_small.csv"
+    json_output: "result/craft/comparison_qwen_dual_dag_issue104_small.json"
+    compact_summary_output: "result/craft/summary_qwen_dual_dag_issue104_small.csv"
+    compact_summary_json_output: "result/craft/summary_qwen_dual_dag_issue104_small.json"
+    variance_summary_output: "result/craft/variance_qwen_dual_dag_issue104_small.csv"
+    variance_summary_json_output: "result/craft/variance_qwen_dual_dag_issue104_small.json"
