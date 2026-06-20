@@ -33,9 +33,9 @@ def test_state_manager_keeps_private_states_isolated():
     snapshot = manager.snapshot_for_metadata()
     assert d1_state.private_view_text == "D1_PRIVATE_ONLY"
     assert "D2_PRIVATE_ONLY" not in str(d1_state)
-    assert snapshot["stores_target_structure"] is False
-    assert snapshot["stores_oracle_moves"] is False
-    assert snapshot["stores_all_private_views"] is False
+    assert snapshot["stores_target_blueprint"] is False
+    assert snapshot["stores_oracle_plan"] is False
+    assert snapshot["stores_cross_director_views"] is False
 
 
 def test_state_manager_rejects_hidden_keys():
