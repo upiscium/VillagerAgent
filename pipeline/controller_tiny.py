@@ -15,6 +15,7 @@ from pipeline.agent import BaseAgent
 from pipeline.utils import *
 from pipeline.controller_prompt import *
 from env.env import VillagerBench
+from env.minecraft_dual_dag import rank_minecraft_runtime_tasks
 import logging
 
 
@@ -33,7 +34,8 @@ class GlobalController:
     - max_workers (int): The maximum number of workers in the thread pool. Default is 4.
     '''
     def __init__(self, llm_config: dict, task_manager: TaskManager, data_manager: DataManager, env: VillagerBench,
-                 silent: bool = False, max_workers=4, tm_llm_config: dict = None, dm_llm_config: dict = None, base_agent_config: dict = None, all_tools=[]):
+                 silent: bool = False, max_workers=4, tm_llm_config: dict = None, dm_llm_config: dict = None,
+                 base_agent_config: dict = None, all_tools=[], minecraft_dual_dag_config: dict | None = None):
 
         self.task_manager = task_manager
         tm_llm_config = llm_config.copy() if tm_llm_config is None else tm_llm_config
@@ -76,6 +78,7 @@ class GlobalController:
         self.max_task_time = 60 * 30 # 3min
 
         self.shutdown = False
+        self.minecraft_dual_dag_config = minecraft_dual_dag_config or {}
 
     def validate_assignments(self, result: [dict]):
         validated_assignments = []
@@ -299,6 +302,7 @@ class GlobalController:
                     break
 
                 self.task_list = self.task_manager.query_subtask_list()
+                self.task_list = self._rank_task_list_with_minecraft_dual_dag(self.task_list)
                 if self.task_list == []:
                     self.logger.info("all assigned tasks are finished ...")
                     self.shutdown = True
@@ -346,6 +350,21 @@ class GlobalController:
             self.data_manager = None
             self.executor.shutdown(wait=False)
             raise Exception("Interrupted by user")
+
+    def _rank_task_list_with_minecraft_dual_dag(self, task_list):
+        ranked = rank_minecraft_runtime_tasks(
+            task_list,
+            graph=getattr(self.task_manager, "graph", None),
+            action_log=self.env.get_action_log() if hasattr(self.env, "get_action_log") else None,
+            config=self.minecraft_dual_dag_config,
+        )
+        support = ranked.get("decision_support", {})
+        if ranked.get("enabled") and support.get("recommended_task_id"):
+            self.logger.info(
+                "Dual-DAG recommended task %s for runtime selection",
+                support.get("recommended_task_id"),
+            )
+        return ranked.get("tasks", task_list)
 
     def run(self):
         try:
