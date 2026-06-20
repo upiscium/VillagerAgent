@@ -2,6 +2,7 @@ import pytest
 
 from benchmarks.craft.craft_env_adapter import (
     _apply_clarification_gate,
+    _prepare_runtime_action_candidates,
     _prioritize_supported_candidates,
     _runtime_decision_support,
 )
@@ -328,6 +329,72 @@ def test_runtime_decision_support_is_config_gated():
     )
 
     assert support["recommended_candidate_id"] == "action:1:0"
+
+
+def test_runtime_decision_support_updates_candidate_state_and_hypotheses():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    candidate = {
+        "node_id": "action:2:0",
+        "action_type": "place_block",
+        "action": {"action": "place", "block": "rs", "position": "(0,0)", "layer": 1},
+        "state": "candidate",
+        "confidence": 0.5,
+        "supported_by": [],
+        "conflicts_with": [],
+        "required_evidence": ["claim:D1:1"],
+        "metadata": {"physically_verified": False},
+    }
+
+    support = _runtime_decision_support(
+        runtime=runtime,
+        candidates=[candidate],
+        config={"dual_dag": {"enabled": True, "runtime_decision_support": {"enabled": True}}},
+        turn_index=2,
+    )
+
+    assert runtime.action_nodes["action:2:0"]["state"] == "waiting_for_evidence"
+    assert support["candidates"][0]["state"] == "waiting_for_evidence"
+    assert support["candidates"][0]["unlock"]["reason"] == "required_evidence_unresolved"
+    hypothesis = runtime.hypotheses()["hypothesis:required_evidence:claim:D1:1:action:2:0"]
+    assert hypothesis["content"]["last_updated_turn"] == 2
+
+    runtime.add_resolved_fact(
+        fact_id="claim_D1_1",
+        turn_index=3,
+        summary="D1 claim resolved publicly",
+        evidence_ids=["claim:D1:1"],
+        confidence=0.9,
+    )
+    support = _runtime_decision_support(
+        runtime=runtime,
+        candidates=[candidate],
+        config={"dual_dag": {"enabled": True, "runtime_decision_support": {"enabled": True}}},
+        turn_index=3,
+    )
+
+    assert runtime.action_nodes["action:2:0"]["state"] == "executable"
+    assert support["candidates"][0]["state"] == "executable"
+    assert runtime.hypotheses()["hypothesis:required_evidence:claim:D1:1:action:2:0"]["content"]["status"] == "resolved"
+
+
+def test_prepare_runtime_action_candidates_syncs_unlock_state_to_metadata_candidates():
+    runtime = DualDAGRuntime(director_ids=["D1"], config={})
+    action_candidates = action_candidates_from_moves(
+        moves=[{"action": "place", "block": "ys", "position": "(0,0)", "layer": 0}],
+        reported_claims={},
+        turn_index=1,
+    )
+
+    support = _prepare_runtime_action_candidates(
+        runtime=runtime,
+        action_candidates=action_candidates,
+        config={"dual_dag": {"enabled": True, "runtime_decision_support": {"enabled": True}}},
+        turn_index=1,
+    )
+
+    assert action_candidates[0].state == "executable"
+    assert action_candidates[0].metadata["unlock"]["reason"] == "physically_verified"
+    assert support["candidates"][0]["state"] == "executable"
 
 
 def test_runtime_decision_support_prioritizes_recommended_oracle_candidate():

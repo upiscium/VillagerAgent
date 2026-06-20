@@ -94,6 +94,11 @@ class DualDAGRuntime:
             candidate_id = candidate.get("node_id")
             if not candidate_id:
                 continue
+            self.action_edges = [
+                edge for edge in self.action_edges
+                if edge.get("target_id") != candidate_id
+                or edge.get("edge_type") not in {"supports", "conflicts_with"}
+            ]
             self.action_nodes[candidate_id] = candidate
             for claim_id in candidate.get("supported_by", []):
                 self.action_edges.append({
@@ -827,11 +832,15 @@ def _decision_support_candidate(candidate: dict, *, graph_context: dict | None =
     row = {
         "node_id": candidate.get("node_id", ""),
         "action": candidate.get("action", {}),
+        "state": candidate.get("state", "candidate"),
         "confidence": confidence,
         "claim_support_count": len(candidate.get("supported_by", []) or []) + historical_support_count,
         "claim_conflict_count": len(candidate.get("conflicts_with", []) or []) + historical_conflict_count,
         "claim_required_evidence_count": len(candidate.get("required_evidence", []) or []) + historical_required_count,
     }
+    metadata = candidate.get("metadata", {}) if isinstance(candidate.get("metadata"), dict) else {}
+    if metadata.get("unlock"):
+        row["unlock"] = metadata["unlock"]
     if graph_context:
         row["graph_context"] = graph_context
     return row
@@ -843,6 +852,7 @@ def _recommended_candidate(rows: list[dict]) -> dict | None:
     return max(
         rows,
         key=lambda row: (
+            row.get("state") == "executable",
             row["claim_conflict_count"] == 0,
             row["claim_required_evidence_count"] == 0,
             row["confidence"],
