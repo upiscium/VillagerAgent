@@ -142,6 +142,8 @@ def _execute_real_runtime(launch_config: dict, *, dual_dag_config: dict) -> None
         document,
         minecraft_dual_dag_config=dual_dag_config,
     )
+
+
 def _task_graph_from_config(config: dict) -> tuple[Task, Graph]:
     task = Task(config.get("task_goal", config.get("task_name", "Minecraft task")), {
         "task_name": config.get("task_name", ""),
