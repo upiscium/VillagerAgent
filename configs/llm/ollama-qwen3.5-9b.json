@@ -1,7 +1,7 @@
 {
   "provider": "ollama",
   "api_model": "qwen3.5:9b",
-  "api_base": "https://ollama.arc.upiscium.dev/v1",
+  "api_base": "http://ollama.arc.upiscium.dev/v1",
   "api_key": "ollama",
   "api_key_list": ["ollama"]
 }

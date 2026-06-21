@@ -23,6 +23,7 @@ The batch produced diagnosable failure artifacts for both runs before any CRAFT 
 
 - Error type: `OllamaPreflightError`
 - Error message after endpoint update: DNS failure resolving `https://ollama.arc.upiscium.dev`
+- Follow-up endpoint check showed the Ollama service is available over `http://ollama.arc.upiscium.dev`; HTTPS fails with TLS SNI `unrecognized name`.
 - Dual-DAG behavior was not exercised, so no conclusion can be drawn about larger-batch fallback rates from this environment attempt.
 
 ## Monitoring Status
