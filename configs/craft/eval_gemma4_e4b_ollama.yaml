@@ -31,14 +31,14 @@ models:
   director:
     provider: "ollama_native"
     model: "gemma4:e4b"
-    base_url: "https://ollama-melchior.arc.upiscium.dev"
+    base_url: "https://ollama.arc.upiscium.dev"
     think: false
     temperature: 0.2
     max_tokens: 4096
   builder:
     provider: "ollama_native"
     model: "gemma4:e4b"
-    base_url: "https://ollama-melchior.arc.upiscium.dev"
+    base_url: "https://ollama.arc.upiscium.dev"
     think: false
     temperature: 0.0
     max_tokens: 4096

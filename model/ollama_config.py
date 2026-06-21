@@ -1,7 +1,7 @@
 import os
 
 OLLAMA_PROVIDER = "ollama"
-OLLAMA_API_BASE = os.environ.get("OLLAMA_API_BASE", "https://ollama-melchior.arc.upiscium.dev/v1")
+OLLAMA_API_BASE = os.environ.get("OLLAMA_API_BASE", "https://ollama.arc.upiscium.dev/v1")
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "ollama")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.6:27b")
 
