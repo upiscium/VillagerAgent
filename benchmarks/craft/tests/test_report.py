@@ -53,6 +53,9 @@ def test_report_aggregates_multiple_runs(tmp_path):
     assert rows[1]["resolved_fact_count"] == 2
     assert rows[1]["hypothesis_resolved_count"] == 1
     assert rows[1]["action_candidate_executed_count"] == 1
+    assert rows[1]["candidate_created_count"] == 3
+    assert rows[1]["candidate_repeated_after_execution_count"] == 1
+    assert rows[1]["candidate_state_transition_counts"] == '{"executes_action:executed": 1}'
     assert rows[1]["coordination_action_count"] == 2
     assert rows[1]["gated_clarification_count"] == 1
     assert rows[1]["gate_invocation_count"] == 1
@@ -134,6 +137,9 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "resolved_fact_count",
                 "hypothesis_resolved_count",
                 "action_candidate_executed_count",
+                "candidate_created_count",
+                "candidate_repeated_after_execution_count",
+                "candidate_state_transition_counts",
                 "coordination_action_count",
                 "gate_invocation_count",
                 "gate_reason_counts",
@@ -161,6 +167,9 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "resolved_fact_count": "2",
                 "hypothesis_resolved_count": "1",
                 "action_candidate_executed_count": "1",
+                "candidate_created_count": "3",
+                "candidate_repeated_after_execution_count": "1",
+                "candidate_state_transition_counts": '{"executes_action:executed": 1}',
                 "coordination_action_count": "2",
                 "gate_invocation_count": "1",
                 "gate_reason_counts": '{"low_action_confidence": 1}',

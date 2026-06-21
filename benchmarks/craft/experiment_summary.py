@@ -82,6 +82,13 @@ SUMMARY_FIELDS = [
     "action_candidate_blocked_count",
     "action_candidate_invalidated_count",
     "action_candidate_executed_count",
+    "candidate_created_count",
+    "candidate_blocked_count",
+    "candidate_executable_count",
+    "candidate_executed_count",
+    "candidate_invalidated_count",
+    "candidate_repeated_after_execution_count",
+    "candidate_state_transition_counts",
     "coordination_action_count",
     "clarify_coordination_action_count",
     "wait_for_evidence_coordination_action_count",
@@ -89,6 +96,16 @@ SUMMARY_FIELDS = [
     "conflicted_action_count",
     "required_evidence_action_count",
     "leakage_passed",
+]
+
+
+_ACTION_CANDIDATE_STATES_FOR_CREATED = [
+    "candidate",
+    "executable",
+    "waiting_for_evidence",
+    "blocked",
+    "invalidated",
+    "executed",
 ]
 
 
@@ -289,6 +306,13 @@ def _summarize_run(run_name: str, *, result_root: Path, analysis: dict | None = 
         "action_candidate_blocked_count": runtime.get("action_candidate_blocked_count", analysis.get("action_state_counts", {}).get("blocked", 0)),
         "action_candidate_invalidated_count": runtime.get("action_candidate_invalidated_count", analysis.get("action_state_counts", {}).get("invalidated", 0)),
         "action_candidate_executed_count": runtime.get("action_candidate_executed_count", analysis.get("action_state_counts", {}).get("executed", 0)),
+        "candidate_created_count": runtime.get("candidate_created_count", _candidate_created_fallback(runtime, analysis)),
+        "candidate_blocked_count": runtime.get("candidate_blocked_count", runtime.get("action_candidate_blocked_count", 0)),
+        "candidate_executable_count": runtime.get("candidate_executable_count", runtime.get("action_candidate_executable_count", 0)),
+        "candidate_executed_count": runtime.get("candidate_executed_count", runtime.get("action_candidate_executed_count", 0)),
+        "candidate_invalidated_count": runtime.get("candidate_invalidated_count", runtime.get("action_candidate_invalidated_count", 0)),
+        "candidate_repeated_after_execution_count": runtime.get("candidate_repeated_after_execution_count", 0),
+        "candidate_state_transition_counts": runtime.get("candidate_state_transition_counts", "{}"),
         "coordination_action_count": runtime.get("coordination_action_count", sum(analysis.get("coordination_action_counts", {}).values())),
         "clarify_coordination_action_count": runtime.get("clarify_coordination_action_count", analysis.get("coordination_action_counts", {}).get("clarify", 0)),
         "wait_for_evidence_coordination_action_count": runtime.get("wait_for_evidence_coordination_action_count", analysis.get("coordination_action_counts", {}).get("wait_for_evidence", 0)),
@@ -351,6 +375,14 @@ def _as_bool(value) -> bool:
     if isinstance(value, str):
         return value.lower() in {"true", "1", "yes"}
     return bool(value)
+
+
+def _candidate_created_fallback(runtime: dict, analysis: dict) -> int:
+    analysis_states = analysis.get("action_state_counts", {})
+    states = _ACTION_CANDIDATE_STATES_FOR_CREATED
+    if analysis_states:
+        return sum(int(analysis_states.get(state, 0) or 0) for state in states)
+    return sum(int(runtime.get(f"action_candidate_{state}_count", 0) or 0) for state in states)
 
 
 def _summarize_variance_group(group: str, rows: list[dict]) -> dict:

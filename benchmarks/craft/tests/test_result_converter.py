@@ -466,7 +466,16 @@ def test_result_converter_writes_dual_dag_artifacts(tmp_path):
                 ],
                 "epistemic_edges": [{"source_id": "claim:D1:1", "target_id": "hypothesis:1"}],
                 "action_nodes": [
-                    {"node_id": "action:1:0", "state": "executed"},
+                    {
+                        "node_id": "action:1:0",
+                        "state": "executed",
+                        "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+                    },
+                    {
+                        "node_id": "action:2:0",
+                        "state": "blocked",
+                        "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+                    },
                     {"node_id": "coordination:clarify:1:0", "action_type": "clarify", "state": "candidate"},
                     {
                         "node_id": "coordination:wait_for_evidence:1:0",
@@ -475,8 +484,19 @@ def test_result_converter_writes_dual_dag_artifacts(tmp_path):
                     },
                 ],
                 "action_edges": [
-                    {"source_id": "claim:D1:1", "target_id": "action:1:0"},
+                    {
+                        "source_id": "claim:D1:1",
+                        "target_id": "action:1:0",
+                        "edge_type": "executes_action",
+                        "metadata": {"state": "executed"},
+                    },
                     {"source_id": "coordination:clarify:1:0", "target_id": "action:1:0"},
+                    {
+                        "source_id": "claim:D1:1",
+                        "target_id": "action:2:0",
+                        "edge_type": "blocks_action",
+                        "metadata": {"state": "blocked"},
+                    },
                 ],
             },
             "final_progress": 0.0,
@@ -489,19 +509,23 @@ def test_result_converter_writes_dual_dag_artifacts(tmp_path):
     dag_summary = json.loads((tmp_path / "normalized" / "dual_dag_summary.json").read_text())
     nodes_text = (tmp_path / "normalized" / "dual_dag_nodes.jsonl").read_text()
     edges_text = (tmp_path / "normalized" / "dual_dag_edges.jsonl").read_text()
-    assert summary["runtime"]["dual_dag_node_count"] == 6
-    assert summary["runtime"]["dual_dag_edge_count"] == 3
+    assert summary["runtime"]["dual_dag_node_count"] == 7
+    assert summary["runtime"]["dual_dag_edge_count"] == 4
     assert summary["runtime"]["resolved_fact_count"] == 1
     assert summary["runtime"]["hypothesis_resolved_count"] == 1
     assert summary["runtime"]["action_candidate_executed_count"] == 1
     assert summary["runtime"]["action_candidate_waiting_for_evidence_count"] == 1
+    assert summary["runtime"]["candidate_created_count"] == 2
+    assert summary["runtime"]["candidate_executed_count"] == 1
+    assert summary["runtime"]["candidate_repeated_after_execution_count"] == 1
+    assert summary["runtime"]["candidate_state_transition_counts"] == '{"blocks_action:blocked": 1, "executes_action:executed": 1}'
     assert summary["runtime"]["coordination_action_count"] == 2
     assert summary["runtime"]["clarify_coordination_action_count"] == 1
     assert summary["runtime"]["wait_for_evidence_coordination_action_count"] == 1
     assert dag_summary["schema_version"] == "1.0.0"
     assert "resolved_fact" in dag_summary["schema"]["node_types"]
     assert "executes_action" in dag_summary["schema"]["edge_types"]
-    assert dag_summary["node_count"] == 6
+    assert dag_summary["node_count"] == 7
     assert "claim:D1:1" in nodes_text
     assert "coordination:clarify:1:0" in nodes_text
     assert "coordination:wait_for_evidence:1:0" in nodes_text

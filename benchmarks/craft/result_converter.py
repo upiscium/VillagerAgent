@@ -133,6 +133,13 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
         "action_candidate_blocked_count",
         "action_candidate_invalidated_count",
         "action_candidate_executed_count",
+        "candidate_created_count",
+        "candidate_blocked_count",
+        "candidate_executable_count",
+        "candidate_executed_count",
+        "candidate_invalidated_count",
+        "candidate_repeated_after_execution_count",
+        "candidate_state_transition_counts",
         "coordination_action_count",
         "clarify_coordination_action_count",
         "wait_for_evidence_coordination_action_count",
@@ -249,6 +256,13 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
                 "action_candidate_blocked_count": game_dual_dag_metrics["action_candidate_blocked_count"],
                 "action_candidate_invalidated_count": game_dual_dag_metrics["action_candidate_invalidated_count"],
                 "action_candidate_executed_count": game_dual_dag_metrics["action_candidate_executed_count"],
+                "candidate_created_count": game_dual_dag_metrics["candidate_created_count"],
+                "candidate_blocked_count": game_dual_dag_metrics["candidate_blocked_count"],
+                "candidate_executable_count": game_dual_dag_metrics["candidate_executable_count"],
+                "candidate_executed_count": game_dual_dag_metrics["candidate_executed_count"],
+                "candidate_invalidated_count": game_dual_dag_metrics["candidate_invalidated_count"],
+                "candidate_repeated_after_execution_count": game_dual_dag_metrics["candidate_repeated_after_execution_count"],
+                "candidate_state_transition_counts": game_dual_dag_metrics["candidate_state_transition_counts"],
                 "coordination_action_count": game_dual_dag_metrics["coordination_action_count"],
                 "clarify_coordination_action_count": game_dual_dag_metrics["clarify_coordination_action_count"],
                 "wait_for_evidence_coordination_action_count": game_dual_dag_metrics["wait_for_evidence_coordination_action_count"],
@@ -808,7 +822,10 @@ def _dual_dag_metrics(games: list[dict]) -> dict:
     resolved_fact_count = 0
     hypothesis_status_counts = {status: 0 for status in _HYPOTHESIS_STATUSES}
     action_state_counts = {state: 0 for state in _ACTION_CANDIDATE_STATES}
+    action_state_transition_counts: dict[str, int] = {}
     coordination_counts = {action_type: 0 for action_type in _COORDINATION_ACTION_TYPES}
+    candidate_created_count = 0
+    repeated_after_execution_count = 0
     for game in games:
         dual_dag = game.get("dual_dag", {})
         epistemic_nodes = list(dual_dag.get("epistemic_nodes", []))
@@ -827,12 +844,21 @@ def _dual_dag_metrics(games: list[dict]) -> dict:
             if node_type == "resolved_fact":
                 resolved_fact_count += 1
         for node in action_nodes:
+            if not _is_coordination_action_node(node):
+                candidate_created_count += 1
             state = node.get("state", "candidate")
             if state in action_state_counts:
                 action_state_counts[state] += 1
             action_type = node.get("action_type")
             if action_type in coordination_counts:
                 coordination_counts[action_type] += 1
+        for edge in dual_dag.get("action_edges", []):
+            state = ((edge.get("metadata") or {}).get("state") or "").strip()
+            if state:
+                edge_type = edge.get("edge_type", "unknown")
+                key = f"{edge_type}:{state}"
+                action_state_transition_counts[key] = action_state_transition_counts.get(key, 0) + 1
+        repeated_after_execution_count += _candidate_repeated_after_execution_count(action_nodes)
     return {
         "dual_dag_node_count": node_count,
         "dual_dag_edge_count": edge_count,
@@ -840,10 +866,51 @@ def _dual_dag_metrics(games: list[dict]) -> dict:
         "resolved_fact_count": resolved_fact_count,
         **{f"hypothesis_{status}_count": count for status, count in hypothesis_status_counts.items()},
         **{f"action_candidate_{state}_count": count for state, count in action_state_counts.items()},
+        "candidate_created_count": candidate_created_count,
+        "candidate_blocked_count": action_state_counts["blocked"],
+        "candidate_executable_count": action_state_counts["executable"],
+        "candidate_executed_count": action_state_counts["executed"],
+        "candidate_invalidated_count": action_state_counts["invalidated"],
+        "candidate_repeated_after_execution_count": repeated_after_execution_count,
+        "candidate_state_transition_counts": json.dumps(action_state_transition_counts, sort_keys=True),
         "coordination_action_count": sum(coordination_counts.values()),
         "clarify_coordination_action_count": coordination_counts["clarify"],
         "wait_for_evidence_coordination_action_count": coordination_counts["wait_for_evidence"],
     }
+
+
+def _candidate_repeated_after_execution_count(action_nodes: list[dict]) -> int:
+    executed_turn_by_action: dict[tuple, int] = {}
+    repeated_count = 0
+    for node in sorted(action_nodes, key=lambda item: _candidate_turn_index(item.get("node_id", ""))):
+        if _is_coordination_action_node(node):
+            continue
+        fingerprint = _action_fingerprint(node.get("action", {}))
+        turn_index = _candidate_turn_index(node.get("node_id", ""))
+        if fingerprint in executed_turn_by_action and turn_index > executed_turn_by_action[fingerprint]:
+            repeated_count += 1
+        if node.get("state") == "executed":
+            execution_turn = ((node.get("metadata") or {}).get("execution") or {}).get("turn_index")
+            executed_turn_by_action[fingerprint] = int(execution_turn if execution_turn is not None else turn_index)
+    return repeated_count
+
+
+def _is_coordination_action_node(node: dict) -> bool:
+    return node.get("action_type") in _COORDINATION_ACTION_TYPES or bool((node.get("metadata") or {}).get("coordination_action"))
+
+
+def _action_fingerprint(action: dict) -> tuple:
+    if not isinstance(action, dict):
+        return tuple()
+    return tuple(sorted((key, value) for key, value in action.items() if not str(key).startswith("_")))
+
+
+def _candidate_turn_index(node_id: str) -> int:
+    parts = str(node_id).split(":")
+    for part in parts:
+        if part.isdigit():
+            return int(part)
+    return 0
 
 
 _HYPOTHESIS_STATUSES = ["open", "supported", "conflicted", "resolved", "invalidated"]

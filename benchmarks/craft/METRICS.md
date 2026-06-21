@@ -106,6 +106,16 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 - `retrieval_used_in_top_action_count`: Number of turns where the chosen candidate has non-empty retrieval context.
 - `retrieval_changed_top_action_count`: Number of turns explicitly marked as retrieval changing the top action. Existing artifacts do not infer this from confidence alone.
 
+## Candidate Lifecycle Diagnostics
+
+- `candidate_created_count`: Number of non-coordination action candidate nodes created in the Dual-DAG artifact.
+- `candidate_blocked_count`: Number of candidate nodes currently in `blocked` state.
+- `candidate_executable_count`: Number of candidate nodes currently in `executable` state.
+- `candidate_executed_count`: Number of candidate nodes currently in `executed` state.
+- `candidate_invalidated_count`: Number of candidate nodes currently in `invalidated` state.
+- `candidate_repeated_after_execution_count`: Number of non-coordination candidates whose public action repeats an already executed action candidate at a later turn.
+- `candidate_state_transition_counts`: JSON object of action lifecycle edges by `edge_type:state`, such as `unlocks_action:executable`, `blocks_action:blocked`, or `executes_action:executed`.
+
 ## Dual-DAG Analysis Metrics
 
 - `supported_action_count`: Number of action candidates with at least one support edge.
@@ -131,6 +141,7 @@ For paper-facing or quick inspection tables, focus on:
 - Action throughput: `physical_action_count`, `clarify_count`, `wait_count`, `mean_progress_delta_per_turn`, `mean_progress_delta_per_physical_action`
 - Runtime stability: `builder_fallback_rate`, `gated_clarification_rate`, `clarification_resolution_rate`
 - Retrieval health: `retrieved_node_count`, `mean_retrieved_node_age`, `retrieved_invalidated_candidate_count`, `retrieved_superseded_node_count`, `retrieval_used_in_top_action_count`
+- Candidate lifecycle: `candidate_created_count`, `candidate_executed_count`, `candidate_repeated_after_execution_count`, `candidate_state_transition_counts`
 - Coordination quality: `claim_support_count`, `claim_conflict_count`, `claim_required_evidence_count`
 - Graph richness: `dual_dag_node_count`, `dual_dag_edge_count`, `supported_action_count`, `conflicted_action_count`, `required_evidence_action_count`
 - Safety: `leakage_passed`
