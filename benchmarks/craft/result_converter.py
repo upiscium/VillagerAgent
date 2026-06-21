@@ -27,6 +27,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
     epistemic_counts = _epistemic_counts(turns)
     action_candidate_metrics = _action_candidate_metrics(turns)
     clarification_metrics = _clarification_metrics(turns)
+    retrieval_metrics = _retrieval_metrics(turns)
     progress_action_metrics = _aggregate_progress_action_metrics(games)
     dual_dag_metrics = _dual_dag_metrics(games)
     hypothesis_count = max(
@@ -61,6 +62,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
             "hypothesis_count": hypothesis_count,
             **action_candidate_metrics,
             **clarification_metrics,
+            **retrieval_metrics,
             **progress_action_metrics,
             **dual_dag_metrics,
         },
@@ -154,6 +156,16 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
         "gate_clarify_count",
         "gate_wait_count",
         "gate_reason_counts",
+        "retrieved_node_count",
+        "retrieved_claim_count",
+        "retrieved_action_count",
+        "mean_retrieved_node_age",
+        "max_retrieved_node_age",
+        "retrieved_executed_candidate_count",
+        "retrieved_invalidated_candidate_count",
+        "retrieved_superseded_node_count",
+        "retrieval_used_in_top_action_count",
+        "retrieval_changed_top_action_count",
         "gated_clarification_count",
         "gated_clarification_rate",
         "clarification_resolution_count",
@@ -180,6 +192,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
             game_epistemic_counts = _epistemic_counts(game.get("turns", []))
             game_action_candidate_metrics = _action_candidate_metrics(game.get("turns", []))
             game_clarification_metrics = _clarification_metrics(game.get("turns", []))
+            game_retrieval_metrics = _retrieval_metrics(game.get("turns", []))
             game_progress_action_metrics = _progress_action_metrics(game)
             game_dual_dag_metrics = _dual_dag_metrics([game])
             game_hypothesis_count = max(
@@ -259,6 +272,16 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
                 "gate_clarify_count": game_clarification_metrics["gate_clarify_count"],
                 "gate_wait_count": game_clarification_metrics["gate_wait_count"],
                 "gate_reason_counts": game_clarification_metrics["gate_reason_counts"],
+                "retrieved_node_count": game_retrieval_metrics["retrieved_node_count"],
+                "retrieved_claim_count": game_retrieval_metrics["retrieved_claim_count"],
+                "retrieved_action_count": game_retrieval_metrics["retrieved_action_count"],
+                "mean_retrieved_node_age": game_retrieval_metrics["mean_retrieved_node_age"],
+                "max_retrieved_node_age": game_retrieval_metrics["max_retrieved_node_age"],
+                "retrieved_executed_candidate_count": game_retrieval_metrics["retrieved_executed_candidate_count"],
+                "retrieved_invalidated_candidate_count": game_retrieval_metrics["retrieved_invalidated_candidate_count"],
+                "retrieved_superseded_node_count": game_retrieval_metrics["retrieved_superseded_node_count"],
+                "retrieval_used_in_top_action_count": game_retrieval_metrics["retrieval_used_in_top_action_count"],
+                "retrieval_changed_top_action_count": game_retrieval_metrics["retrieval_changed_top_action_count"],
                 "gated_clarification_count": game_clarification_metrics["gated_clarification_count"],
                 "gated_clarification_rate": game_clarification_metrics["gated_clarification_rate"],
                 "clarification_resolution_count": game_clarification_metrics["clarification_resolution_count"],
@@ -471,6 +494,75 @@ def _action_candidate_metrics(turns: list[dict]) -> dict:
         "claim_required_evidence_count": claim_required_evidence_count,
         "candidate_count": candidate_count,
     }
+
+
+def _retrieval_metrics(turns: list[dict]) -> dict:
+    retrieved_claim_count = 0
+    retrieved_action_count = 0
+    retrieved_executed_candidate_count = 0
+    retrieved_invalidated_candidate_count = 0
+    retrieved_superseded_node_count = 0
+    retrieval_used_in_top_action_count = 0
+    retrieval_changed_top_action_count = 0
+    ages = []
+    for turn in turns:
+        action = turn.get("builder_action") or {}
+        metadata = action.get("_action_candidate_metadata") or {}
+        turn_index = _turn_index(turn)
+        chosen_id = metadata.get("chosen_candidate_id")
+        top_uses_retrieval = False
+        for candidate in metadata.get("candidates", []) or []:
+            context = candidate.get("graph_context") or {}
+            claims = context.get("relevant_public_claims", []) or []
+            actions = context.get("relevant_public_actions", []) or []
+            retrieved_claim_count += len(claims)
+            retrieved_action_count += len(actions)
+            for node in [*claims, *actions]:
+                age = _retrieved_node_age(node, turn_index)
+                if age is not None:
+                    ages.append(age)
+                state = str(node.get("state", "") or "").lower()
+                if state == "invalidated":
+                    retrieved_invalidated_candidate_count += 1
+                if state == "superseded" or node.get("superseded_by"):
+                    retrieved_superseded_node_count += 1
+            retrieved_executed_candidate_count += sum(
+                1 for node in actions
+                if str(node.get("state", "executed") or "").lower() == "executed"
+            )
+            if candidate.get("node_id") == chosen_id and (claims or actions):
+                top_uses_retrieval = True
+        if top_uses_retrieval:
+            retrieval_used_in_top_action_count += 1
+        if metadata.get("retrieval_changed_top_action"):
+            retrieval_changed_top_action_count += 1
+    return {
+        "retrieved_node_count": retrieved_claim_count + retrieved_action_count,
+        "retrieved_claim_count": retrieved_claim_count,
+        "retrieved_action_count": retrieved_action_count,
+        "mean_retrieved_node_age": _mean(ages),
+        "max_retrieved_node_age": max(ages) if ages else 0.0,
+        "retrieved_executed_candidate_count": retrieved_executed_candidate_count,
+        "retrieved_invalidated_candidate_count": retrieved_invalidated_candidate_count,
+        "retrieved_superseded_node_count": retrieved_superseded_node_count,
+        "retrieval_used_in_top_action_count": retrieval_used_in_top_action_count,
+        "retrieval_changed_top_action_count": retrieval_changed_top_action_count,
+    }
+
+
+def _turn_index(turn: dict) -> int | None:
+    for key in ("turn_index", "turn_number"):
+        value = turn.get(key)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _retrieved_node_age(node: dict, current_turn: int | None) -> int | None:
+    source_turn = node.get("turn_index")
+    if current_turn is None or not isinstance(source_turn, int):
+        return None
+    return max(current_turn - source_turn, 0)
 
 
 def _clarification_metrics(turns: list[dict]) -> dict:

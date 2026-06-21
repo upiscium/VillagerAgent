@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from benchmarks.craft.config import repo_root
-from benchmarks.craft.result_converter import _clarification_metrics, _progress_action_metrics
+from benchmarks.craft.result_converter import _clarification_metrics, _progress_action_metrics, _retrieval_metrics
 
 
 SUMMARY_FIELDS = [
@@ -48,6 +48,16 @@ SUMMARY_FIELDS = [
     "gate_clarify_count",
     "gate_wait_count",
     "gate_reason_counts",
+    "retrieved_node_count",
+    "retrieved_claim_count",
+    "retrieved_action_count",
+    "mean_retrieved_node_age",
+    "max_retrieved_node_age",
+    "retrieved_executed_candidate_count",
+    "retrieved_invalidated_candidate_count",
+    "retrieved_superseded_node_count",
+    "retrieval_used_in_top_action_count",
+    "retrieval_changed_top_action_count",
     "gated_clarification_rate",
     "clarification_resolution_rate",
     "mean_clarification_quality_score",
@@ -203,6 +213,7 @@ def _summarize_run(run_name: str, *, result_root: Path, analysis: dict | None = 
         "final_progress": summary.get("mean_final_progress", 0.0),
     })
     clarification_metrics = _clarification_metrics(turns)
+    retrieval_metrics = _retrieval_metrics(turns)
     return {
         "run_name": summary.get("run_name", run_name),
         "run_group": _run_group(summary.get("run_name", run_name)),
@@ -244,6 +255,16 @@ def _summarize_run(run_name: str, *, result_root: Path, analysis: dict | None = 
         "gate_clarify_count": runtime.get("gate_clarify_count", clarification_metrics["gate_clarify_count"]),
         "gate_wait_count": runtime.get("gate_wait_count", clarification_metrics["gate_wait_count"]),
         "gate_reason_counts": runtime.get("gate_reason_counts", clarification_metrics["gate_reason_counts"]),
+        "retrieved_node_count": runtime.get("retrieved_node_count", retrieval_metrics["retrieved_node_count"]),
+        "retrieved_claim_count": runtime.get("retrieved_claim_count", retrieval_metrics["retrieved_claim_count"]),
+        "retrieved_action_count": runtime.get("retrieved_action_count", retrieval_metrics["retrieved_action_count"]),
+        "mean_retrieved_node_age": runtime.get("mean_retrieved_node_age", retrieval_metrics["mean_retrieved_node_age"]),
+        "max_retrieved_node_age": runtime.get("max_retrieved_node_age", retrieval_metrics["max_retrieved_node_age"]),
+        "retrieved_executed_candidate_count": runtime.get("retrieved_executed_candidate_count", retrieval_metrics["retrieved_executed_candidate_count"]),
+        "retrieved_invalidated_candidate_count": runtime.get("retrieved_invalidated_candidate_count", retrieval_metrics["retrieved_invalidated_candidate_count"]),
+        "retrieved_superseded_node_count": runtime.get("retrieved_superseded_node_count", retrieval_metrics["retrieved_superseded_node_count"]),
+        "retrieval_used_in_top_action_count": runtime.get("retrieval_used_in_top_action_count", retrieval_metrics["retrieval_used_in_top_action_count"]),
+        "retrieval_changed_top_action_count": runtime.get("retrieval_changed_top_action_count", retrieval_metrics["retrieval_changed_top_action_count"]),
         "gated_clarification_rate": runtime.get("gated_clarification_rate", 0.0),
         "clarification_resolution_rate": runtime.get("clarification_resolution_rate", 0.0),
         "mean_clarification_quality_score": runtime.get("mean_clarification_quality_score", 0.0),

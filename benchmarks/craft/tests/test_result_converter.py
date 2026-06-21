@@ -340,6 +340,60 @@ def test_result_converter_tracks_duplicate_clarifications_and_positive_latency(t
     assert summary["runtime"]["span_uncertainty_gate_count"] == 2
 
 
+def test_result_converter_tracks_retrieval_metrics(tmp_path):
+    config = {
+        "run": {"name": "test", "seed": 3, "structures": [0], "turns": 1},
+        "models": {"director": {"model": "d"}, "builder": {"model": "b"}},
+        "villageragent": {"enabled": True},
+    }
+    normalize_results(
+        config=config,
+        condition="villageragent_directors",
+        raw_result={
+            "structure_id": 0,
+            "turns": [{
+                "turn_index": 5,
+                "builder_action": {
+                    "action": "place",
+                    "_action_candidate_metadata": {
+                        "chosen_candidate_id": "action:5:0",
+                        "retrieval_changed_top_action": True,
+                        "candidates": [{
+                            "node_id": "action:5:0",
+                            "graph_context": {
+                                "relevant_public_claims": [
+                                    {"node_id": "claim:D1:1", "turn_index": 2, "relation": "supports"},
+                                    {"node_id": "claim:D2:1", "turn_index": 3, "relation": "conflicts_with", "state": "invalidated"},
+                                ],
+                                "relevant_public_actions": [
+                                    {"node_id": "public:builder_action:1:0", "turn_index": 1},
+                                    {"node_id": "public:builder_action:4:0", "turn_index": 4, "state": "superseded", "superseded_by": "public:builder_action:5:0"},
+                                ],
+                            },
+                        }],
+                    },
+                },
+                "progress": {"overall_progress": 0.1},
+            }],
+            "final_progress": 0.1,
+            "completed": False,
+        },
+        output_dir=tmp_path,
+    )
+
+    summary = json.loads((tmp_path / "normalized" / "summary.json").read_text())
+    assert summary["runtime"]["retrieved_node_count"] == 4
+    assert summary["runtime"]["retrieved_claim_count"] == 2
+    assert summary["runtime"]["retrieved_action_count"] == 2
+    assert summary["runtime"]["mean_retrieved_node_age"] == 2.5
+    assert summary["runtime"]["max_retrieved_node_age"] == 4
+    assert summary["runtime"]["retrieved_executed_candidate_count"] == 1
+    assert summary["runtime"]["retrieved_invalidated_candidate_count"] == 1
+    assert summary["runtime"]["retrieved_superseded_node_count"] == 1
+    assert summary["runtime"]["retrieval_used_in_top_action_count"] == 1
+    assert summary["runtime"]["retrieval_changed_top_action_count"] == 1
+
+
 def test_result_converter_tracks_progress_and_action_throughput(tmp_path):
     config = {
         "run": {"name": "test", "seed": 3, "structures": [0], "turns": 4},

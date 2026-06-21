@@ -57,6 +57,8 @@ def test_report_aggregates_multiple_runs(tmp_path):
     assert rows[1]["gated_clarification_count"] == 1
     assert rows[1]["gate_invocation_count"] == 1
     assert rows[1]["gate_reason_counts"] == '{"low_action_confidence": 1}'
+    assert rows[1]["retrieved_node_count"] == 3
+    assert rows[1]["mean_retrieved_node_age"] == 2.0
     assert rows[1]["clarification_resolution_rate"] == 0.5
     assert rows[1]["clarification_to_unlock_rate"] == 0.5
     assert rows[1]["mean_clarification_quality_score"] == 0.75
@@ -135,6 +137,8 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "coordination_action_count",
                 "gate_invocation_count",
                 "gate_reason_counts",
+                "retrieved_node_count",
+                "mean_retrieved_node_age",
                 "gated_clarification_count",
                 "clarification_resolution_count",
                 "clarification_resolution_rate",
@@ -160,6 +164,8 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "coordination_action_count": "2",
                 "gate_invocation_count": "1",
                 "gate_reason_counts": '{"low_action_confidence": 1}',
+                "retrieved_node_count": "3",
+                "mean_retrieved_node_age": "2.0",
                 "gated_clarification_count": "1",
                 "clarification_resolution_count": "1",
                 "clarification_resolution_rate": "0.5",

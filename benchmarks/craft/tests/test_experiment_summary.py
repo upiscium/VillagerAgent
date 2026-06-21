@@ -29,6 +29,8 @@ def test_experiment_summary_combines_runtime_and_analysis_metrics(tmp_path):
     assert rows[0]["mean_progress_delta_per_physical_action"] == 0.2
     assert rows[0]["gate_invocation_count"] == 1
     assert rows[0]["gate_reason_counts"] == '{"low_action_confidence": 1}'
+    assert rows[0]["retrieved_node_count"] == 3
+    assert rows[0]["mean_retrieved_node_age"] == 2.0
     assert rows[0]["clarification_to_unlock_rate"] == 0.5
     assert rows[0]["clarification_resolution_rate"] == 0.5
     assert rows[0]["mean_clarification_quality_score"] == 0.75
@@ -229,6 +231,16 @@ def _write_run(
             "gate_clarify_count": 1,
             "gate_wait_count": 0,
             "gate_reason_counts": '{"low_action_confidence": 1}',
+            "retrieved_node_count": 3,
+            "retrieved_claim_count": 2,
+            "retrieved_action_count": 1,
+            "mean_retrieved_node_age": 2.0,
+            "max_retrieved_node_age": 4,
+            "retrieved_executed_candidate_count": 1,
+            "retrieved_invalidated_candidate_count": 0,
+            "retrieved_superseded_node_count": 0,
+            "retrieval_used_in_top_action_count": 1,
+            "retrieval_changed_top_action_count": 0,
             "gated_clarification_rate": 0.1,
             "clarification_resolution_rate": 0.5,
             "mean_clarification_quality_score": 0.75,

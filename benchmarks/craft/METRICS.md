@@ -93,6 +93,19 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 - `dual_dag_node_count`: Number of serialized Dual-DAG nodes. Nodes include observed facts, public facts, reported claims, action candidates, and public Builder actions.
 - `dual_dag_edge_count`: Number of serialized Dual-DAG edges. Current edges include action support/conflict edges and epistemic `supports`, `conflicts_with`, `derived_from`, and `requires_confirmation_from` edges.
 
+## Historical Retrieval Diagnostics
+
+- `retrieved_node_count`: Total retrieved public graph nodes referenced by action-candidate `graph_context` metadata.
+- `retrieved_claim_count`: Retrieved public claim count.
+- `retrieved_action_count`: Retrieved public Builder action count.
+- `mean_retrieved_node_age`: Mean `current_turn - source_turn` across retrieved nodes when both turns are known.
+- `max_retrieved_node_age`: Maximum retrieved node age.
+- `retrieved_executed_candidate_count`: Retrieved public action count treated as executed historical action evidence.
+- `retrieved_invalidated_candidate_count`: Retrieved nodes marked with `state=invalidated`.
+- `retrieved_superseded_node_count`: Retrieved nodes marked `state=superseded` or carrying `superseded_by` metadata.
+- `retrieval_used_in_top_action_count`: Number of turns where the chosen candidate has non-empty retrieval context.
+- `retrieval_changed_top_action_count`: Number of turns explicitly marked as retrieval changing the top action. Existing artifacts do not infer this from confidence alone.
+
 ## Dual-DAG Analysis Metrics
 
 - `supported_action_count`: Number of action candidates with at least one support edge.
@@ -117,6 +130,7 @@ For paper-facing or quick inspection tables, focus on:
 - Task performance: `mean_final_progress`, `max_progress`, `progress_auc`, `completion_rate`
 - Action throughput: `physical_action_count`, `clarify_count`, `wait_count`, `mean_progress_delta_per_turn`, `mean_progress_delta_per_physical_action`
 - Runtime stability: `builder_fallback_rate`, `gated_clarification_rate`, `clarification_resolution_rate`
+- Retrieval health: `retrieved_node_count`, `mean_retrieved_node_age`, `retrieved_invalidated_candidate_count`, `retrieved_superseded_node_count`, `retrieval_used_in_top_action_count`
 - Coordination quality: `claim_support_count`, `claim_conflict_count`, `claim_required_evidence_count`
 - Graph richness: `dual_dag_node_count`, `dual_dag_edge_count`, `supported_action_count`, `conflicted_action_count`, `required_evidence_action_count`
 - Safety: `leakage_passed`
