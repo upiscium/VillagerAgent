@@ -7,6 +7,10 @@ experiment:
     turns: 5
     run_name_suffix: _progress_large
   runs:
+    - config: configs/craft/official_baseline_gemma4_12b_ollama.yaml
+      suffix: _official
+      seeds: [1, 3, 5]
+      structures: [0, 1, 2, 3, 4]
     - config: configs/craft/eval_gemma4_12b_ollama.yaml
       suffix: _baseline
       seeds: [1, 3, 5]
