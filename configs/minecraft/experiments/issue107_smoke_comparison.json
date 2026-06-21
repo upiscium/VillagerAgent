@@ -1,0 +1,49 @@
+[
+  {
+    "task_type": "meta",
+    "task_idx": 0,
+    "agent_num": 2,
+    "max_task_num": 2,
+    "task_goal": "Compare Minecraft Dual-DAG runtime task selection on a fixed smoke fixture.",
+    "document_file": "",
+    "host": "127.0.0.1",
+    "port": 25565,
+    "task_name": "minecraft_issue107_smoke",
+    "role": "same",
+    "evaluation_arg": {},
+    "smoke_tasks": [
+      {
+        "id": "open_locked_door",
+        "description": "Open locked door",
+        "candidate_agents": ["Alice"],
+        "assigned_agents": ["Alice"]
+      },
+      {
+        "id": "find_chest",
+        "description": "Find chest",
+        "candidate_agents": ["Bob"],
+        "assigned_agents": []
+      }
+    ],
+    "smoke_action_log": {
+      "Alice": [
+        {
+          "action": "openContainer",
+          "kwargs": {"player_name": "Alice", "item_name": "door"},
+          "result": {"status": false, "message": "door is locked"}
+        }
+      ],
+      "Bob": [
+        {
+          "action": "talkTo",
+          "kwargs": {
+            "player_name": "Bob",
+            "entity_name": "Alice",
+            "message": "The chest is north of the door."
+          },
+          "result": {"status": true}
+        }
+      ]
+    }
+  }
+]

@@ -82,3 +82,65 @@ def test_minecraft_experiment_accepts_config_lists(tmp_path):
     )
     assert graph_snapshot["mutates_runtime"] is False
     assert graph_snapshot["tasks"][0]["description"] == "Second task"
+
+
+def test_minecraft_experiment_records_enabled_task_reordering(tmp_path):
+    config_path = tmp_path / "minecraft_config.json"
+    config_path.write_text(
+        json.dumps({
+            "task_type": "meta",
+            "task_idx": 0,
+            "agent_num": 2,
+            "task_goal": "Smoke compare task selection",
+            "host": "127.0.0.1",
+            "port": 25565,
+            "task_name": "issue107",
+            "smoke_tasks": [
+                {
+                    "id": "open_locked_door",
+                    "description": "Open locked door",
+                    "candidate_agents": ["Alice"],
+                    "assigned_agents": ["Alice"],
+                },
+                {
+                    "id": "find_chest",
+                    "description": "Find chest",
+                    "candidate_agents": ["Bob"],
+                },
+            ],
+            "smoke_action_log": {
+                "Alice": [{
+                    "action": "openContainer",
+                    "kwargs": {"player_name": "Alice", "item_name": "door"},
+                    "result": {"status": False, "message": "door is locked"},
+                }],
+                "Bob": [{
+                    "action": "talkTo",
+                    "kwargs": {
+                        "player_name": "Bob",
+                        "entity_name": "Alice",
+                        "message": "The chest is north of the door.",
+                    },
+                    "result": {"status": True},
+                }],
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    disabled = run_minecraft_experiment(
+        config_path=config_path,
+        output_root=tmp_path / "result",
+        run_name="disabled",
+    )
+    enabled = run_minecraft_experiment(
+        config_path=config_path,
+        output_root=tmp_path / "result",
+        run_name="enabled",
+        enable_dual_dag_task_selection=True,
+    )
+
+    assert disabled["task_order"] == disabled["ranked_task_order"]
+    assert enabled["ranked_task_order"][0]["description"] == "Find chest"
+    assert enabled["task_order"] != enabled["ranked_task_order"]
+    assert enabled["recommended_description"] == "Find chest"

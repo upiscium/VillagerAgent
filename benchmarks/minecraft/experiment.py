@@ -6,6 +6,7 @@ from pathlib import Path
 from env.minecraft_dual_dag import (
     build_minecraft_dual_dag_artifact,
     build_minecraft_runtime_decision_support,
+    rank_minecraft_runtime_tasks,
     sanitize_public_value,
 )
 from type_define.graph import Graph, Task
@@ -36,8 +37,8 @@ def run_minecraft_experiment(
 
     started_at = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
     dual_dag_config = _dual_dag_config(enable_dual_dag_task_selection)
-    task, graph = _task_graph_from_config(launch_config)
-    action_log: dict = {}
+    tasks, graph = _task_graph_from_config(launch_config)
+    action_log: dict = _fixture_action_log(launch_config)
     score: dict = {}
     error = None
 
@@ -51,13 +52,20 @@ def run_minecraft_experiment(
 
     artifact = build_minecraft_dual_dag_artifact(
         action_log=action_log,
-        tasks=[task],
+        tasks=tasks,
         graph=graph,
     )
     decision_support = build_minecraft_runtime_decision_support(
         artifact,
-        candidate_tasks=[task],
+        candidate_tasks=tasks,
     )
+    ranked = rank_minecraft_runtime_tasks(
+        tasks,
+        graph=graph,
+        action_log=action_log,
+        config=dual_dag_config,
+    )
+    ranked_tasks = ranked.get("tasks", tasks)
     task_graph_snapshot = _task_graph_snapshot(graph)
     summary = {
         "run_name": selected_run_name,
@@ -72,6 +80,11 @@ def run_minecraft_experiment(
         "mutates_runtime": False,
         "artifact_summary": artifact.get("summary", {}),
         "recommended_task_id": decision_support.get("recommended_task_id", ""),
+        "recommended_description": decision_support.get("recommended_description", ""),
+        "task_order": _task_order(tasks),
+        "ranked_task_order": _task_order(ranked_tasks),
+        "selected_task_id": _task_id(ranked_tasks[0]) if ranked_tasks else "",
+        "selected_description": ranked_tasks[0].description if ranked_tasks else "",
         "final_score": sanitize_public_value(score),
         "progress": _progress_from_score(score),
         "error": error,
@@ -144,18 +157,34 @@ def _execute_real_runtime(launch_config: dict, *, dual_dag_config: dict) -> None
     )
 
 
-def _task_graph_from_config(config: dict) -> tuple[Task, Graph]:
-    task = Task(config.get("task_goal", config.get("task_name", "Minecraft task")), {
+def _task_graph_from_config(config: dict) -> tuple[list[Task], Graph]:
+    task_configs = config.get("smoke_tasks")
+    if isinstance(task_configs, list) and task_configs:
+        tasks = [_task_from_config(config, task_config) for task_config in task_configs]
+    else:
+        tasks = [_task_from_config(config, {
+            "description": config.get("task_goal", config.get("task_name", "Minecraft task")),
+        })]
+    graph = Graph()
+    for task in tasks:
+        graph.add_node(task)
+    return tasks, graph
+
+
+def _task_from_config(config: dict, task_config: dict) -> Task:
+    task = Task(task_config.get("description", "Minecraft task"), {
         "task_name": config.get("task_name", ""),
         "task_type": config.get("task_type", ""),
         "task_idx": config.get("task_idx"),
+        "smoke_task_id": task_config.get("id", ""),
     })
+    if task_config.get("id"):
+        task.id = str(task_config["id"])
     agent_num = int(config.get("agent_num", 0) or 0)
-    task.candidate_list = _agent_names(agent_num)
-    task.number = max(1, min(agent_num, 1))
-    graph = Graph()
-    graph.add_node(task)
-    return task, graph
+    task.candidate_list = task_config.get("candidate_agents") or _agent_names(agent_num)
+    task._agent = task_config.get("assigned_agents", [])
+    task.number = int(task_config.get("number", max(1, min(agent_num, 1))))
+    return task
 
 
 def _task_graph_snapshot(graph: Graph) -> dict:
@@ -171,6 +200,22 @@ def _task_graph_snapshot(graph: Graph) -> dict:
 
 def _dual_dag_config(enabled: bool) -> dict:
     return {"runtime_task_selection": {"enabled": enabled}}
+
+
+def _fixture_action_log(config: dict) -> dict:
+    action_log = config.get("smoke_action_log", {})
+    return action_log if isinstance(action_log, dict) else {}
+
+
+def _task_order(tasks: list[Task]) -> list[dict]:
+    return [
+        {"task_id": _task_id(task), "description": task.description}
+        for task in tasks
+    ]
+
+
+def _task_id(task: Task) -> str:
+    return f"minecraft:task:{task.id}"
 
 
 def _agent_names(agent_num: int) -> list[str]:
