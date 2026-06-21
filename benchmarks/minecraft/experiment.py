@@ -3,6 +3,7 @@ import json
 import time
 from pathlib import Path
 
+from benchmarks.minecraft.metrics import build_minecraft_metrics
 from env.minecraft_dual_dag import (
     build_minecraft_dual_dag_artifact,
     build_minecraft_runtime_decision_support,
@@ -89,12 +90,19 @@ def run_minecraft_experiment(
         "progress": _progress_from_score(score),
         "error": error,
     }
+    metrics = build_minecraft_metrics(
+        summary=summary,
+        action_log=action_log,
+        task_graph_snapshot=task_graph_snapshot,
+        decision_support=decision_support,
+    )
 
     _write_json(output_dir / "launch_config.json", sanitize_public_value(launch_config))
     _write_json(output_dir / "action_log.json", sanitize_public_value(action_log))
     _write_json(output_dir / "task_graph_snapshot.json", task_graph_snapshot)
     _write_json(output_dir / "dual_dag_artifact.json", artifact)
     _write_json(output_dir / "decision_support.json", decision_support)
+    _write_json(output_dir / "metrics.json", metrics)
     _write_json(output_dir / "summary.json", summary)
     return summary
 

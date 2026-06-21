@@ -1,6 +1,7 @@
 import json
 
 from benchmarks.minecraft.experiment import run_minecraft_experiment
+from benchmarks.minecraft.metrics import build_minecraft_metrics
 
 
 def test_minecraft_experiment_dry_run_writes_expected_artifacts(tmp_path):
@@ -37,6 +38,7 @@ def test_minecraft_experiment_dry_run_writes_expected_artifacts(tmp_path):
     assert (output_dir / "task_graph_snapshot.json").exists()
     assert (output_dir / "dual_dag_artifact.json").exists()
     assert (output_dir / "decision_support.json").exists()
+    assert (output_dir / "metrics.json").exists()
     assert (output_dir / "summary.json").exists()
 
     launch_config = json.loads((output_dir / "launch_config.json").read_text(encoding="utf-8"))
@@ -144,3 +146,45 @@ def test_minecraft_experiment_records_enabled_task_reordering(tmp_path):
     assert enabled["ranked_task_order"][0]["description"] == "Find chest"
     assert enabled["task_order"] != enabled["ranked_task_order"]
     assert enabled["recommended_description"] == "Find chest"
+
+
+def test_minecraft_metrics_extracts_representative_counts_without_secrets():
+    metrics = build_minecraft_metrics(
+        summary={
+            "run_name": "metrics",
+            "mode": "dry_run",
+            "recommended_task_id": "minecraft:task:find_chest",
+            "selected_task_id": "minecraft:task:find_chest",
+            "progress": 0.5,
+            "api_key": "secret",
+        },
+        action_log={
+            "Alice": [{
+                "action": "openContainer",
+                "duration": 2.0,
+                "kwargs": {"api_key": "secret"},
+                "result": {"status": False, "message": "retry after locked door"},
+            }],
+            "Bob": [{
+                "action": "talkTo",
+                "duration": 3.0,
+                "result": {"status": True},
+            }],
+        },
+        task_graph_snapshot={
+            "tasks": [
+                {"description": "Open locked door", "status": "failure"},
+                {"description": "Find chest", "status": "success"},
+            ]
+        },
+        decision_support={"mutates_runtime": False},
+    )
+
+    assert metrics["schema_version"] == "1.0.0"
+    assert metrics["task_completion_rate"] == 0.5
+    assert metrics["action_count"] == 2
+    assert metrics["failed_action_count"] == 1
+    assert metrics["retry_replan_count"] == 1
+    assert metrics["time_to_completion"] == 5.0
+    assert metrics["recommendation_adopted_count"] == 1
+    assert "api_key" not in json.dumps(metrics)
