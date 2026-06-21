@@ -1,0 +1,30 @@
+experiment:
+  name: craft_gemma4_12b_progress_full
+  description: Full progress evaluation manifest; run only when compute budget is available.
+  result_root: result/craft
+  continue_on_error: true
+  overrides:
+    structures: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    turns: 20
+    run_name_suffix: _progress_full
+  runs:
+    - config: configs/craft/official_baseline_gemma4_12b_ollama.yaml
+      suffix: _official
+      seeds: [1, 3, 5, 7, 11]
+      structures: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    - config: configs/craft/eval_gemma4_12b_ollama.yaml
+      suffix: _baseline
+      seeds: [1, 3, 5, 7, 11]
+      structures: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    - config: configs/craft/eval_gemma4_12b_ollama_dual_dag.yaml
+      suffix: _dual_dag
+      seeds: [1, 3, 5, 7, 11]
+      structures: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+  report:
+    output: result/craft/comparison_gemma4_12b_progress_full.csv
+    json_output: result/craft/comparison_gemma4_12b_progress_full.json
+    compact_summary_output: result/craft/summary_gemma4_12b_progress_full.csv
+    compact_summary_json_output: result/craft/summary_gemma4_12b_progress_full.json
+    variance_summary_output: result/craft/variance_gemma4_12b_progress_full.csv
+    variance_summary_json_output: result/craft/variance_gemma4_12b_progress_full.json
+    variance_group_by: run_group

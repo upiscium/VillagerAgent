@@ -24,6 +24,9 @@ def test_experiment_summary_combines_runtime_and_analysis_metrics(tmp_path):
     assert rows[0]["seed"] == 3
     assert rows[0]["structures"] == "0,1"
     assert rows[0]["mean_final_progress"] == 0.25
+    assert rows[0]["progress_auc"] == 0.3
+    assert rows[0]["physical_action_count"] == 2
+    assert rows[0]["mean_progress_delta_per_physical_action"] == 0.2
     assert rows[0]["clarification_resolution_rate"] == 0.5
     assert rows[0]["mean_clarification_quality_score"] == 0.75
     assert rows[0]["claim_required_evidence_count"] == 3
@@ -101,6 +104,34 @@ def test_experiment_summary_includes_failed_run_status(tmp_path):
     assert rows[0]["leakage_passed"] is False
 
 
+def test_experiment_summary_derives_progress_action_metrics_from_turns_jsonl(tmp_path):
+    normalized = tmp_path / "craft_old_artifact" / "normalized"
+    normalized.mkdir(parents=True)
+    summary = {
+        "run_name": "craft_old_artifact",
+        "condition": "villageragent_directors",
+        "seed": 3,
+        "structures": [0],
+        "mean_final_progress": 0.4,
+        "completion_rate": 0.0,
+        "runtime": {},
+    }
+    (normalized / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    with (normalized / "turns.jsonl").open("w", encoding="utf-8") as f:
+        f.write(json.dumps({"builder_action": {"action": "place"}, "progress": {"overall_progress": 0.2}}) + "\n")
+        f.write(json.dumps({"builder_action": {"action": "remove"}, "progress": {"overall_progress": 0.4}}) + "\n")
+    with (normalized / "metrics.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["leakage_passed"])
+        writer.writeheader()
+        writer.writerow({"leakage_passed": "True"})
+
+    rows = build_experiment_summary(["craft_old_artifact"], result_root=tmp_path)
+
+    assert rows[0]["progress_auc"] == 0.30000000000000004
+    assert rows[0]["physical_action_count"] == 2
+    assert rows[0]["mean_progress_delta_per_physical_action"] == 0.2
+
+
 def test_variance_summary_groups_completed_runs_and_records_failures(tmp_path):
     _write_run(tmp_path, "craft_dual_dag_seed1", leakage_values=["True"], seed=1, progress=0.2)
     _write_run(tmp_path, "craft_dual_dag_seed3", leakage_values=["True"], seed=3, progress=0.4)
@@ -166,6 +197,21 @@ def _write_run(
         "completion_rate": 0.0,
         "runtime": {
             "builder_fallback_rate": 0.2,
+            "max_progress": 0.4,
+            "progress_auc": 0.3,
+            "physical_action_count": 2,
+            "place_action_count": 1,
+            "remove_action_count": 1,
+            "clarify_count": 1,
+            "wait_count": 0,
+            "fallback_count": 0,
+            "no_op_count": 0,
+            "invalid_action_count": 0,
+            "positive_progress_turn_count": 2,
+            "zero_progress_turn_count": 1,
+            "negative_progress_turn_count": 0,
+            "mean_progress_delta_per_turn": 0.1,
+            "mean_progress_delta_per_physical_action": 0.2,
             "gated_clarification_rate": 0.1,
             "clarification_resolution_rate": 0.5,
             "mean_clarification_quality_score": 0.75,

@@ -1,3 +1,4 @@
+import csv
 import json
 
 from benchmarks.craft.result_converter import normalize_results
@@ -271,6 +272,57 @@ def test_result_converter_tracks_clarification_resolution_and_progress_delta(tmp
     assert summary["runtime"]["mean_clarification_quality_score"] == 1.0
     assert summary["runtime"]["mean_post_clarification_progress_delta"] == 0.30000000000000004
     assert "clarification_resolution_rate" in metrics_text
+
+
+def test_result_converter_tracks_progress_and_action_throughput(tmp_path):
+    config = {
+        "run": {"name": "test", "seed": 3, "structures": [0], "turns": 4},
+        "models": {"director": {"model": "d"}, "builder": {"model": "b"}},
+        "villageragent": {"enabled": True},
+    }
+    normalize_results(
+        config=config,
+        condition="villageragent_directors",
+        raw_result={
+            "structure_id": 0,
+            "turns": [
+                {"builder_action": {"action": "place"}, "progress": {"overall_progress": 0.2}},
+                {"builder_action": {"action": "clarify"}, "progress": {"overall_progress": 0.2}},
+                {"builder_action": {"action": "remove"}, "progress": {"overall_progress": 0.1}},
+                {
+                    "builder_action": {
+                        "action": "wait_for_evidence",
+                        "_builder_fallback": "fallback",
+                        "_invalid_action": True,
+                    },
+                    "progress": {"overall_progress": 0.4},
+                },
+            ],
+            "final_progress": 0.4,
+            "completed": False,
+        },
+        output_dir=tmp_path,
+    )
+
+    summary = json.loads((tmp_path / "normalized" / "summary.json").read_text())
+    with (tmp_path / "normalized" / "metrics.csv").open("r", encoding="utf-8", newline="") as f:
+        metrics = next(csv.DictReader(f))
+    assert summary["runtime"]["max_progress"] == 0.4
+    assert summary["runtime"]["progress_auc"] == 0.225
+    assert summary["runtime"]["physical_action_count"] == 2
+    assert summary["runtime"]["place_action_count"] == 1
+    assert summary["runtime"]["remove_action_count"] == 1
+    assert summary["runtime"]["clarify_count"] == 1
+    assert summary["runtime"]["wait_count"] == 1
+    assert summary["runtime"]["fallback_count"] == 1
+    assert summary["runtime"]["invalid_action_count"] == 1
+    assert summary["runtime"]["positive_progress_turn_count"] == 2
+    assert summary["runtime"]["zero_progress_turn_count"] == 1
+    assert summary["runtime"]["negative_progress_turn_count"] == 1
+    assert summary["runtime"]["mean_progress_delta_per_turn"] == 0.1
+    assert summary["runtime"]["mean_progress_delta_per_physical_action"] == 0.2
+    assert metrics["progress_auc"] == "0.225"
+    assert metrics["mean_progress_delta_per_physical_action"] == "0.2"
 
 
 def test_result_converter_writes_dual_dag_artifacts(tmp_path):

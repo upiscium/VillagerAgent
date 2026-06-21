@@ -27,6 +27,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
     epistemic_counts = _epistemic_counts(turns)
     action_candidate_metrics = _action_candidate_metrics(turns)
     clarification_metrics = _clarification_metrics(turns)
+    progress_action_metrics = _aggregate_progress_action_metrics(games)
     dual_dag_metrics = _dual_dag_metrics(games)
     hypothesis_count = max(
         epistemic_counts["hypothesis_count"],
@@ -60,6 +61,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
             "hypothesis_count": hypothesis_count,
             **action_candidate_metrics,
             **clarification_metrics,
+            **progress_action_metrics,
             **dual_dag_metrics,
         },
         "villageragent": {
@@ -99,6 +101,21 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
         "active_director_count",
         "builder_fallback_count",
         "builder_fallback_rate",
+        "max_progress",
+        "progress_auc",
+        "physical_action_count",
+        "place_action_count",
+        "remove_action_count",
+        "clarify_count",
+        "wait_count",
+        "fallback_count",
+        "no_op_count",
+        "invalid_action_count",
+        "positive_progress_turn_count",
+        "zero_progress_turn_count",
+        "negative_progress_turn_count",
+        "mean_progress_delta_per_turn",
+        "mean_progress_delta_per_physical_action",
         "observed_fact_count",
         "reported_claim_count",
         "hypothesis_count",
@@ -147,6 +164,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
             game_epistemic_counts = _epistemic_counts(game.get("turns", []))
             game_action_candidate_metrics = _action_candidate_metrics(game.get("turns", []))
             game_clarification_metrics = _clarification_metrics(game.get("turns", []))
+            game_progress_action_metrics = _progress_action_metrics(game)
             game_dual_dag_metrics = _dual_dag_metrics([game])
             game_hypothesis_count = max(
                 game_epistemic_counts["hypothesis_count"],
@@ -172,6 +190,21 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
                     if (turn.get("builder_action") or {}).get("_builder_fallback")
                 ),
                 "builder_fallback_rate": _fallback_rate(game.get("turns", [])),
+                "max_progress": game_progress_action_metrics["max_progress"],
+                "progress_auc": game_progress_action_metrics["progress_auc"],
+                "physical_action_count": game_progress_action_metrics["physical_action_count"],
+                "place_action_count": game_progress_action_metrics["place_action_count"],
+                "remove_action_count": game_progress_action_metrics["remove_action_count"],
+                "clarify_count": game_progress_action_metrics["clarify_count"],
+                "wait_count": game_progress_action_metrics["wait_count"],
+                "fallback_count": game_progress_action_metrics["fallback_count"],
+                "no_op_count": game_progress_action_metrics["no_op_count"],
+                "invalid_action_count": game_progress_action_metrics["invalid_action_count"],
+                "positive_progress_turn_count": game_progress_action_metrics["positive_progress_turn_count"],
+                "zero_progress_turn_count": game_progress_action_metrics["zero_progress_turn_count"],
+                "negative_progress_turn_count": game_progress_action_metrics["negative_progress_turn_count"],
+                "mean_progress_delta_per_turn": game_progress_action_metrics["mean_progress_delta_per_turn"],
+                "mean_progress_delta_per_physical_action": game_progress_action_metrics["mean_progress_delta_per_physical_action"],
                 "observed_fact_count": game_epistemic_counts["observed_fact_count"],
                 "reported_claim_count": game_epistemic_counts["reported_claim_count"],
                 "hypothesis_count": game_hypothesis_count,
@@ -248,6 +281,121 @@ def _fallback_rate(turns: list[dict]) -> float:
         1 for turn in turns if (turn.get("builder_action") or {}).get("_builder_fallback")
     )
     return fallback_count / len(turns)
+
+
+def _aggregate_progress_action_metrics(games: list[dict]) -> dict:
+    game_metrics = [_progress_action_metrics(game) for game in games]
+    if not game_metrics:
+        return _empty_progress_action_metrics()
+    total_physical_actions = sum(metric["physical_action_count"] for metric in game_metrics)
+    total_progress_delta = sum(metric["total_progress_delta"] for metric in game_metrics)
+    return {
+        "max_progress": _mean([metric["max_progress"] for metric in game_metrics]),
+        "progress_auc": _mean([metric["progress_auc"] for metric in game_metrics]),
+        "physical_action_count": sum(metric["physical_action_count"] for metric in game_metrics),
+        "place_action_count": sum(metric["place_action_count"] for metric in game_metrics),
+        "remove_action_count": sum(metric["remove_action_count"] for metric in game_metrics),
+        "clarify_count": sum(metric["clarify_count"] for metric in game_metrics),
+        "wait_count": sum(metric["wait_count"] for metric in game_metrics),
+        "fallback_count": sum(metric["fallback_count"] for metric in game_metrics),
+        "no_op_count": sum(metric["no_op_count"] for metric in game_metrics),
+        "invalid_action_count": sum(metric["invalid_action_count"] for metric in game_metrics),
+        "positive_progress_turn_count": sum(metric["positive_progress_turn_count"] for metric in game_metrics),
+        "zero_progress_turn_count": sum(metric["zero_progress_turn_count"] for metric in game_metrics),
+        "negative_progress_turn_count": sum(metric["negative_progress_turn_count"] for metric in game_metrics),
+        "mean_progress_delta_per_turn": _mean([
+            metric["mean_progress_delta_per_turn"] for metric in game_metrics
+        ]),
+        "mean_progress_delta_per_physical_action": (
+            total_progress_delta / total_physical_actions if total_physical_actions else 0.0
+        ),
+    }
+
+
+def _progress_action_metrics(game: dict) -> dict:
+    turns = game.get("turns", []) or []
+    progress_values = [_progress_value(turn.get("progress")) for turn in turns]
+    if not progress_values and "final_progress" in game:
+        progress_values = [_metadata_float(game, "final_progress")]
+    deltas = []
+    previous_progress = 0.0
+    for progress in progress_values:
+        deltas.append(progress - previous_progress)
+        previous_progress = progress
+
+    action_counts = _action_throughput_counts(turns)
+    total_progress_delta = sum(deltas)
+    physical_action_count = action_counts["physical_action_count"]
+    return {
+        "max_progress": max(progress_values) if progress_values else 0.0,
+        "progress_auc": _mean(progress_values),
+        **action_counts,
+        "positive_progress_turn_count": sum(1 for delta in deltas if delta > 0.0),
+        "zero_progress_turn_count": sum(1 for delta in deltas if delta == 0.0),
+        "negative_progress_turn_count": sum(1 for delta in deltas if delta < 0.0),
+        "mean_progress_delta_per_turn": _mean(deltas),
+        "mean_progress_delta_per_physical_action": (
+            total_progress_delta / physical_action_count if physical_action_count else 0.0
+        ),
+        "total_progress_delta": total_progress_delta,
+    }
+
+
+def _action_throughput_counts(turns: list[dict]) -> dict:
+    counts = {
+        "physical_action_count": 0,
+        "place_action_count": 0,
+        "remove_action_count": 0,
+        "clarify_count": 0,
+        "wait_count": 0,
+        "fallback_count": 0,
+        "no_op_count": 0,
+        "invalid_action_count": 0,
+    }
+    for turn in turns:
+        action = turn.get("builder_action") or {}
+        action_type = str(action.get("action", "") or "").lower()
+        if action.get("_builder_fallback"):
+            counts["fallback_count"] += 1
+        if action.get("invalid") or action.get("_invalid_action") or action_type == "invalid":
+            counts["invalid_action_count"] += 1
+        if action_type == "place":
+            counts["place_action_count"] += 1
+            counts["physical_action_count"] += 1
+        elif action_type == "remove":
+            counts["remove_action_count"] += 1
+            counts["physical_action_count"] += 1
+        elif action_type == "clarify":
+            counts["clarify_count"] += 1
+        elif action_type == "wait_for_evidence":
+            counts["wait_count"] += 1
+        elif action_type in {"", "noop", "no_op", "none"}:
+            counts["no_op_count"] += 1
+    return counts
+
+
+def _empty_progress_action_metrics() -> dict:
+    return {
+        "max_progress": 0.0,
+        "progress_auc": 0.0,
+        "physical_action_count": 0,
+        "place_action_count": 0,
+        "remove_action_count": 0,
+        "clarify_count": 0,
+        "wait_count": 0,
+        "fallback_count": 0,
+        "no_op_count": 0,
+        "invalid_action_count": 0,
+        "positive_progress_turn_count": 0,
+        "zero_progress_turn_count": 0,
+        "negative_progress_turn_count": 0,
+        "mean_progress_delta_per_turn": 0.0,
+        "mean_progress_delta_per_physical_action": 0.0,
+    }
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
 
 
 def _epistemic_counts(turns: list[dict]) -> dict:

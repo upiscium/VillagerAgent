@@ -1,5 +1,6 @@
 experiment:
   name: craft_gemma4_12b_progress_large
+  description: Historical 5-turn diagnostic smoke manifest; use gemma4_12b_progress_full.yaml for final progress evaluation.
   result_root: result/craft
   continue_on_error: true
   overrides:
@@ -26,4 +27,4 @@ experiment:
     compact_summary_json_output: result/craft/summary_gemma4_12b_progress_large.json
     variance_summary_output: result/craft/variance_gemma4_12b_progress_large.csv
     variance_summary_json_output: result/craft/variance_gemma4_12b_progress_large.json
-    variance_group_by: condition
+    variance_group_by: run_group

@@ -44,6 +44,9 @@ def test_report_aggregates_multiple_runs(tmp_path):
     assert rows[1]["use_state_manager"] is True
     assert rows[1]["builder_fallback_count"] == 1
     assert rows[1]["builder_fallback_rate"] == 1.0
+    assert rows[1]["progress_auc"] == 0.3
+    assert rows[1]["physical_action_count"] == 2
+    assert rows[1]["mean_progress_delta_per_physical_action"] == 0.2
     assert rows[1]["mean_action_confidence"] == 0.6
     assert rows[1]["claim_support_count"] == 2
     assert rows[1]["claim_required_evidence_count"] == 3
@@ -118,6 +121,9 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
             fieldnames=[
                 "leakage_passed",
                 "mean_action_confidence",
+                "progress_auc",
+                "physical_action_count",
+                "mean_progress_delta_per_physical_action",
                 "claim_support_count",
                 "claim_required_evidence_count",
                 "resolved_fact_count",
@@ -137,6 +143,9 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
             writer.writerow({
                 "leakage_passed": value,
                 "mean_action_confidence": "0.6",
+                "progress_auc": "0.3",
+                "physical_action_count": "2",
+                "mean_progress_delta_per_physical_action": "0.2",
                 "claim_support_count": "2",
                 "claim_required_evidence_count": "3",
                 "resolved_fact_count": "2",
