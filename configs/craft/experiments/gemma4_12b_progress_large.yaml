@@ -1,0 +1,25 @@
+experiment:
+  name: craft_gemma4_12b_progress_large
+  result_root: result/craft
+  continue_on_error: true
+  overrides:
+    structures: [0, 1, 2, 3, 4]
+    turns: 5
+    run_name_suffix: _progress_large
+  runs:
+    - config: configs/craft/eval_gemma4_12b_ollama.yaml
+      suffix: _baseline
+      seeds: [1, 3, 5]
+      structures: [0, 1, 2, 3, 4]
+    - config: configs/craft/eval_gemma4_12b_ollama_dual_dag.yaml
+      suffix: _dual_dag
+      seeds: [1, 3, 5]
+      structures: [0, 1, 2, 3, 4]
+  report:
+    output: result/craft/comparison_gemma4_12b_progress_large.csv
+    json_output: result/craft/comparison_gemma4_12b_progress_large.json
+    compact_summary_output: result/craft/summary_gemma4_12b_progress_large.csv
+    compact_summary_json_output: result/craft/summary_gemma4_12b_progress_large.json
+    variance_summary_output: result/craft/variance_gemma4_12b_progress_large.csv
+    variance_summary_json_output: result/craft/variance_gemma4_12b_progress_large.json
+    variance_group_by: condition
