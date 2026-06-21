@@ -40,9 +40,41 @@ def test_minecraft_experiment_dry_run_writes_expected_artifacts(tmp_path):
     assert (output_dir / "decision_support.json").exists()
     assert (output_dir / "metrics.json").exists()
     assert (output_dir / "summary.json").exists()
+    assert (output_dir / "command.txt").exists()
+    assert (output_dir / "config.resolved.json").exists()
+    assert (output_dir / "provenance.json").exists()
 
     launch_config = json.loads((output_dir / "launch_config.json").read_text(encoding="utf-8"))
     assert "api_key" not in launch_config
+    provenance = json.loads((output_dir / "provenance.json").read_text(encoding="utf-8"))
+    assert provenance["benchmark"] == "minecraft"
+    assert provenance["schema_version"] == "1.0.0"
+
+
+def test_minecraft_experiment_sanitizes_run_names(tmp_path):
+    config_path = tmp_path / "minecraft_config.json"
+    config_path.write_text(
+        json.dumps({
+            "task_type": "meta",
+            "task_idx": 0,
+            "agent_num": 1,
+            "task_goal": "Find the village bell",
+            "host": "127.0.0.1",
+            "port": 25565,
+            "task_name": "ignored",
+        }),
+        encoding="utf-8",
+    )
+
+    summary = run_minecraft_experiment(
+        config_path=config_path,
+        output_root=tmp_path / "result",
+        run_name="minecraft enabled local seed0 issue/109 smoke",
+        command_text="python -m benchmarks.minecraft.experiment --config minecraft_config.json",
+    )
+
+    assert summary["run_name"] == "minecraft_enabled_local_seed0_issue_109_smoke"
+    assert (tmp_path / "result" / summary["run_name"] / "command.txt").exists()
 
 
 def test_minecraft_experiment_accepts_config_lists(tmp_path):

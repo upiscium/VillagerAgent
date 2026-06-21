@@ -1,4 +1,5 @@
 import copy
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -170,3 +171,6 @@ def save_resolved_config(config: dict, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / "config.resolved.yaml").open("w", encoding="utf-8") as f:
         yaml.safe_dump(config, f, sort_keys=False, allow_unicode=True)
+    with (output_dir / "config.resolved.json").open("w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")

@@ -3,6 +3,7 @@ import json
 import time
 from pathlib import Path
 
+from benchmarks.experiment_provenance import standard_run_name, write_provenance
 from benchmarks.minecraft.metrics import build_minecraft_metrics
 from env.minecraft_dual_dag import (
     build_minecraft_dual_dag_artifact,
@@ -24,6 +25,7 @@ def run_minecraft_experiment(
     config_index: int = 0,
     enable_dual_dag_task_selection: bool = False,
     execute: bool = False,
+    command_text: str | None = None,
 ) -> dict:
     """Run or dry-run a Minecraft experiment and write normalized artifacts.
 
@@ -32,7 +34,7 @@ def run_minecraft_experiment(
     runtime and then captures the same public artifact set from the run outputs.
     """
     launch_config = _load_config(config_path, config_index=config_index)
-    selected_run_name = run_name or launch_config.get("task_name") or _default_run_name(config_path)
+    selected_run_name = standard_run_name(run_name or launch_config.get("task_name") or _default_run_name(config_path))
     output_dir = Path(output_root) / selected_run_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -104,6 +106,13 @@ def run_minecraft_experiment(
     _write_json(output_dir / "decision_support.json", decision_support)
     _write_json(output_dir / "metrics.json", metrics)
     _write_json(output_dir / "summary.json", summary)
+    write_provenance(
+        output_dir,
+        benchmark="minecraft",
+        command=command_text or _command_text(),
+        resolved_config=sanitize_public_value(launch_config),
+        environment_notes="real_environment_execute=" + str(bool(execute)).lower(),
+    )
     return summary
 
 
@@ -124,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         config_index=args.config_index,
         enable_dual_dag_task_selection=args.dual_dag_task_selection,
         execute=args.execute,
+        command_text=_command_text(args),
     )
     print(json.dumps(summary, indent=2))
     return 0 if summary.get("error") is None else 1
@@ -242,6 +252,23 @@ def _progress_from_score(score: dict):
 
 def _default_run_name(config_path: str | Path) -> str:
     return f"minecraft_experiment_{Path(config_path).stem}"
+
+
+def _command_text(args: argparse.Namespace | None = None) -> str:
+    if args is None:
+        return "python -m benchmarks.minecraft.experiment"
+    parts = ["python -m benchmarks.minecraft.experiment", "--config", args.config]
+    if args.output_root != str(DEFAULT_OUTPUT_ROOT):
+        parts.extend(["--output-root", args.output_root])
+    if args.run_name:
+        parts.extend(["--run-name", args.run_name])
+    if args.config_index:
+        parts.extend(["--config-index", str(args.config_index)])
+    if args.dual_dag_task_selection:
+        parts.append("--dual-dag-task-selection")
+    if args.execute:
+        parts.append("--execute")
+    return " ".join(parts)
 
 
 def _read_json(path: Path, *, default):

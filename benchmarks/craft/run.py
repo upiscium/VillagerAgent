@@ -11,6 +11,7 @@ from benchmarks.craft.config import (
 from benchmarks.craft.adapters.ollama_preflight import preflight_ollama_model
 from benchmarks.craft.craft_env_adapter import CraftEnvAdapter
 from benchmarks.craft.result_converter import normalize_results
+from benchmarks.experiment_provenance import write_provenance
 
 
 CONDITIONS = {"official_baseline", "villageragent_directors", "single_director_ablation"}
@@ -31,12 +32,6 @@ def _structure_override(value: str | None) -> list[int] | None:
     if value is None:
         return None
     return [int(part) for part in value.split(",") if part.strip()]
-
-
-def _write_command_text(output_dir: Path, command: str) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "command.txt").write_text(command + "\n", encoding="utf-8")
-
 
 def _print_dry_run(config: dict, condition: str, output_dir: Path) -> None:
     print("Benchmark: CRAFT")
@@ -99,8 +94,13 @@ def run_config(
         _require_runtime_api_keys(config)
     output_dir = output_dir_for_config(config)
     save_resolved_config(config, output_dir)
-    if command_text:
-        _write_command_text(output_dir, command_text)
+    write_provenance(
+        output_dir,
+        benchmark="craft",
+        command=command_text or _default_command_text(config_path, dry_run=dry_run, overrides=overrides),
+        resolved_config=config,
+        environment_notes=f"condition={condition}",
+    )
     (output_dir / "logs").mkdir(parents=True, exist_ok=True)
     (output_dir / "raw").mkdir(parents=True, exist_ok=True)
     (output_dir / "normalized").mkdir(parents=True, exist_ok=True)
@@ -120,6 +120,23 @@ def run_config(
         output_dir=output_dir,
     )
     return output_dir
+
+
+def _default_command_text(config_path: str, *, dry_run: bool, overrides: dict | None) -> str:
+    command = "python -m benchmarks.craft.run --config " + config_path
+    if dry_run:
+        command += " --dry-run"
+    if not overrides:
+        return command
+    if overrides.get("structures") is not None:
+        command += " --structure " + ",".join(str(item) for item in overrides["structures"])
+    if overrides.get("turns") is not None:
+        command += f" --turns {overrides['turns']}"
+    if overrides.get("seed") is not None:
+        command += f" --seed {overrides['seed']}"
+    if overrides.get("condition") is not None:
+        command += f" --condition {overrides['condition']}"
+    return command
 
 
 def main() -> None:
