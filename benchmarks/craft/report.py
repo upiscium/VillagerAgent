@@ -6,6 +6,7 @@ from pathlib import Path
 import yaml
 
 from benchmarks.craft.config import repo_root
+from benchmarks.craft.result_converter import _progress_action_metrics
 
 
 REPORT_FIELDS = [
@@ -28,6 +29,21 @@ REPORT_FIELDS = [
     "active_director_count",
     "builder_fallback_count",
     "builder_fallback_rate",
+    "max_progress",
+    "progress_auc",
+    "physical_action_count",
+    "place_action_count",
+    "remove_action_count",
+    "clarify_count",
+    "wait_count",
+    "fallback_count",
+    "no_op_count",
+    "invalid_action_count",
+    "positive_progress_turn_count",
+    "zero_progress_turn_count",
+    "negative_progress_turn_count",
+    "mean_progress_delta_per_turn",
+    "mean_progress_delta_per_physical_action",
     "observed_fact_count",
     "reported_claim_count",
     "hypothesis_count",
@@ -95,6 +111,11 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
     )
     condition = summary.get("condition", "")
     runtime = summary.get("runtime", {})
+    turns_path = run_dir / "normalized" / "turns.jsonl"
+    progress_action_metrics = _progress_action_metrics({
+        "turns": _read_turns(turns_path),
+        "final_progress": summary.get("mean_final_progress", 0.0),
+    })
     active_directors = runtime.get("active_directors") or _active_directors_from_config(
         resolved_config,
         condition,
@@ -121,11 +142,71 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
         "active_director_count": runtime.get("active_director_count", len(active_directors)),
         "builder_fallback_count": runtime.get(
             "builder_fallback_count",
-            _builder_fallback_count(run_dir / "normalized" / "turns.jsonl"),
+            _builder_fallback_count(turns_path),
         ),
         "builder_fallback_rate": runtime.get(
             "builder_fallback_rate",
-            _builder_fallback_rate(run_dir / "normalized" / "turns.jsonl"),
+            _builder_fallback_rate(turns_path),
+        ),
+        "max_progress": runtime.get(
+            "max_progress",
+            _mean_metric_rows_or_default(metrics_rows, "max_progress", progress_action_metrics["max_progress"]),
+        ),
+        "progress_auc": runtime.get(
+            "progress_auc",
+            _mean_metric_rows_or_default(metrics_rows, "progress_auc", progress_action_metrics["progress_auc"]),
+        ),
+        "physical_action_count": runtime.get(
+            "physical_action_count",
+            _sum_metric_rows_or_default(metrics_rows, "physical_action_count", progress_action_metrics["physical_action_count"]),
+        ),
+        "place_action_count": runtime.get(
+            "place_action_count",
+            _sum_metric_rows_or_default(metrics_rows, "place_action_count", progress_action_metrics["place_action_count"]),
+        ),
+        "remove_action_count": runtime.get(
+            "remove_action_count",
+            _sum_metric_rows_or_default(metrics_rows, "remove_action_count", progress_action_metrics["remove_action_count"]),
+        ),
+        "clarify_count": runtime.get(
+            "clarify_count",
+            _sum_metric_rows_or_default(metrics_rows, "clarify_count", progress_action_metrics["clarify_count"]),
+        ),
+        "wait_count": runtime.get(
+            "wait_count",
+            _sum_metric_rows_or_default(metrics_rows, "wait_count", progress_action_metrics["wait_count"]),
+        ),
+        "fallback_count": runtime.get(
+            "fallback_count",
+            _sum_metric_rows_or_default(metrics_rows, "fallback_count", progress_action_metrics["fallback_count"]),
+        ),
+        "no_op_count": runtime.get(
+            "no_op_count",
+            _sum_metric_rows_or_default(metrics_rows, "no_op_count", progress_action_metrics["no_op_count"]),
+        ),
+        "invalid_action_count": runtime.get(
+            "invalid_action_count",
+            _sum_metric_rows_or_default(metrics_rows, "invalid_action_count", progress_action_metrics["invalid_action_count"]),
+        ),
+        "positive_progress_turn_count": runtime.get(
+            "positive_progress_turn_count",
+            _sum_metric_rows_or_default(metrics_rows, "positive_progress_turn_count", progress_action_metrics["positive_progress_turn_count"]),
+        ),
+        "zero_progress_turn_count": runtime.get(
+            "zero_progress_turn_count",
+            _sum_metric_rows_or_default(metrics_rows, "zero_progress_turn_count", progress_action_metrics["zero_progress_turn_count"]),
+        ),
+        "negative_progress_turn_count": runtime.get(
+            "negative_progress_turn_count",
+            _sum_metric_rows_or_default(metrics_rows, "negative_progress_turn_count", progress_action_metrics["negative_progress_turn_count"]),
+        ),
+        "mean_progress_delta_per_turn": runtime.get(
+            "mean_progress_delta_per_turn",
+            _mean_metric_rows_or_default(metrics_rows, "mean_progress_delta_per_turn", progress_action_metrics["mean_progress_delta_per_turn"]),
+        ),
+        "mean_progress_delta_per_physical_action": runtime.get(
+            "mean_progress_delta_per_physical_action",
+            _mean_metric_rows_or_default(metrics_rows, "mean_progress_delta_per_physical_action", progress_action_metrics["mean_progress_delta_per_physical_action"]),
         ),
         "observed_fact_count": runtime.get(
             "observed_fact_count",
@@ -329,6 +410,17 @@ def _read_metrics(metrics_path: Path) -> list[dict]:
         return list(csv.DictReader(f))
 
 
+def _read_turns(turns_path: Path) -> list[dict]:
+    if not turns_path.exists():
+        return []
+    turns = []
+    with turns_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                turns.append(json.loads(line))
+    return turns
+
+
 def _as_bool(value) -> bool:
     if isinstance(value, bool):
         return value
@@ -355,6 +447,22 @@ def _mean_metric_rows(rows: list[dict], field: str) -> float:
         except ValueError:
             continue
     return sum(values) / len(values) if values else 0.0
+
+
+def _sum_metric_rows_or_default(rows: list[dict], field: str, default: int) -> int:
+    if not _metric_field_exists(rows, field):
+        return default
+    return _sum_metric_rows(rows, field)
+
+
+def _mean_metric_rows_or_default(rows: list[dict], field: str, default: float) -> float:
+    if not _metric_field_exists(rows, field):
+        return default
+    return _mean_metric_rows(rows, field)
+
+
+def _metric_field_exists(rows: list[dict], field: str) -> bool:
+    return any(field in row for row in rows)
 
 
 def _load_resolved_config(config_path: Path) -> dict:

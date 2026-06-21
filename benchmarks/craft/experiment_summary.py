@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from benchmarks.craft.config import repo_root
+from benchmarks.craft.result_converter import _progress_action_metrics
 
 
 SUMMARY_FIELDS = [
@@ -18,6 +19,21 @@ SUMMARY_FIELDS = [
     "mean_final_progress",
     "completion_rate",
     "builder_fallback_rate",
+    "max_progress",
+    "progress_auc",
+    "physical_action_count",
+    "place_action_count",
+    "remove_action_count",
+    "clarify_count",
+    "wait_count",
+    "fallback_count",
+    "no_op_count",
+    "invalid_action_count",
+    "positive_progress_turn_count",
+    "zero_progress_turn_count",
+    "negative_progress_turn_count",
+    "mean_progress_delta_per_turn",
+    "mean_progress_delta_per_physical_action",
     "gated_clarification_rate",
     "clarification_resolution_rate",
     "mean_clarification_quality_score",
@@ -165,6 +181,10 @@ def _summarize_run(run_name: str, *, result_root: Path, analysis: dict | None = 
     status = summary.get("status") or runtime.get("status") or "completed"
     failure = summary.get("failure") or runtime.get("failure", {}) or {}
     analysis = analysis or _read_optional_json(normalized_dir / "dual_dag_analysis.json")
+    progress_action_metrics = _progress_action_metrics({
+        "turns": _read_turns(normalized_dir / "turns.jsonl"),
+        "final_progress": summary.get("mean_final_progress", 0.0),
+    })
     return {
         "run_name": summary.get("run_name", run_name),
         "run_group": _run_group(summary.get("run_name", run_name)),
@@ -177,6 +197,21 @@ def _summarize_run(run_name: str, *, result_root: Path, analysis: dict | None = 
         "mean_final_progress": summary.get("mean_final_progress", 0.0),
         "completion_rate": summary.get("completion_rate", 0.0),
         "builder_fallback_rate": runtime.get("builder_fallback_rate", 0.0),
+        "max_progress": runtime.get("max_progress", progress_action_metrics["max_progress"]),
+        "progress_auc": runtime.get("progress_auc", progress_action_metrics["progress_auc"]),
+        "physical_action_count": runtime.get("physical_action_count", progress_action_metrics["physical_action_count"]),
+        "place_action_count": runtime.get("place_action_count", progress_action_metrics["place_action_count"]),
+        "remove_action_count": runtime.get("remove_action_count", progress_action_metrics["remove_action_count"]),
+        "clarify_count": runtime.get("clarify_count", progress_action_metrics["clarify_count"]),
+        "wait_count": runtime.get("wait_count", progress_action_metrics["wait_count"]),
+        "fallback_count": runtime.get("fallback_count", progress_action_metrics["fallback_count"]),
+        "no_op_count": runtime.get("no_op_count", progress_action_metrics["no_op_count"]),
+        "invalid_action_count": runtime.get("invalid_action_count", progress_action_metrics["invalid_action_count"]),
+        "positive_progress_turn_count": runtime.get("positive_progress_turn_count", progress_action_metrics["positive_progress_turn_count"]),
+        "zero_progress_turn_count": runtime.get("zero_progress_turn_count", progress_action_metrics["zero_progress_turn_count"]),
+        "negative_progress_turn_count": runtime.get("negative_progress_turn_count", progress_action_metrics["negative_progress_turn_count"]),
+        "mean_progress_delta_per_turn": runtime.get("mean_progress_delta_per_turn", progress_action_metrics["mean_progress_delta_per_turn"]),
+        "mean_progress_delta_per_physical_action": runtime.get("mean_progress_delta_per_physical_action", progress_action_metrics["mean_progress_delta_per_physical_action"]),
         "gated_clarification_rate": runtime.get("gated_clarification_rate", 0.0),
         "clarification_resolution_rate": runtime.get("clarification_resolution_rate", 0.0),
         "mean_clarification_quality_score": runtime.get("mean_clarification_quality_score", 0.0),
@@ -229,6 +264,17 @@ def _read_optional_json(path: Path) -> dict:
         return {}
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _read_turns(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    turns = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                turns.append(json.loads(line))
+    return turns
 
 
 def _analysis_by_run(path: Path) -> dict[str, dict]:

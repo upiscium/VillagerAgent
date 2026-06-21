@@ -6,7 +6,14 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 
 - `mean_final_progress`: Mean final progress across evaluated structures. This is the main task-performance score and estimates how closely the constructed structure matches the target.
 - `final_progress`: Per-structure final progress. This is the per-game value used to compute `mean_final_progress`.
+- `max_progress`: Maximum per-turn progress reached in an episode, averaged across games for run-level summaries.
+- `progress_auc`: Turn-normalized mean progress across observed turns. This is useful for comparing early progress within the same horizon without changing `mean_final_progress`.
 - `completion_rate`: Fraction of games that reached the complete-state condition. With short turn budgets this is usually low or zero.
+- `positive_progress_turn_count`: Number of turns with positive progress delta relative to the previous turn.
+- `zero_progress_turn_count`: Number of turns with no progress delta relative to the previous turn.
+- `negative_progress_turn_count`: Number of turns with negative progress delta relative to the previous turn.
+- `mean_progress_delta_per_turn`: Mean progress delta across observed turns.
+- `mean_progress_delta_per_physical_action`: Mean progress delta divided by physical `place`/`remove` action count. This helps separate action quality from action throughput.
 
 ## Runtime And Configuration
 
@@ -28,6 +35,14 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 
 - `builder_fallback_count`: Number of turns where the Builder output was incompatible with the verified candidates and the adapter fell back to an oracle-assisted candidate.
 - `builder_fallback_rate`: `builder_fallback_count / turn_count`. This measures how often the Builder failed to return an acceptable candidate response.
+- `physical_action_count`: Number of Builder turns that execute a physical `place` or `remove` action.
+- `place_action_count`: Number of physical `place` actions.
+- `remove_action_count`: Number of physical `remove` actions.
+- `clarify_count`: Number of Builder turns whose action is `clarify`.
+- `wait_count`: Number of Builder turns whose action is `wait_for_evidence`.
+- `fallback_count`: Number of Builder turns carrying fallback metadata. This is the action-throughput counterpart of `builder_fallback_count`.
+- `no_op_count`: Number of empty/no-op Builder action turns.
+- `invalid_action_count`: Number of Builder turns marked as invalid by runtime metadata.
 - `candidate_count`: Number of action candidates represented in metadata. With `oracle_n=1`, this is usually close to the number of turns.
 - `mean_action_confidence`: Mean confidence of the chosen action candidate. Confidence increases with supporting claims, decreases with hard conflicts, and receives a small boost for physically verified candidates.
 
@@ -83,7 +98,8 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 
 For paper-facing or quick inspection tables, focus on:
 
-- Task performance: `mean_final_progress`, `completion_rate`
+- Task performance: `mean_final_progress`, `max_progress`, `progress_auc`, `completion_rate`
+- Action throughput: `physical_action_count`, `clarify_count`, `wait_count`, `mean_progress_delta_per_turn`, `mean_progress_delta_per_physical_action`
 - Runtime stability: `builder_fallback_rate`, `gated_clarification_rate`, `clarification_resolution_rate`
 - Coordination quality: `claim_support_count`, `claim_conflict_count`, `claim_required_evidence_count`
 - Graph richness: `dual_dag_node_count`, `dual_dag_edge_count`, `supported_action_count`, `conflicted_action_count`, `required_evidence_action_count`

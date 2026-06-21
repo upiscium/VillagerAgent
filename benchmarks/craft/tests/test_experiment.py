@@ -78,6 +78,33 @@ def test_load_qwen_adaptive_gating_manifest():
     assert experiment["report"]["compact_summary_output"].endswith("summary_qwen_adaptive_gating_v1.csv")
 
 
+def test_load_gemma4_progress_smoke_manifest():
+    manifest = load_experiment("configs/craft/experiments/gemma4_12b_progress_smoke.yaml")
+    experiment = manifest["experiment"]
+    assert experiment["name"] == "craft_gemma4_12b_progress_smoke"
+    assert "Diagnostic smoke" in experiment["description"]
+    assert experiment["overrides"]["structures"] == [0, 1, 2, 3, 4]
+    assert experiment["overrides"]["turns"] == 5
+    assert experiment["report"]["variance_group_by"] == "run_group"
+    assert [run["suffix"] for run in experiment["runs"]] == [
+        "_official",
+        "_baseline",
+        "_dual_dag",
+    ]
+
+
+def test_load_gemma4_progress_full_manifest():
+    manifest = load_experiment("configs/craft/experiments/gemma4_12b_progress_full.yaml")
+    experiment = manifest["experiment"]
+    assert experiment["name"] == "craft_gemma4_12b_progress_full"
+    assert experiment["overrides"]["structures"] == list(range(20))
+    assert experiment["overrides"]["turns"] == 20
+    assert experiment["report"]["variance_group_by"] == "run_group"
+    for run in experiment["runs"]:
+        assert run["seeds"] == [1, 3, 5, 7, 11]
+        assert run["structures"] == list(range(20))
+
+
 def test_load_experiment_rejects_empty_runs(tmp_path):
     manifest_path = tmp_path / "empty.yaml"
     manifest_path.write_text(yaml.safe_dump({"experiment": {"runs": []}}), encoding="utf-8")
