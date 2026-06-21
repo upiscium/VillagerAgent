@@ -1,0 +1,26 @@
+experiment:
+  name: craft_qwen_dual_dag_issue114_fallback
+  result_root: result/craft
+  continue_on_error: true
+  overrides:
+    structures: [0, 1, 2]
+    turns: 2
+    seed: 3
+    run_name_suffix: _issue114_fallback
+  runs:
+    - config: configs/craft/eval_qwen_ollama.yaml
+      suffix: _baseline
+      seeds: [3]
+      structures: [0, 1, 2]
+    - config: configs/craft/eval_qwen_ollama_dual_dag.yaml
+      suffix: _dual_dag
+      seeds: [3]
+      structures: [0, 1, 2]
+  report:
+    output: result/craft/comparison_qwen_dual_dag_issue114_fallback.csv
+    json_output: result/craft/comparison_qwen_dual_dag_issue114_fallback.json
+    compact_summary_output: result/craft/summary_qwen_dual_dag_issue114_fallback.csv
+    compact_summary_json_output: result/craft/summary_qwen_dual_dag_issue114_fallback.json
+    variance_summary_output: result/craft/variance_qwen_dual_dag_issue114_fallback.csv
+    variance_summary_json_output: result/craft/variance_qwen_dual_dag_issue114_fallback.json
+    variance_group_by: condition
