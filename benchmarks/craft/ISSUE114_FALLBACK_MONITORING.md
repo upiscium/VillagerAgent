@@ -22,7 +22,7 @@ python -m benchmarks.craft.fallback_monitor --runs craft_eval_qwen_ollama_issue1
 The batch produced diagnosable failure artifacts for both runs before any CRAFT turns executed:
 
 - Error type: `OllamaPreflightError`
-- Error message: DNS failure resolving `https://ollama-melchior.arc.upiscium.dev`
+- Error message after endpoint update: DNS failure resolving `https://ollama.arc.upiscium.dev`
 - Dual-DAG behavior was not exercised, so no conclusion can be drawn about larger-batch fallback rates from this environment attempt.
 
 ## Monitoring Status
