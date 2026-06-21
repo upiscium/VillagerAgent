@@ -69,9 +69,9 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
             "use_state_manager": config.get("villageragent", {}).get("use_state_manager", False),
         },
         "partial_information": {
-            "target_structure_exposed": config.get("villageragent", {}).get("expose_target_structure", False),
-            "oracle_moves_exposed": config.get("villageragent", {}).get("expose_oracle_moves", False),
-            "private_views_shared_raw": config.get("villageragent", {}).get("expose_private_views_to_global_state", False),
+            "target_blueprint_exposed": config.get("villageragent", {}).get("expose_target_structure", False),
+            "oracle_plan_exposed": config.get("villageragent", {}).get("expose_oracle_moves", False),
+            "director_view_payloads_shared": config.get("villageragent", {}).get("expose_private_views_to_global_state", False),
         },
     }
     with (normalized_dir / "summary.json").open("w", encoding="utf-8") as f:
