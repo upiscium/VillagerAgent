@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from benchmarks.craft.config import repo_root
-from benchmarks.craft.result_converter import _progress_action_metrics
+from benchmarks.craft.result_converter import _clarification_metrics, _progress_action_metrics
 
 
 SUMMARY_FIELDS = [
@@ -34,11 +34,27 @@ SUMMARY_FIELDS = [
     "negative_progress_turn_count",
     "mean_progress_delta_per_turn",
     "mean_progress_delta_per_physical_action",
+    "unique_clarification_count",
+    "repeated_clarification_count",
+    "clarification_response_count",
+    "clarification_to_unlock_count",
+    "clarification_to_unlock_rate",
+    "clarification_to_positive_action_count",
+    "clarification_to_positive_action_latency",
+    "clarification_without_state_change_count",
+    "gate_invocation_count",
+    "gate_allow_count",
+    "gate_block_count",
+    "gate_clarify_count",
+    "gate_wait_count",
+    "gate_reason_counts",
     "gated_clarification_rate",
     "clarification_resolution_rate",
     "mean_clarification_quality_score",
     "mean_post_clarification_progress_delta",
     "mean_action_confidence",
+    "required_evidence_gate_count",
+    "span_uncertainty_gate_count",
     "claim_support_count",
     "claim_conflict_count",
     "claim_required_evidence_count",
@@ -181,10 +197,12 @@ def _summarize_run(run_name: str, *, result_root: Path, analysis: dict | None = 
     status = summary.get("status") or runtime.get("status") or "completed"
     failure = summary.get("failure") or runtime.get("failure", {}) or {}
     analysis = analysis or _read_optional_json(normalized_dir / "dual_dag_analysis.json")
+    turns = _read_turns(normalized_dir / "turns.jsonl")
     progress_action_metrics = _progress_action_metrics({
-        "turns": _read_turns(normalized_dir / "turns.jsonl"),
+        "turns": turns,
         "final_progress": summary.get("mean_final_progress", 0.0),
     })
+    clarification_metrics = _clarification_metrics(turns)
     return {
         "run_name": summary.get("run_name", run_name),
         "run_group": _run_group(summary.get("run_name", run_name)),
@@ -212,11 +230,27 @@ def _summarize_run(run_name: str, *, result_root: Path, analysis: dict | None = 
         "negative_progress_turn_count": runtime.get("negative_progress_turn_count", progress_action_metrics["negative_progress_turn_count"]),
         "mean_progress_delta_per_turn": runtime.get("mean_progress_delta_per_turn", progress_action_metrics["mean_progress_delta_per_turn"]),
         "mean_progress_delta_per_physical_action": runtime.get("mean_progress_delta_per_physical_action", progress_action_metrics["mean_progress_delta_per_physical_action"]),
+        "unique_clarification_count": runtime.get("unique_clarification_count", clarification_metrics["unique_clarification_count"]),
+        "repeated_clarification_count": runtime.get("repeated_clarification_count", clarification_metrics["repeated_clarification_count"]),
+        "clarification_response_count": runtime.get("clarification_response_count", clarification_metrics["clarification_response_count"]),
+        "clarification_to_unlock_count": runtime.get("clarification_to_unlock_count", clarification_metrics["clarification_to_unlock_count"]),
+        "clarification_to_unlock_rate": runtime.get("clarification_to_unlock_rate", clarification_metrics["clarification_to_unlock_rate"]),
+        "clarification_to_positive_action_count": runtime.get("clarification_to_positive_action_count", clarification_metrics["clarification_to_positive_action_count"]),
+        "clarification_to_positive_action_latency": runtime.get("clarification_to_positive_action_latency", clarification_metrics["clarification_to_positive_action_latency"]),
+        "clarification_without_state_change_count": runtime.get("clarification_without_state_change_count", clarification_metrics["clarification_without_state_change_count"]),
+        "gate_invocation_count": runtime.get("gate_invocation_count", clarification_metrics["gate_invocation_count"]),
+        "gate_allow_count": runtime.get("gate_allow_count", clarification_metrics["gate_allow_count"]),
+        "gate_block_count": runtime.get("gate_block_count", clarification_metrics["gate_block_count"]),
+        "gate_clarify_count": runtime.get("gate_clarify_count", clarification_metrics["gate_clarify_count"]),
+        "gate_wait_count": runtime.get("gate_wait_count", clarification_metrics["gate_wait_count"]),
+        "gate_reason_counts": runtime.get("gate_reason_counts", clarification_metrics["gate_reason_counts"]),
         "gated_clarification_rate": runtime.get("gated_clarification_rate", 0.0),
         "clarification_resolution_rate": runtime.get("clarification_resolution_rate", 0.0),
         "mean_clarification_quality_score": runtime.get("mean_clarification_quality_score", 0.0),
         "mean_post_clarification_progress_delta": runtime.get("mean_post_clarification_progress_delta", 0.0),
         "mean_action_confidence": runtime.get("mean_action_confidence", 0.0),
+        "required_evidence_gate_count": runtime.get("required_evidence_gate_count", clarification_metrics["required_evidence_gate_count"]),
+        "span_uncertainty_gate_count": runtime.get("span_uncertainty_gate_count", clarification_metrics["span_uncertainty_gate_count"]),
         "claim_support_count": runtime.get("claim_support_count", 0),
         "claim_conflict_count": runtime.get("claim_conflict_count", 0),
         "claim_required_evidence_count": runtime.get("claim_required_evidence_count", 0),

@@ -55,7 +55,10 @@ def test_report_aggregates_multiple_runs(tmp_path):
     assert rows[1]["action_candidate_executed_count"] == 1
     assert rows[1]["coordination_action_count"] == 2
     assert rows[1]["gated_clarification_count"] == 1
+    assert rows[1]["gate_invocation_count"] == 1
+    assert rows[1]["gate_reason_counts"] == '{"low_action_confidence": 1}'
     assert rows[1]["clarification_resolution_rate"] == 0.5
+    assert rows[1]["clarification_to_unlock_rate"] == 0.5
     assert rows[1]["mean_clarification_quality_score"] == 0.75
     assert rows[1]["mean_risk_score"] == 0.4
 
@@ -130,9 +133,12 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "hypothesis_resolved_count",
                 "action_candidate_executed_count",
                 "coordination_action_count",
+                "gate_invocation_count",
+                "gate_reason_counts",
                 "gated_clarification_count",
                 "clarification_resolution_count",
                 "clarification_resolution_rate",
+                "clarification_to_unlock_rate",
                 "mean_clarification_quality_score",
                 "mean_post_clarification_progress_delta",
                 "mean_risk_score",
@@ -152,9 +158,12 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "hypothesis_resolved_count": "1",
                 "action_candidate_executed_count": "1",
                 "coordination_action_count": "2",
+                "gate_invocation_count": "1",
+                "gate_reason_counts": '{"low_action_confidence": 1}',
                 "gated_clarification_count": "1",
                 "clarification_resolution_count": "1",
                 "clarification_resolution_rate": "0.5",
+                "clarification_to_unlock_rate": "0.5",
                 "mean_clarification_quality_score": "0.75",
                 "mean_post_clarification_progress_delta": "0.2",
                 "mean_risk_score": "0.4",
