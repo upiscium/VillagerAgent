@@ -38,6 +38,8 @@ def test_experiment_summary_combines_runtime_and_analysis_metrics(tmp_path):
     assert rows[0]["resolved_fact_count"] == 2
     assert rows[0]["hypothesis_resolved_count"] == 1
     assert rows[0]["action_candidate_executed_count"] == 1
+    assert rows[0]["candidate_created_count"] == 3
+    assert rows[0]["candidate_state_transition_counts"] == '{"executes_action:executed": 1}'
     assert rows[0]["coordination_action_count"] == 2
     assert rows[0]["supported_action_count"] == 2
     assert rows[0]["required_evidence_action_count"] == 1
@@ -263,6 +265,13 @@ def _write_run(
             "action_candidate_blocked_count": 0,
             "action_candidate_invalidated_count": 0,
             "action_candidate_executed_count": 1,
+            "candidate_created_count": 3,
+            "candidate_blocked_count": 0,
+            "candidate_executable_count": 2,
+            "candidate_executed_count": 1,
+            "candidate_invalidated_count": 0,
+            "candidate_repeated_after_execution_count": 1,
+            "candidate_state_transition_counts": '{"executes_action:executed": 1}',
             "coordination_action_count": 2,
             "clarify_coordination_action_count": 1,
             "wait_for_evidence_coordination_action_count": 1,

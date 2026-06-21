@@ -59,6 +59,13 @@ REPORT_FIELDS = [
     "action_candidate_blocked_count",
     "action_candidate_invalidated_count",
     "action_candidate_executed_count",
+    "candidate_created_count",
+    "candidate_blocked_count",
+    "candidate_executable_count",
+    "candidate_executed_count",
+    "candidate_invalidated_count",
+    "candidate_repeated_after_execution_count",
+    "candidate_state_transition_counts",
     "coordination_action_count",
     "clarify_coordination_action_count",
     "wait_for_evidence_coordination_action_count",
@@ -296,6 +303,34 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
         "action_candidate_executed_count": runtime.get(
             "action_candidate_executed_count",
             _sum_metric_rows(metrics_rows, "action_candidate_executed_count"),
+        ),
+        "candidate_created_count": runtime.get(
+            "candidate_created_count",
+            _sum_metric_rows_or_default(metrics_rows, "candidate_created_count", _candidate_created_fallback(runtime, metrics_rows)),
+        ),
+        "candidate_blocked_count": runtime.get(
+            "candidate_blocked_count",
+            _sum_metric_rows(metrics_rows, "candidate_blocked_count"),
+        ),
+        "candidate_executable_count": runtime.get(
+            "candidate_executable_count",
+            _sum_metric_rows(metrics_rows, "candidate_executable_count"),
+        ),
+        "candidate_executed_count": runtime.get(
+            "candidate_executed_count",
+            _sum_metric_rows(metrics_rows, "candidate_executed_count"),
+        ),
+        "candidate_invalidated_count": runtime.get(
+            "candidate_invalidated_count",
+            _sum_metric_rows(metrics_rows, "candidate_invalidated_count"),
+        ),
+        "candidate_repeated_after_execution_count": runtime.get(
+            "candidate_repeated_after_execution_count",
+            _sum_metric_rows(metrics_rows, "candidate_repeated_after_execution_count"),
+        ),
+        "candidate_state_transition_counts": runtime.get(
+            "candidate_state_transition_counts",
+            _merge_reason_counts(metrics_rows, "candidate_state_transition_counts"),
         ),
         "coordination_action_count": runtime.get(
             "coordination_action_count",
@@ -622,6 +657,14 @@ def _metric_text_or_default(rows: list[dict], field: str, default: str) -> str:
     if not _metric_field_exists(rows, field):
         return default
     return _merge_reason_counts(rows, field)
+
+
+def _candidate_created_fallback(runtime: dict, rows: list[dict]) -> int:
+    states = ["candidate", "executable", "waiting_for_evidence", "blocked", "invalidated", "executed"]
+    runtime_total = sum(int(runtime.get(f"action_candidate_{state}_count", 0) or 0) for state in states)
+    if runtime_total:
+        return runtime_total
+    return sum(_sum_metric_rows(rows, f"action_candidate_{state}_count") for state in states)
 
 
 def _load_resolved_config(config_path: Path) -> dict:
