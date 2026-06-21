@@ -1,0 +1,15 @@
+[
+  {
+    "task_type": "meta",
+    "task_idx": 0,
+    "agent_num": 1,
+    "max_task_num": 1,
+    "task_goal": "Inspect the immediate area and report one safe next step.",
+    "document_file": "",
+    "host": "127.0.0.1",
+    "port": 25565,
+    "task_name": "minecraft_issue110_smoke",
+    "role": "same",
+    "evaluation_arg": {}
+  }
+]

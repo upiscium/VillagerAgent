@@ -21,7 +21,7 @@ start_time = time.time()
 os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1"
 os.environ["no_proxy"] = "localhost,127.0.0.1,::1"
 
-def run(api_model: str, api_base: str, task_type: str, task_idx: int, agent_num: int, dig_needed: bool, max_task_num: int, task_goal: str, document_file: str, host: str, port: int, task_name: str, role: str = "same", api_key_list: list = [], document: dict = {}):
+def run(api_model: str, api_base: str, task_type: str, task_idx: int, agent_num: int, dig_needed: bool, max_task_num: int, task_goal: str, document_file: str, host: str, port: int, task_name: str, role: str = "same", api_key_list: list = [], document: dict = {}, minecraft_dual_dag_config: dict | None = None):
     start_time = time.time()
 
     api_key_list = json.load(open("API_KEY_LIST", "r"))["AGENT_KEY"]
@@ -162,7 +162,8 @@ def run(api_model: str, api_base: str, task_type: str, task_idx: int, agent_num:
                                 tm_llm_config=tm_llm_config, 
                                 dm_llm_config=dm_llm_config,
                                 base_agent_config=base_llm_config,
-                                all_tools=agent_tool)
+                                all_tools=agent_tool,
+                                minecraft_dual_dag_config=minecraft_dual_dag_config)
 
         # response = ctrl.agent_list[0].llm.few_shot_generate_thoughts(system_prompt="", example_prompt="hi")
         # print(response)
