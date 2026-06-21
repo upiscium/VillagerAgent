@@ -207,10 +207,13 @@ def test_run_experiment_dry_run_creates_run_output(tmp_path):
     output = tmp_path / "results" / "craft_experiment_dry_run_smoke"
     resolved_config = yaml.safe_load((output / "config.resolved.yaml").read_text())
     command_text = (output / "command.txt").read_text()
+    provenance = json.loads((output / "provenance.json").read_text(encoding="utf-8"))
     assert resolved_config["run"]["structures"] == [0]
     assert resolved_config["run"]["turns"] == 1
     assert resolved_config["run"]["seed"] == 9
     assert "--run-name-suffix _smoke" in command_text
+    assert provenance["benchmark"] == "craft"
+    assert provenance["schema_version"] == "1.0.0"
 
 
 def test_run_experiment_records_failed_run_and_writes_summaries(tmp_path, monkeypatch):

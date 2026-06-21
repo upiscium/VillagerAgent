@@ -22,6 +22,7 @@ from benchmarks.craft.experiment_summary import (
 )
 from benchmarks.craft.report import build_comparison_report, write_csv_report, write_json_report
 from benchmarks.craft.run import run_config
+from benchmarks.experiment_provenance import write_provenance
 
 
 class ExperimentConfigError(ValueError):
@@ -254,7 +255,13 @@ def _write_failure_artifacts(
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     save_resolved_config(config, output_dir)
-    (output_dir / "command.txt").write_text(command + "\n", encoding="utf-8")
+    write_provenance(
+        output_dir,
+        benchmark="craft",
+        command=command,
+        resolved_config=config,
+        environment_notes=f"condition={condition_from_config(config)}; failure_artifact=true",
+    )
     normalized_dir = output_dir / "normalized"
     normalized_dir.mkdir(parents=True, exist_ok=True)
     failure = {
