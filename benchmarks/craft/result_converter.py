@@ -140,6 +140,20 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
         "claim_required_evidence_count",
         "candidate_count",
         "clarification_count",
+        "unique_clarification_count",
+        "repeated_clarification_count",
+        "clarification_response_count",
+        "clarification_to_unlock_count",
+        "clarification_to_unlock_rate",
+        "clarification_to_positive_action_count",
+        "clarification_to_positive_action_latency",
+        "clarification_without_state_change_count",
+        "gate_invocation_count",
+        "gate_allow_count",
+        "gate_block_count",
+        "gate_clarify_count",
+        "gate_wait_count",
+        "gate_reason_counts",
         "gated_clarification_count",
         "gated_clarification_rate",
         "clarification_resolution_count",
@@ -149,6 +163,8 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
         "mean_risk_score",
         "low_confidence_gate_count",
         "conflict_gate_count",
+        "required_evidence_gate_count",
+        "span_uncertainty_gate_count",
         "dual_dag_node_count",
         "dual_dag_edge_count",
         "baseline_type",
@@ -229,6 +245,20 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
                 "claim_required_evidence_count": game_action_candidate_metrics["claim_required_evidence_count"],
                 "candidate_count": game_action_candidate_metrics["candidate_count"],
                 "clarification_count": game_clarification_metrics["clarification_count"],
+                "unique_clarification_count": game_clarification_metrics["unique_clarification_count"],
+                "repeated_clarification_count": game_clarification_metrics["repeated_clarification_count"],
+                "clarification_response_count": game_clarification_metrics["clarification_response_count"],
+                "clarification_to_unlock_count": game_clarification_metrics["clarification_to_unlock_count"],
+                "clarification_to_unlock_rate": game_clarification_metrics["clarification_to_unlock_rate"],
+                "clarification_to_positive_action_count": game_clarification_metrics["clarification_to_positive_action_count"],
+                "clarification_to_positive_action_latency": game_clarification_metrics["clarification_to_positive_action_latency"],
+                "clarification_without_state_change_count": game_clarification_metrics["clarification_without_state_change_count"],
+                "gate_invocation_count": game_clarification_metrics["gate_invocation_count"],
+                "gate_allow_count": game_clarification_metrics["gate_allow_count"],
+                "gate_block_count": game_clarification_metrics["gate_block_count"],
+                "gate_clarify_count": game_clarification_metrics["gate_clarify_count"],
+                "gate_wait_count": game_clarification_metrics["gate_wait_count"],
+                "gate_reason_counts": game_clarification_metrics["gate_reason_counts"],
                 "gated_clarification_count": game_clarification_metrics["gated_clarification_count"],
                 "gated_clarification_rate": game_clarification_metrics["gated_clarification_rate"],
                 "clarification_resolution_count": game_clarification_metrics["clarification_resolution_count"],
@@ -238,6 +268,8 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
                 "mean_risk_score": game_clarification_metrics["mean_risk_score"],
                 "low_confidence_gate_count": game_clarification_metrics["low_confidence_gate_count"],
                 "conflict_gate_count": game_clarification_metrics["conflict_gate_count"],
+                "required_evidence_gate_count": game_clarification_metrics["required_evidence_gate_count"],
+                "span_uncertainty_gate_count": game_clarification_metrics["span_uncertainty_gate_count"],
                 "dual_dag_node_count": game_dual_dag_metrics["dual_dag_node_count"],
                 "dual_dag_edge_count": game_dual_dag_metrics["dual_dag_edge_count"],
                 "baseline_type": _baseline_type(condition, raw_result),
@@ -443,37 +475,93 @@ def _action_candidate_metrics(turns: list[dict]) -> dict:
 
 def _clarification_metrics(turns: list[dict]) -> dict:
     clarification_count = 0
+    clarification_keys = []
+    clarification_response_count = 0
     gated_clarification_count = 0
     clarification_resolution_count = 0
+    clarification_to_positive_action_count = 0
+    positive_action_latencies = []
+    gate_invocation_count = 0
+    gate_allow_count = 0
+    gate_block_count = 0
+    gate_clarify_count = 0
+    gate_wait_count = 0
+    gate_reason_counts = {}
     low_confidence_gate_count = 0
     conflict_gate_count = 0
+    required_evidence_gate_count = 0
+    span_uncertainty_gate_count = 0
     risk_scores = []
     quality_scores = []
     progress_deltas = []
     for index, turn in enumerate(turns):
         action = turn.get("builder_action") or {}
+        clarification_response_count += len(turn.get("director_responses", {}) or {})
         if action.get("action") == "clarify":
             clarification_count += 1
+            clarification_keys.append(_clarification_key(action))
             quality_scores.append(_clarification_quality_score(action))
             resolution = _clarification_resolution(turns, index)
             if resolution["resolved"]:
                 clarification_resolution_count += 1
             if resolution["progress_delta"] is not None:
                 progress_deltas.append(resolution["progress_delta"])
+            positive_latency = _clarification_positive_action_latency(turns, index)
+            if positive_latency is not None:
+                clarification_to_positive_action_count += 1
+                positive_action_latencies.append(positive_latency)
         gate = action.get("_gated_clarification")
         if not gate:
             continue
+        gate_invocation_count += 1
         gated_clarification_count += 1
         reasons = gate.get("reasons", [])
+        if not reasons and gate.get("reason"):
+            reasons = [gate["reason"]]
+        for reason in reasons:
+            gate_reason_counts[reason] = gate_reason_counts.get(reason, 0) + 1
+        decision = str(gate.get("decision") or action.get("action") or "").lower()
+        if gate.get("reason") == "none" or decision == "allow":
+            gate_allow_count += 1
+        elif decision == "clarify":
+            gate_block_count += 1
+            gate_clarify_count += 1
+        elif decision == "wait_for_evidence":
+            gate_block_count += 1
+            gate_wait_count += 1
         if "low_action_confidence" in reasons:
             low_confidence_gate_count += 1
         if "claim_conflict" in reasons:
             conflict_gate_count += 1
+        if "required_evidence" in reasons:
+            required_evidence_gate_count += 1
+        if "large_block_span_uncertainty" in reasons:
+            span_uncertainty_gate_count += 1
         risk_score = gate.get("risk_score")
         if risk_score is not None:
             risk_scores.append(float(risk_score))
+    unique_clarification_count = len(set(clarification_keys))
     return {
         "clarification_count": clarification_count,
+        "unique_clarification_count": unique_clarification_count,
+        "repeated_clarification_count": clarification_count - unique_clarification_count,
+        "clarification_response_count": clarification_response_count,
+        "clarification_to_unlock_count": clarification_resolution_count,
+        "clarification_to_unlock_rate": (
+            clarification_resolution_count / clarification_count
+            if clarification_count else 0.0
+        ),
+        "clarification_to_positive_action_count": clarification_to_positive_action_count,
+        "clarification_to_positive_action_latency": (
+            _mean(positive_action_latencies) if positive_action_latencies else 0.0
+        ),
+        "clarification_without_state_change_count": clarification_count - clarification_resolution_count,
+        "gate_invocation_count": gate_invocation_count,
+        "gate_allow_count": gate_allow_count,
+        "gate_block_count": gate_block_count,
+        "gate_clarify_count": gate_clarify_count,
+        "gate_wait_count": gate_wait_count,
+        "gate_reason_counts": json.dumps(gate_reason_counts, sort_keys=True),
         "gated_clarification_count": gated_clarification_count,
         "gated_clarification_rate": gated_clarification_count / len(turns) if turns else 0.0,
         "clarification_resolution_count": clarification_resolution_count,
@@ -492,7 +580,48 @@ def _clarification_metrics(turns: list[dict]) -> dict:
         "mean_risk_score": sum(risk_scores) / len(risk_scores) if risk_scores else 0.0,
         "low_confidence_gate_count": low_confidence_gate_count,
         "conflict_gate_count": conflict_gate_count,
+        "required_evidence_gate_count": required_evidence_gate_count,
+        "span_uncertainty_gate_count": span_uncertainty_gate_count,
     }
+
+
+def _clarification_key(action: dict) -> str:
+    metadata = action.get("_action_candidate_metadata") or {}
+    gate = action.get("_gated_clarification") or {}
+    candidate = _chosen_candidate(metadata)
+    candidate_action = candidate.get("action", {}) if isinstance(candidate, dict) else {}
+    reasons = gate.get("reasons", []) or []
+    question_type = reasons[0] if reasons else gate.get("reason", "general")
+    parts = [
+        str(action.get("target_director") or action.get("director_id") or "unknown_director"),
+        str(action.get("coordinate") or action.get("position") or candidate_action.get("position") or "unknown_coordinate"),
+        str(action.get("layer") or candidate_action.get("layer") or "unknown_layer"),
+        str(action.get("block_attribute") or action.get("block") or candidate_action.get("block") or "unknown_block"),
+        str(action.get("span") or candidate_action.get("span_to") or "unknown_span"),
+        str(question_type),
+    ]
+    if all(part.startswith("unknown_") for part in parts[:5]):
+        parts.append(str(action.get("clarification", "")).strip().lower())
+    return "|".join(parts)
+
+
+def _chosen_candidate(metadata: dict) -> dict:
+    chosen_id = metadata.get("chosen_candidate_id")
+    for candidate in metadata.get("candidates", []) or []:
+        if candidate.get("node_id") == chosen_id:
+            return candidate
+    return {}
+
+
+def _clarification_positive_action_latency(turns: list[dict], index: int) -> int | None:
+    clarify_progress = _progress_value(turns[index].get("progress"))
+    for next_index in range(index + 1, len(turns)):
+        action = turns[next_index].get("builder_action") or {}
+        if action.get("action") == "clarify":
+            continue
+        if _progress_value(turns[next_index].get("progress")) > clarify_progress:
+            return next_index - index
+    return None
 
 
 def _clarification_quality_score(action: dict) -> float:

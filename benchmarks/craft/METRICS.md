@@ -61,6 +61,20 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 ## Gated Clarification
 
 - `clarification_count`: Number of turns where the final Builder action is `clarify`. This includes direct Builder clarifications and gate-induced clarifications.
+- `unique_clarification_count`: Number of distinct canonical clarification keys. Keys are built from public target Director/coordinate/layer/block/span metadata when present, otherwise from candidate action metadata and clarification text.
+- `repeated_clarification_count`: `clarification_count - unique_clarification_count`.
+- `clarification_response_count`: Number of public Director response payloads recorded on turns.
+- `clarification_to_unlock_count`: Number of clarification turns whose next non-clarify action satisfies the existing unlock/resolution heuristic.
+- `clarification_to_unlock_rate`: `clarification_to_unlock_count / clarification_count`.
+- `clarification_to_positive_action_count`: Number of clarification turns followed by a later non-clarify turn with higher progress.
+- `clarification_to_positive_action_latency`: Mean turn distance from clarification to the later positive-progress non-clarify action.
+- `clarification_without_state_change_count`: Number of clarification turns without downstream resolution under the existing unlock heuristic.
+- `gate_invocation_count`: Number of persisted gate decision metadata records. Current artifacts persist intervention decisions; future allow decisions are counted when stored with `reason=none` or `decision=allow`.
+- `gate_allow_count`: Number of persisted allow decisions.
+- `gate_block_count`: Number of persisted gate interventions that blocked the candidate action.
+- `gate_clarify_count`: Number of gate interventions that selected `clarify`.
+- `gate_wait_count`: Number of gate interventions that selected `wait_for_evidence`.
+- `gate_reason_counts`: JSON object aggregating persisted gate reasons.
 - `gated_clarification_count`: Number of turns where the Dual-DAG gate replaced a candidate action with `clarify`.
 - `gated_clarification_rate`: `gated_clarification_count / turn_count`.
 - Adaptive gated clarification is experimental and opt-in. When `dual_dag.gated_clarification.adaptive_thresholds.enabled=true`, the gate adjusts `min_action_confidence` and `clarification_cost` from public action metadata: support lowers intervention pressure, while conflicts and required evidence raise it. Static thresholds remain the default.
@@ -71,6 +85,8 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 - `mean_risk_score`: Mean risk score over gated clarification decisions. The current score is based primarily on `1.0 - chosen_confidence`.
 - `low_confidence_gate_count`: Number of gated clarifications caused by low action confidence.
 - `conflict_gate_count`: Number of gated clarifications caused by hard claim conflicts whose risk exceeds clarification cost.
+- `required_evidence_gate_count`: Number of gated clarifications caused by required-evidence metadata.
+- `span_uncertainty_gate_count`: Number of gated clarifications caused by large-block span uncertainty.
 
 ## Dual-DAG Size
 

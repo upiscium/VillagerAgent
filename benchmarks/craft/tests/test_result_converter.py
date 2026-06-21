@@ -196,7 +196,7 @@ def test_result_converter_counts_gated_clarification_metadata(tmp_path):
                     "action": "clarify",
                     "_gated_clarification": {
                         "risk_score": 0.4,
-                        "reasons": ["low_action_confidence", "claim_conflict"],
+                        "reasons": ["low_action_confidence", "claim_conflict", "required_evidence"],
                     },
                 },
             }],
@@ -209,6 +209,10 @@ def test_result_converter_counts_gated_clarification_metadata(tmp_path):
     metrics_text = (tmp_path / "normalized" / "metrics.csv").read_text()
     assert summary["runtime"]["clarification_count"] == 1
     assert summary["runtime"]["gated_clarification_count"] == 1
+    assert summary["runtime"]["gate_invocation_count"] == 1
+    assert summary["runtime"]["gate_block_count"] == 1
+    assert summary["runtime"]["gate_clarify_count"] == 1
+    assert summary["runtime"]["gate_reason_counts"] == '{"claim_conflict": 1, "low_action_confidence": 1, "required_evidence": 1}'
     assert summary["runtime"]["gated_clarification_rate"] == 1.0
     assert summary["runtime"]["clarification_resolution_count"] == 0
     assert summary["runtime"]["clarification_resolution_rate"] == 0.0
@@ -216,6 +220,7 @@ def test_result_converter_counts_gated_clarification_metadata(tmp_path):
     assert summary["runtime"]["mean_risk_score"] == 0.4
     assert summary["runtime"]["low_confidence_gate_count"] == 1
     assert summary["runtime"]["conflict_gate_count"] == 1
+    assert summary["runtime"]["required_evidence_gate_count"] == 1
     assert "gated_clarification_count" in metrics_text
 
 
@@ -272,6 +277,67 @@ def test_result_converter_tracks_clarification_resolution_and_progress_delta(tmp
     assert summary["runtime"]["mean_clarification_quality_score"] == 1.0
     assert summary["runtime"]["mean_post_clarification_progress_delta"] == 0.30000000000000004
     assert "clarification_resolution_rate" in metrics_text
+
+
+def test_result_converter_tracks_duplicate_clarifications_and_positive_latency(tmp_path):
+    config = {
+        "run": {"name": "test", "seed": 3, "structures": [0], "turns": 3},
+        "models": {"director": {"model": "d"}, "builder": {"model": "b"}},
+        "villageragent": {"enabled": True},
+    }
+    clarify_action = {
+        "action": "clarify",
+        "clarification": "Please clarify the missing span?",
+        "_gated_clarification": {
+            "risk_score": 0.5,
+            "reasons": ["large_block_span_uncertainty"],
+        },
+        "_action_candidate_metadata": {
+            "chosen_candidate_id": "action:1:0",
+            "chosen_confidence": 0.4,
+            "candidates": [{
+                "node_id": "action:1:0",
+                "action": {"action": "place", "block": "yl", "position": "(0,0)", "layer": 0},
+            }],
+        },
+    }
+    normalize_results(
+        config=config,
+        condition="villageragent_directors",
+        raw_result={
+            "structure_id": 0,
+            "turns": [
+                {
+                    "builder_action": clarify_action,
+                    "director_responses": {"D1": {"public_message": "It spans right."}},
+                    "progress": {"overall_progress": 0.1},
+                },
+                {"builder_action": dict(clarify_action), "progress": {"overall_progress": 0.1}},
+                {
+                    "builder_action": {
+                        "action": "place",
+                        "_action_candidate_metadata": {"chosen_confidence": 0.9},
+                    },
+                    "progress": {"overall_progress": 0.4},
+                },
+            ],
+            "final_progress": 0.4,
+            "completed": False,
+        },
+        output_dir=tmp_path,
+    )
+
+    summary = json.loads((tmp_path / "normalized" / "summary.json").read_text())
+    assert summary["runtime"]["clarification_count"] == 2
+    assert summary["runtime"]["unique_clarification_count"] == 1
+    assert summary["runtime"]["repeated_clarification_count"] == 1
+    assert summary["runtime"]["clarification_response_count"] == 1
+    assert summary["runtime"]["clarification_to_unlock_count"] == 2
+    assert summary["runtime"]["clarification_to_unlock_rate"] == 1.0
+    assert summary["runtime"]["clarification_to_positive_action_count"] == 2
+    assert summary["runtime"]["clarification_to_positive_action_latency"] == 1.5
+    assert summary["runtime"]["clarification_without_state_change_count"] == 0
+    assert summary["runtime"]["span_uncertainty_gate_count"] == 2
 
 
 def test_result_converter_tracks_progress_and_action_throughput(tmp_path):

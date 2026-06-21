@@ -6,7 +6,7 @@ from pathlib import Path
 import yaml
 
 from benchmarks.craft.config import repo_root
-from benchmarks.craft.result_converter import _progress_action_metrics
+from benchmarks.craft.result_converter import _clarification_metrics, _progress_action_metrics
 
 
 REPORT_FIELDS = [
@@ -68,6 +68,20 @@ REPORT_FIELDS = [
     "claim_required_evidence_count",
     "candidate_count",
     "clarification_count",
+    "unique_clarification_count",
+    "repeated_clarification_count",
+    "clarification_response_count",
+    "clarification_to_unlock_count",
+    "clarification_to_unlock_rate",
+    "clarification_to_positive_action_count",
+    "clarification_to_positive_action_latency",
+    "clarification_without_state_change_count",
+    "gate_invocation_count",
+    "gate_allow_count",
+    "gate_block_count",
+    "gate_clarify_count",
+    "gate_wait_count",
+    "gate_reason_counts",
     "gated_clarification_count",
     "gated_clarification_rate",
     "clarification_resolution_count",
@@ -77,6 +91,8 @@ REPORT_FIELDS = [
     "mean_risk_score",
     "low_confidence_gate_count",
     "conflict_gate_count",
+    "required_evidence_gate_count",
+    "span_uncertainty_gate_count",
     "dual_dag_node_count",
     "dual_dag_edge_count",
     "baseline_type",
@@ -112,10 +128,12 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
     condition = summary.get("condition", "")
     runtime = summary.get("runtime", {})
     turns_path = run_dir / "normalized" / "turns.jsonl"
+    turns = _read_turns(turns_path)
     progress_action_metrics = _progress_action_metrics({
-        "turns": _read_turns(turns_path),
+        "turns": turns,
         "final_progress": summary.get("mean_final_progress", 0.0),
     })
+    clarification_metrics = _clarification_metrics(turns)
     active_directors = runtime.get("active_directors") or _active_directors_from_config(
         resolved_config,
         condition,
@@ -302,7 +320,63 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
         ),
         "clarification_count": runtime.get(
             "clarification_count",
-            _sum_metric_rows(metrics_rows, "clarification_count"),
+            _sum_metric_rows_or_default(metrics_rows, "clarification_count", clarification_metrics["clarification_count"]),
+        ),
+        "unique_clarification_count": runtime.get(
+            "unique_clarification_count",
+            _sum_metric_rows_or_default(metrics_rows, "unique_clarification_count", clarification_metrics["unique_clarification_count"]),
+        ),
+        "repeated_clarification_count": runtime.get(
+            "repeated_clarification_count",
+            _sum_metric_rows_or_default(metrics_rows, "repeated_clarification_count", clarification_metrics["repeated_clarification_count"]),
+        ),
+        "clarification_response_count": runtime.get(
+            "clarification_response_count",
+            _sum_metric_rows_or_default(metrics_rows, "clarification_response_count", clarification_metrics["clarification_response_count"]),
+        ),
+        "clarification_to_unlock_count": runtime.get(
+            "clarification_to_unlock_count",
+            _sum_metric_rows_or_default(metrics_rows, "clarification_to_unlock_count", clarification_metrics["clarification_to_unlock_count"]),
+        ),
+        "clarification_to_unlock_rate": runtime.get(
+            "clarification_to_unlock_rate",
+            _mean_metric_rows_or_default(metrics_rows, "clarification_to_unlock_rate", clarification_metrics["clarification_to_unlock_rate"]),
+        ),
+        "clarification_to_positive_action_count": runtime.get(
+            "clarification_to_positive_action_count",
+            _sum_metric_rows_or_default(metrics_rows, "clarification_to_positive_action_count", clarification_metrics["clarification_to_positive_action_count"]),
+        ),
+        "clarification_to_positive_action_latency": runtime.get(
+            "clarification_to_positive_action_latency",
+            _mean_metric_rows_or_default(metrics_rows, "clarification_to_positive_action_latency", clarification_metrics["clarification_to_positive_action_latency"]),
+        ),
+        "clarification_without_state_change_count": runtime.get(
+            "clarification_without_state_change_count",
+            _sum_metric_rows_or_default(metrics_rows, "clarification_without_state_change_count", clarification_metrics["clarification_without_state_change_count"]),
+        ),
+        "gate_invocation_count": runtime.get(
+            "gate_invocation_count",
+            _sum_metric_rows_or_default(metrics_rows, "gate_invocation_count", clarification_metrics["gate_invocation_count"]),
+        ),
+        "gate_allow_count": runtime.get(
+            "gate_allow_count",
+            _sum_metric_rows_or_default(metrics_rows, "gate_allow_count", clarification_metrics["gate_allow_count"]),
+        ),
+        "gate_block_count": runtime.get(
+            "gate_block_count",
+            _sum_metric_rows_or_default(metrics_rows, "gate_block_count", clarification_metrics["gate_block_count"]),
+        ),
+        "gate_clarify_count": runtime.get(
+            "gate_clarify_count",
+            _sum_metric_rows_or_default(metrics_rows, "gate_clarify_count", clarification_metrics["gate_clarify_count"]),
+        ),
+        "gate_wait_count": runtime.get(
+            "gate_wait_count",
+            _sum_metric_rows_or_default(metrics_rows, "gate_wait_count", clarification_metrics["gate_wait_count"]),
+        ),
+        "gate_reason_counts": runtime.get(
+            "gate_reason_counts",
+            _metric_text_or_default(metrics_rows, "gate_reason_counts", clarification_metrics["gate_reason_counts"]),
         ),
         "gated_clarification_count": runtime.get(
             "gated_clarification_count",
@@ -339,6 +413,14 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
         "conflict_gate_count": runtime.get(
             "conflict_gate_count",
             _sum_metric_rows(metrics_rows, "conflict_gate_count"),
+        ),
+        "required_evidence_gate_count": runtime.get(
+            "required_evidence_gate_count",
+            _sum_metric_rows_or_default(metrics_rows, "required_evidence_gate_count", clarification_metrics["required_evidence_gate_count"]),
+        ),
+        "span_uncertainty_gate_count": runtime.get(
+            "span_uncertainty_gate_count",
+            _sum_metric_rows_or_default(metrics_rows, "span_uncertainty_gate_count", clarification_metrics["span_uncertainty_gate_count"]),
         ),
         "dual_dag_node_count": runtime.get(
             "dual_dag_node_count",
@@ -463,6 +545,32 @@ def _mean_metric_rows_or_default(rows: list[dict], field: str, default: float) -
 
 def _metric_field_exists(rows: list[dict], field: str) -> bool:
     return any(field in row for row in rows)
+
+
+def _merge_reason_counts(rows: list[dict], field: str) -> str:
+    merged: dict[str, int] = {}
+    for row in rows:
+        value = row.get(field)
+        if not value:
+            continue
+        try:
+            counts = json.loads(value)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(counts, dict):
+            continue
+        for reason, count in counts.items():
+            try:
+                merged[str(reason)] = merged.get(str(reason), 0) + int(count)
+            except (TypeError, ValueError):
+                continue
+    return json.dumps(merged, sort_keys=True)
+
+
+def _metric_text_or_default(rows: list[dict], field: str, default: str) -> str:
+    if not _metric_field_exists(rows, field):
+        return default
+    return _merge_reason_counts(rows, field)
 
 
 def _load_resolved_config(config_path: Path) -> dict:
