@@ -174,7 +174,7 @@ def test_run_experiment_dry_run_creates_run_output(tmp_path):
                 "director": {
                     "provider": "openai_compatible",
                     "model": "qwen3.5:9b",
-                    "base_url": "https://ollama.arc.upiscium.dev/v1",
+                    "base_url": "http://ollama.arc.upiscium.dev/v1",
                     "api_key": "ollama",
                 },
                 "builder": {

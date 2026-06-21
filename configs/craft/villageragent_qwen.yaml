@@ -34,7 +34,7 @@ models:
   director:
     provider: "openai_compatible"
     model: "qwen3.5:9b"
-    base_url: "https://ollama.arc.upiscium.dev/v1"
+    base_url: "http://ollama.arc.upiscium.dev/v1"
     api_key: "ollama"
     temperature: 0.2
     max_tokens: 2000
