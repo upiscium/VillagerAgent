@@ -64,6 +64,54 @@ def test_gate_allows_medium_confidence_after_tuning():
     assert metadata["thresholds"]["adaptive_thresholds"]["enabled"] is False
 
 
+def test_gate_can_suppress_low_confidence_for_executable_candidate():
+    should_gate, metadata = should_clarify(
+        candidate_metadata={
+            "chosen_candidate_id": "action:1:0",
+            "chosen_confidence": 0.4,
+            "claim_conflict_count": 0,
+            "claim_required_evidence_count": 0,
+            "candidates": [{"node_id": "action:1:0", "state": "executable", "action": {"action": "place"}}],
+        },
+        config={
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {
+                    "enabled": True,
+                    "suppress_executable_low_confidence": True,
+                },
+            }
+        },
+    )
+
+    assert should_gate is False
+    assert metadata["reason"] == "none"
+    assert metadata["thresholds"]["suppress_executable_low_confidence"] is True
+
+
+def test_gate_keeps_conflict_even_when_executable_low_confidence_is_suppressed():
+    should_gate, metadata = should_clarify(
+        candidate_metadata={
+            "chosen_candidate_id": "action:1:0",
+            "chosen_confidence": 0.4,
+            "claim_conflict_count": 1,
+            "candidates": [{"node_id": "action:1:0", "state": "executable", "action": {"action": "place"}}],
+        },
+        config={
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {
+                    "enabled": True,
+                    "suppress_executable_low_confidence": True,
+                },
+            }
+        },
+    )
+
+    assert should_gate is True
+    assert "claim_conflict" in metadata["reasons"]
+
+
 def test_adaptive_gate_lowers_confidence_threshold_with_support():
     should_gate, metadata = should_clarify(
         candidate_metadata={

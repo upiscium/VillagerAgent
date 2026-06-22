@@ -49,3 +49,9 @@ Concrete candidates:
 3. Keep C4-style gate metadata available for diagnostics so the gate can be measured without reducing action throughput.
 
 Avoid changing retrieval behavior based on this smoke alone, because retrieval did not activate.
+
+## Follow-Up Fix
+
+#131 adds an opt-in gate option, `dual_dag.gated_clarification.suppress_executable_low_confidence`, and the Gemma4 config `configs/craft/eval_gemma4_12b_ollama_dual_dag_clarify_throughput_fix.yaml`.
+
+When enabled, the gate suppresses Clarify actions caused only by low confidence if the selected candidate is already executable. Conflict, required-evidence, and large-block span uncertainty Clarify behavior remains unchanged.
