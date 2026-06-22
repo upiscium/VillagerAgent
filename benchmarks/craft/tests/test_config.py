@@ -125,14 +125,26 @@ def test_gemma4_ablation_configs_keep_villageragent_parity_and_flags():
     metadata_only = load_config("configs/craft/eval_gemma4_12b_ollama_dual_dag_metadata_only.yaml")
     current_evidence = load_config("configs/craft/eval_gemma4_12b_ollama_dual_dag_current_evidence.yaml")
     retrieval = load_config("configs/craft/eval_gemma4_12b_ollama_dual_dag_retrieval.yaml")
+    gating_no_coordination = load_config(
+        "configs/craft/eval_gemma4_12b_ollama_dual_dag_gating_no_coordination.yaml"
+    )
+    clarify_only = load_config("configs/craft/eval_gemma4_12b_ollama_dual_dag_clarify_only.yaml")
+    full_dual_dag = load_config("configs/craft/eval_gemma4_12b_ollama_dual_dag.yaml")
 
-    for config in (metadata_only, current_evidence, retrieval):
+    for config in (metadata_only, current_evidence, retrieval, gating_no_coordination, clarify_only, full_dual_dag):
         assert config["craft"] == baseline["craft"]
         assert config["villageragent"] == baseline["villageragent"]
         assert config["models"] == baseline["models"]
+
+    for config in (metadata_only, current_evidence, retrieval):
         assert config["dual_dag"]["gated_clarification"]["enabled"] is False
 
     assert _evidence_summary_enabled(metadata_only) is False
     assert _evidence_summary_enabled(current_evidence) is True
     assert current_evidence["dual_dag"]["runtime_decision_support"]["historical_retrieval"]["enabled"] is False
     assert retrieval["dual_dag"]["runtime_decision_support"]["historical_retrieval"]["enabled"] is True
+    assert gating_no_coordination["dual_dag"]["gated_clarification"]["enabled"] is True
+    assert gating_no_coordination["dual_dag"]["gated_clarification"]["coordination_actions"]["enabled"] is False
+    assert clarify_only["dual_dag"]["gated_clarification"]["enabled"] is True
+    assert clarify_only["dual_dag"]["gated_clarification"]["coordination_actions"]["enabled"] is True
+    assert full_dual_dag["dual_dag"]["gated_clarification"]["enabled"] is True
