@@ -223,6 +223,33 @@ def test_clarify_action_not_applied_when_gate_disabled():
     assert _apply_clarification_gate(action, {}) is action
 
 
+def test_gate_records_metadata_without_coordination_action_when_configured():
+    action = {
+        "action": "place",
+        "block": "ys",
+        "position": "(0,0)",
+        "layer": 0,
+        "_action_candidate_metadata": {"chosen_confidence": 0.1, "claim_conflict_count": 0},
+    }
+
+    gated = _apply_clarification_gate(
+        action,
+        {
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {
+                    "enabled": True,
+                    "coordination_actions": {"enabled": False},
+                },
+            }
+        },
+    )
+
+    assert gated["action"] == "place"
+    assert gated["_gated_clarification"]["reason"] == "low_action_confidence"
+    assert gated["_gated_clarification"]["decision"] == "allow"
+
+
 def test_required_evidence_clarification_references_public_claim_only():
     action = _apply_clarification_gate(
         {

@@ -105,7 +105,7 @@ def test_load_gemma4_progress_full_manifest():
         assert run["structures"] == list(range(20))
 
 
-def test_load_gemma4_ablation_smoke_manifest_covers_c0_to_c3():
+def test_load_gemma4_ablation_smoke_manifest_covers_c0_to_c6():
     manifest = load_experiment("configs/craft/experiments/gemma4_12b_dual_dag_ablation_smoke.yaml")
     experiment = manifest["experiment"]
     assert experiment["name"] == "craft_gemma4_12b_dual_dag_ablation_smoke"
@@ -116,6 +116,9 @@ def test_load_gemma4_ablation_smoke_manifest_covers_c0_to_c3():
         "_c1_metadata_only",
         "_c2_current_evidence",
         "_c3_retrieval",
+        "_c4_gating_no_coordination",
+        "_c5_clarify_only",
+        "_c6_full_dual_dag",
     ]
 
 

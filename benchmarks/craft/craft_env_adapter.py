@@ -750,6 +750,12 @@ def _apply_clarification_gate(action: dict, config: dict) -> dict:
     )
     if not should_gate:
         return action
+    if not _coordination_actions_enabled(config):
+        passthrough = dict(action)
+        gate_metadata = {**gate_metadata, "decision": "allow"}
+        passthrough["_gated_clarification"] = gate_metadata
+        passthrough["_action_candidate_metadata"] = candidate_metadata
+        return passthrough
     return {
         "action": "clarify",
         "clarification": _clarification_message(gate_metadata, candidate_metadata),
@@ -768,6 +774,12 @@ def _clarification_message(gate_metadata: dict, candidate_metadata: dict) -> str
             f"Please clarify: {message}"
         )
     return "The candidate action is ambiguous. Please clarify the block color, coordinate, layer, or span before building."
+
+
+def _coordination_actions_enabled(config: dict) -> bool:
+    gate_config = config.get("dual_dag", {}).get("gated_clarification", {})
+    coordination_config = gate_config.get("coordination_actions", {})
+    return bool(coordination_config.get("enabled", True))
 
 
 def _missing_public_evidence_claims(candidate_metadata: dict) -> list[dict]:
