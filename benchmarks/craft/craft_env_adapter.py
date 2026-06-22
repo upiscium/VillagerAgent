@@ -442,12 +442,13 @@ class CraftEnvAdapter:
             oracle_moves=oracle_moves,
         )
         evidence_summary_candidates = [candidate.to_dict() for candidate in action_candidates]
-        prompt = append_public_evidence_summary(
-            prompt=prompt,
-            candidates=evidence_summary_candidates,
-            reported_claims=epistemic_claims,
-        )
-        if not evidence_summary_candidates:
+        if _evidence_summary_enabled(self.config):
+            prompt = append_public_evidence_summary(
+                prompt=prompt,
+                candidates=evidence_summary_candidates,
+                reported_claims=epistemic_claims,
+            )
+        if _evidence_summary_enabled(self.config) and not evidence_summary_candidates:
             prompt = append_public_evidence_context(
                 prompt=prompt,
                 reported_claims=(
@@ -506,9 +507,13 @@ class CraftEnvAdapter:
                 config=self.config,
                 turn_index=turn_index,
             )
-        public_evidence_summary = build_public_evidence_summary(
-            candidates=[candidate.to_dict() for candidate in action_candidates],
-            reported_claims=epistemic_claims,
+        public_evidence_summary = (
+            build_public_evidence_summary(
+                candidates=[candidate.to_dict() for candidate in action_candidates],
+                reported_claims=epistemic_claims,
+            )
+            if _evidence_summary_enabled(self.config)
+            else []
         )
         if parsed.get("action") == "clarify" and oracle_moves:
             fallback = _oracle_fallback_action(
@@ -641,6 +646,12 @@ def _runtime_decision_support(
             query_config.get("historical_retrieval", {}).get("enabled", False)
         ),
     )
+
+
+def _evidence_summary_enabled(config: dict) -> bool:
+    dual_dag = config.get("dual_dag", {})
+    summary_config = dual_dag.get("evidence_summary", {})
+    return bool(summary_config.get("enabled", True))
 
 
 def _prepare_runtime_action_candidates(

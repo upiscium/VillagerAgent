@@ -3,6 +3,7 @@ import copy
 import pytest
 
 from benchmarks.craft.config import InvalidConfigError, condition_from_config, load_config, validate_config
+from benchmarks.craft.craft_env_adapter import _evidence_summary_enabled
 
 
 def test_config_rejects_target_structure_exposure():
@@ -117,3 +118,21 @@ def test_adaptive_dual_dag_config_keeps_static_gate_config_explicit():
     assert gate["min_action_confidence"] == 0.55
     assert gate["clarification_cost"] == 0.4
     assert gate["clarify_on_required_evidence"] is True
+
+
+def test_gemma4_ablation_configs_keep_villageragent_parity_and_flags():
+    baseline = load_config("configs/craft/eval_gemma4_12b_ollama.yaml")
+    metadata_only = load_config("configs/craft/eval_gemma4_12b_ollama_dual_dag_metadata_only.yaml")
+    current_evidence = load_config("configs/craft/eval_gemma4_12b_ollama_dual_dag_current_evidence.yaml")
+    retrieval = load_config("configs/craft/eval_gemma4_12b_ollama_dual_dag_retrieval.yaml")
+
+    for config in (metadata_only, current_evidence, retrieval):
+        assert config["craft"] == baseline["craft"]
+        assert config["villageragent"] == baseline["villageragent"]
+        assert config["models"] == baseline["models"]
+        assert config["dual_dag"]["gated_clarification"]["enabled"] is False
+
+    assert _evidence_summary_enabled(metadata_only) is False
+    assert _evidence_summary_enabled(current_evidence) is True
+    assert current_evidence["dual_dag"]["runtime_decision_support"]["historical_retrieval"]["enabled"] is False
+    assert retrieval["dual_dag"]["runtime_decision_support"]["historical_retrieval"]["enabled"] is True

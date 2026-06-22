@@ -105,6 +105,20 @@ def test_load_gemma4_progress_full_manifest():
         assert run["structures"] == list(range(20))
 
 
+def test_load_gemma4_ablation_smoke_manifest_covers_c0_to_c3():
+    manifest = load_experiment("configs/craft/experiments/gemma4_12b_dual_dag_ablation_smoke.yaml")
+    experiment = manifest["experiment"]
+    assert experiment["name"] == "craft_gemma4_12b_dual_dag_ablation_smoke"
+    assert experiment["overrides"]["turns"] == 5
+    assert experiment["report"]["variance_group_by"] == "run_group"
+    assert [run["suffix"] for run in experiment["runs"]] == [
+        "_c0_va_baseline",
+        "_c1_metadata_only",
+        "_c2_current_evidence",
+        "_c3_retrieval",
+    ]
+
+
 def test_load_experiment_rejects_empty_runs(tmp_path):
     manifest_path = tmp_path / "empty.yaml"
     manifest_path.write_text(yaml.safe_dump({"experiment": {"runs": []}}), encoding="utf-8")
