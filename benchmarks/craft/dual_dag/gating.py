@@ -3,6 +3,7 @@ DEFAULT_GATE_CONFIG = {
     "max_conflict_count": 0,
     "clarify_on_required_evidence": False,
     "clarify_on_large_block_span_uncertainty": True,
+    "suppress_executable_low_confidence": False,
     "clarification_cost": 0.4,
     "mistake_cost_weight": 1.0,
     "adaptive_thresholds": {
@@ -51,6 +52,8 @@ def should_clarify(*, candidate_metadata: dict, config: dict) -> tuple[bool, dic
     if enabled and thresholds.get("clarify_on_large_block_span_uncertainty", True):
         if _large_block_span_unresolved(candidate_metadata):
             reasons.append("large_block_span_uncertainty")
+    if enabled and thresholds.get("suppress_executable_low_confidence", False):
+        reasons = _suppress_executable_low_confidence(reasons, candidate_metadata)
     return bool(reasons), {
         "enabled": enabled,
         "should_clarify": bool(reasons),
@@ -116,14 +119,27 @@ def _clamp(value: float, lower: float, upper: float) -> float:
 
 
 def _large_block_span_unresolved(candidate_metadata: dict) -> bool:
-    chosen_id = candidate_metadata.get("chosen_candidate_id")
-    candidates = candidate_metadata.get("candidates", [])
-    chosen = next(
-        (candidate for candidate in candidates if candidate.get("node_id") == chosen_id),
-        None,
-    )
+    chosen = _chosen_candidate(candidate_metadata)
     if not chosen:
         return False
     action = chosen.get("action", {})
     block = action.get("block")
     return isinstance(block, str) and block.endswith("l") and not action.get("span_to")
+
+
+def _suppress_executable_low_confidence(reasons: list[str], candidate_metadata: dict) -> list[str]:
+    if reasons != ["low_action_confidence"]:
+        return reasons
+    chosen = _chosen_candidate(candidate_metadata)
+    if chosen and chosen.get("state") == "executable":
+        return []
+    return reasons
+
+
+def _chosen_candidate(candidate_metadata: dict) -> dict | None:
+    chosen_id = candidate_metadata.get("chosen_candidate_id")
+    candidates = candidate_metadata.get("candidates", [])
+    return next(
+        (candidate for candidate in candidates if candidate.get("node_id") == chosen_id),
+        None,
+    )
