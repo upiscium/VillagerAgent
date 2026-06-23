@@ -208,6 +208,7 @@ class CraftEnvAdapter:
                 dual_dag_runtime=dual_dag_runtime,
                 structure_index=structure_index,
                 turn_index=turn_index,
+                previous_builder_actions=builder_actions,
                 leakage_guard=leakage_guard,
                 leakage_reports=leakage_reports,
                 forbidden_payloads=_builder_forbidden_payloads(
@@ -404,6 +405,7 @@ class CraftEnvAdapter:
         epistemic_claims: dict[str, dict],
         structure_index: int,
         turn_index: int,
+        previous_builder_actions: list[dict] | None = None,
         dual_dag_runtime: DualDAGRuntime | None = None,
         leakage_guard: LeakageGuard | None = None,
         leakage_reports: list[dict] | None = None,
@@ -529,7 +531,12 @@ class CraftEnvAdapter:
                     public_evidence_summary=public_evidence_summary,
                 ),
             )
-            return _apply_clarification_gate(fallback, self.config)
+            return _apply_clarification_gate(
+                fallback,
+                self.config,
+                turn_index=turn_index,
+                previous_actions=previous_builder_actions,
+            )
         if oracle_moves and not _matches_oracle_candidate(parsed, oracle_moves):
             fallback = _oracle_fallback_action(
                 oracle_moves=oracle_moves,
@@ -544,7 +551,12 @@ class CraftEnvAdapter:
                     public_evidence_summary=public_evidence_summary,
                 ),
             )
-            return _apply_clarification_gate(fallback, self.config)
+            return _apply_clarification_gate(
+                fallback,
+                self.config,
+                turn_index=turn_index,
+                previous_actions=previous_builder_actions,
+            )
         parsed["_action_candidate_metadata"] = build_action_candidate_metadata(
             candidates=action_candidates,
             chosen_action=parsed,
@@ -552,7 +564,12 @@ class CraftEnvAdapter:
             decision_support=decision_support,
             public_evidence_summary=public_evidence_summary,
         )
-        return _apply_clarification_gate(parsed, self.config)
+        return _apply_clarification_gate(
+            parsed,
+            self.config,
+            turn_index=turn_index,
+            previous_actions=previous_builder_actions,
+        )
 
 
 def _make_chat_client(model_config: dict):
@@ -742,7 +759,13 @@ def _oracle_fallback_action(
     return fallback
 
 
-def _apply_clarification_gate(action: dict, config: dict) -> dict:
+def _apply_clarification_gate(
+    action: dict,
+    config: dict,
+    *,
+    turn_index: int | None = None,
+    previous_actions: list[dict] | None = None,
+) -> dict:
     candidate_metadata = action.get("_action_candidate_metadata", {})
     should_gate, gate_metadata = should_clarify(
         candidate_metadata=candidate_metadata,
@@ -750,6 +773,19 @@ def _apply_clarification_gate(action: dict, config: dict) -> dict:
     )
     if not should_gate:
         return action
+    suppression_reason = _clarification_suppression_reason(
+        action=action,
+        gate_metadata=gate_metadata,
+        config=config,
+        turn_index=turn_index,
+        previous_actions=previous_actions or [],
+    )
+    if suppression_reason:
+        passthrough = dict(action)
+        gate_metadata = {**gate_metadata, "decision": "allow", "suppression_reason": suppression_reason}
+        passthrough["_gated_clarification"] = gate_metadata
+        passthrough["_action_candidate_metadata"] = candidate_metadata
+        return passthrough
     if not _coordination_actions_enabled(config):
         passthrough = dict(action)
         gate_metadata = {**gate_metadata, "decision": "allow"}
@@ -761,6 +797,8 @@ def _apply_clarification_gate(action: dict, config: dict) -> dict:
         "clarification": _clarification_message(gate_metadata, candidate_metadata),
         "_gated_clarification": gate_metadata,
         "_action_candidate_metadata": candidate_metadata,
+        "_clarification_turn_index": turn_index,
+        "_clarification_key": _clarification_gate_key(action, gate_metadata),
     }
 
 
@@ -780,6 +818,70 @@ def _coordination_actions_enabled(config: dict) -> bool:
     gate_config = config.get("dual_dag", {}).get("gated_clarification", {})
     coordination_config = gate_config.get("coordination_actions", {})
     return bool(coordination_config.get("enabled", True))
+
+
+def _clarification_suppression_reason(
+    *,
+    action: dict,
+    gate_metadata: dict,
+    config: dict,
+    turn_index: int | None,
+    previous_actions: list[dict],
+) -> str | None:
+    gate_config = config.get("dual_dag", {}).get("gated_clarification", {})
+    prior_clarifications = [prior for prior in previous_actions if prior.get("action") == "clarify"]
+    max_clarifications = gate_config.get("max_clarifications_per_episode")
+    if max_clarifications is not None and len(prior_clarifications) >= int(max_clarifications):
+        return "clarification_budget_exhausted"
+    cooldown_turns = int(gate_config.get("clarification_cooldown_turns", 0) or 0)
+    if cooldown_turns > 0 and turn_index is not None:
+        last_turn = _last_clarification_turn(prior_clarifications)
+        if last_turn is not None and turn_index - last_turn <= cooldown_turns:
+            return "clarification_cooldown"
+    min_remaining = gate_config.get("min_remaining_turns_after_clarification")
+    if min_remaining is not None and turn_index is not None:
+        remaining_turns = int(config.get("run", {}).get("turns", 0) or 0) - turn_index
+        if remaining_turns < int(min_remaining):
+            return "late_clarification"
+    turn_fraction = gate_config.get("disallow_after_turn_fraction")
+    if turn_fraction is not None and turn_index is not None:
+        total_turns = int(config.get("run", {}).get("turns", 0) or 0)
+        if total_turns and turn_index / total_turns >= float(turn_fraction):
+            return "late_clarification"
+    if gate_config.get("prevent_duplicate_clarifications", False):
+        current_key = _clarification_gate_key(action, gate_metadata)
+        previous_keys = {
+            prior.get("_clarification_key") or _clarification_gate_key(prior, prior.get("_gated_clarification") or {})
+            for prior in prior_clarifications
+        }
+        if current_key and current_key in previous_keys:
+            return "duplicate_clarification"
+    return None
+
+
+def _last_clarification_turn(actions: list[dict]) -> int | None:
+    turns = [action.get("_clarification_turn_index") for action in actions]
+    turns = [turn for turn in turns if isinstance(turn, int)]
+    return max(turns) if turns else None
+
+
+def _clarification_gate_key(action: dict, gate_metadata: dict) -> str:
+    metadata = action.get("_action_candidate_metadata") or {}
+    chosen_id = metadata.get("chosen_candidate_id", "unknown_candidate")
+    chosen = next(
+        (candidate for candidate in metadata.get("candidates", []) or [] if candidate.get("node_id") == chosen_id),
+        {},
+    )
+    candidate_action = chosen.get("action", {}) if isinstance(chosen, dict) else {}
+    reason = gate_metadata.get("reason") or ",".join(gate_metadata.get("reasons", []) or []) or "unknown_reason"
+    return "|".join([
+        str(reason),
+        str(candidate_action.get("position", action.get("position", "unknown_position"))),
+        str(candidate_action.get("layer", action.get("layer", "unknown_layer"))),
+        str(candidate_action.get("block", action.get("block", "unknown_block"))),
+        str(candidate_action.get("span_to", action.get("span_to", "unknown_span"))),
+        str(chosen_id),
+    ])
 
 
 def _missing_public_evidence_claims(candidate_metadata: dict) -> list[dict]:

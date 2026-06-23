@@ -298,6 +298,98 @@ def test_gate_records_metadata_without_coordination_action_when_configured():
     assert gated["_gated_clarification"]["decision"] == "allow"
 
 
+def test_gate_suppresses_clarification_when_episode_budget_exhausted():
+    action = {
+        "action": "place",
+        "block": "ys",
+        "position": "(0,0)",
+        "layer": 0,
+        "_action_candidate_metadata": {"chosen_confidence": 0.1, "claim_conflict_count": 0},
+    }
+
+    gated = _apply_clarification_gate(
+        action,
+        {"dual_dag": {"enabled": True, "gated_clarification": {"enabled": True, "max_clarifications_per_episode": 1}}},
+        turn_index=2,
+        previous_actions=[{"action": "clarify", "_clarification_turn_index": 1}],
+    )
+
+    assert gated["action"] == "place"
+    assert gated["_gated_clarification"]["decision"] == "allow"
+    assert gated["_gated_clarification"]["suppression_reason"] == "clarification_budget_exhausted"
+
+
+def test_gate_suppresses_clarification_during_cooldown():
+    action = {"action": "place", "_action_candidate_metadata": {"chosen_confidence": 0.1}}
+
+    gated = _apply_clarification_gate(
+        action,
+        {"dual_dag": {"enabled": True, "gated_clarification": {"enabled": True, "clarification_cooldown_turns": 2}}},
+        turn_index=3,
+        previous_actions=[{"action": "clarify", "_clarification_turn_index": 2}],
+    )
+
+    assert gated["action"] == "place"
+    assert gated["_gated_clarification"]["suppression_reason"] == "clarification_cooldown"
+
+
+def test_gate_suppresses_late_clarification_when_remaining_turns_too_low():
+    action = {"action": "place", "_action_candidate_metadata": {"chosen_confidence": 0.1}}
+
+    gated = _apply_clarification_gate(
+        action,
+        {
+            "run": {"turns": 5},
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {"enabled": True, "min_remaining_turns_after_clarification": 2},
+            },
+        },
+        turn_index=4,
+    )
+
+    assert gated["action"] == "place"
+    assert gated["_gated_clarification"]["suppression_reason"] == "late_clarification"
+
+
+def test_gate_suppresses_duplicate_clarification_key():
+    action = {
+        "action": "place",
+        "block": "ys",
+        "position": "(0,0)",
+        "layer": 0,
+        "_action_candidate_metadata": {
+            "chosen_candidate_id": "action:1:0",
+            "chosen_confidence": 0.1,
+            "candidates": [{
+                "node_id": "action:1:0",
+                "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+            }],
+        },
+    }
+    first = _apply_clarification_gate(
+        action,
+        {"dual_dag": {"enabled": True, "gated_clarification": {"enabled": True}}},
+        turn_index=1,
+    )
+
+    second = _apply_clarification_gate(
+        action,
+        {
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {"enabled": True, "prevent_duplicate_clarifications": True},
+            }
+        },
+        turn_index=2,
+        previous_actions=[first],
+    )
+
+    assert first["action"] == "clarify"
+    assert second["action"] == "place"
+    assert second["_gated_clarification"]["suppression_reason"] == "duplicate_clarification"
+
+
 def test_required_evidence_clarification_references_public_claim_only():
     action = _apply_clarification_gate(
         {
