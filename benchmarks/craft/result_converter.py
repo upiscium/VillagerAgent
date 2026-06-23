@@ -320,6 +320,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
     with (normalized_dir / "leakage_report.json").open("w", encoding="utf-8") as f:
         json.dump(leakage_report, f, ensure_ascii=False, indent=2)
     _write_dual_dag_artifacts(normalized_dir=normalized_dir, games=games)
+    _write_clarification_trace(normalized_dir=normalized_dir, games=games, config=config)
 
 
 def _active_directors(config: dict, condition: str) -> list[str]:
@@ -709,6 +710,97 @@ def _clarification_key(action: dict) -> str:
     if all(part.startswith("unknown_") for part in parts[:5]):
         parts.append(str(action.get("clarification", "")).strip().lower())
     return "|".join(parts)
+
+
+def _clarification_trace_rows(*, games: list[dict], config: dict) -> list[dict]:
+    rows = []
+    for game_index, game in enumerate(games):
+        turns = game.get("turns", []) or []
+        for index, turn in enumerate(turns):
+            action = turn.get("builder_action") or {}
+            if action.get("action") != "clarify":
+                continue
+            metadata = action.get("_action_candidate_metadata") or {}
+            gate = action.get("_gated_clarification") or {}
+            candidates = metadata.get("candidates", []) or []
+            ranked_candidates = sorted(
+                candidates,
+                key=lambda candidate: _candidate_score(candidate),
+                reverse=True,
+            )
+            top_candidate = ranked_candidates[0] if ranked_candidates else {}
+            top1_score = _candidate_score(top_candidate) if top_candidate else None
+            top2_score = _candidate_score(ranked_candidates[1]) if len(ranked_candidates) > 1 else None
+            next_turn = _next_non_clarify_turn(turns, index + 1)
+            next_action = (next_turn or {}).get("builder_action") or {}
+            turn_index = _turn_index(turn)
+            next_turn_index = _turn_index(next_turn or {})
+            rows.append({
+                "clarification_id": f"clarification:{game.get('structure_id', game_index)}:{turn_index if turn_index is not None else index}",
+                "structure_id": game.get("structure_id"),
+                "turn_index": turn_index,
+                "remaining_turns": _remaining_turns(config, turn_index),
+                "oracle_enabled": bool(config.get("craft", {}).get("use_oracle", False)),
+                "oracle_candidate_count": config.get("craft", {}).get("oracle_n") if config.get("craft", {}).get("use_oracle", False) else 0,
+                "candidate_ids_before": [candidate.get("node_id") for candidate in candidates],
+                "candidate_actions_before": [_public_action(candidate.get("action", {})) for candidate in candidates],
+                "candidate_states_before": [candidate.get("state") for candidate in candidates],
+                "candidate_scores_before": [_candidate_score(candidate) for candidate in candidates],
+                "top_candidate_before": top_candidate.get("node_id"),
+                "top1_score_before": top1_score,
+                "top2_score_before": top2_score,
+                "top1_top2_margin_before": (top1_score - top2_score) if top1_score is not None and top2_score is not None else None,
+                "action_confidence_before": metadata.get("chosen_confidence", gate.get("chosen_confidence")),
+                "conflict_count_before": metadata.get("claim_conflict_count", gate.get("claim_conflict_count")),
+                "required_evidence_before": metadata.get("claim_required_evidence_count", gate.get("claim_required_evidence_count")),
+                "span_uncertainty_before": "large_block_span_uncertainty" in (gate.get("reasons", []) or []),
+                "gate_reasons": gate.get("reasons", []) or ([gate.get("reason")] if gate.get("reason") else []),
+                "question_text": action.get("clarification", ""),
+                "canonical_question_key": _clarification_key(action),
+                "next_physical_action_turn": next_turn_index,
+                "clarification_to_action_latency": (next_turn_index - turn_index) if turn_index is not None and next_turn_index is not None else None,
+                "next_physical_action": _public_action(next_action),
+                "next_physical_action_progress_delta": _next_action_progress_delta(turn, next_turn),
+                "next_action_was_original_top_candidate": _matches_action(top_candidate.get("action", {}), next_action) if top_candidate else False,
+            })
+    return rows
+
+
+def _write_clarification_trace(*, normalized_dir: Path, games: list[dict], config: dict) -> None:
+    rows = _clarification_trace_rows(games=games, config=config)
+    with (normalized_dir / "clarification_trace.jsonl").open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _remaining_turns(config: dict, turn_index: int | None) -> int | None:
+    total_turns = config.get("run", {}).get("turns")
+    if not isinstance(total_turns, int) or turn_index is None:
+        return None
+    return max(total_turns - turn_index - 1, 0)
+
+
+def _candidate_score(candidate: dict) -> float:
+    return _metadata_float(candidate, "confidence")
+
+
+def _public_action(action: dict) -> dict:
+    if not isinstance(action, dict):
+        return {}
+    return {key: value for key, value in action.items() if not str(key).startswith("_")}
+
+
+def _next_action_progress_delta(turn: dict, next_turn: dict | None) -> float | None:
+    if next_turn is None:
+        return None
+    return _progress_value(next_turn.get("progress")) - _progress_value(turn.get("progress"))
+
+
+def _matches_action(candidate_action: dict, action: dict) -> bool:
+    if not candidate_action or not action:
+        return False
+    public_action = _public_action(action)
+    return all(public_action.get(key) == value for key, value in candidate_action.items())
 
 
 def _chosen_candidate(metadata: dict) -> dict:

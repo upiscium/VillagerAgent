@@ -127,8 +127,11 @@ Runs write to `result/craft/{run_name}/`:
 - `normalized/summary.json`
 - `normalized/turns.jsonl`
 - `normalized/metrics.csv`
+- `normalized/clarification_trace.jsonl`
 - `normalized/leakage_report.json`
 - `logs/run.log`
+
+`clarification_trace.jsonl` contains one row per emitted Clarify action. It records public candidate snapshots, gate reasons, a canonical question key, and the next physical action linkage for offline analysis. It must not contain hidden target structures, oracle plans, or private Director views.
 
 See [`METRICS.md`](METRICS.md) for the meaning of normalized metrics, comparison report columns, Dual-DAG analysis fields, and compact experiment summary columns. See [`TASK_DAG_MAPPING.md`](TASK_DAG_MAPPING.md) for the narrow bridge between CRAFT action candidates and VillagerAgent Task DAG concepts.
 

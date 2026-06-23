@@ -224,6 +224,82 @@ def test_result_converter_counts_gated_clarification_metadata(tmp_path):
     assert "gated_clarification_count" in metrics_text
 
 
+def test_result_converter_writes_clarification_trace_with_next_action_link(tmp_path):
+    config = {
+        "run": {"name": "test", "seed": 3, "structures": [0], "turns": 5},
+        "craft": {"use_oracle": True, "oracle_n": 1},
+        "models": {"director": {"model": "d"}, "builder": {"model": "b"}},
+        "villageragent": {"enabled": True},
+    }
+    candidate_action = {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0}
+    normalize_results(
+        config=config,
+        condition="villageragent_directors",
+        raw_result={
+            "structure_id": 0,
+            "turns": [
+                {
+                    "turn_index": 0,
+                    "builder_action": {
+                        "action": "clarify",
+                        "clarification": "Please clarify yellow at (0,0)?",
+                        "_gated_clarification": {"reasons": ["low_action_confidence"], "chosen_confidence": 0.4},
+                        "_action_candidate_metadata": {
+                            "chosen_candidate_id": "action:0:0",
+                            "chosen_confidence": 0.4,
+                            "claim_conflict_count": 0,
+                            "claim_required_evidence_count": 0,
+                            "candidates": [
+                                {
+                                    "node_id": "action:0:0",
+                                    "state": "executable",
+                                    "confidence": 0.4,
+                                    "action": candidate_action,
+                                },
+                                {
+                                    "node_id": "action:0:1",
+                                    "state": "candidate",
+                                    "confidence": 0.2,
+                                    "action": {"action": "place", "block": "bs", "position": "(1,0)", "layer": 0},
+                                },
+                            ],
+                        },
+                    },
+                    "progress": {"overall_progress": 0.1},
+                },
+                {
+                    "turn_index": 1,
+                    "builder_action": {**candidate_action, "_private_note": "hidden"},
+                    "progress": {"overall_progress": 0.25},
+                },
+            ],
+            "final_progress": 0.25,
+            "completed": False,
+        },
+        output_dir=tmp_path,
+    )
+
+    trace_lines = (tmp_path / "normalized" / "clarification_trace.jsonl").read_text().splitlines()
+    assert len(trace_lines) == 1
+    row = json.loads(trace_lines[0])
+    assert row["clarification_id"] == "clarification:0:0"
+    assert row["remaining_turns"] == 4
+    assert row["oracle_enabled"] is True
+    assert row["oracle_candidate_count"] == 1
+    assert row["candidate_ids_before"] == ["action:0:0", "action:0:1"]
+    assert row["candidate_states_before"] == ["executable", "candidate"]
+    assert row["top_candidate_before"] == "action:0:0"
+    assert row["top1_top2_margin_before"] == 0.2
+    assert row["gate_reasons"] == ["low_action_confidence"]
+    assert row["canonical_question_key"]
+    assert row["next_physical_action_turn"] == 1
+    assert row["clarification_to_action_latency"] == 1
+    assert row["next_physical_action"] == candidate_action
+    assert row["next_physical_action_progress_delta"] == 0.15
+    assert row["next_action_was_original_top_candidate"] is True
+    assert "_private_note" not in str(row)
+
+
 def test_result_converter_tracks_clarification_resolution_and_progress_delta(tmp_path):
     config = {
         "run": {"name": "test", "seed": 3, "structures": [0], "turns": 2},
