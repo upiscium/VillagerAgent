@@ -280,8 +280,11 @@ def test_result_converter_writes_clarification_trace_with_next_action_link(tmp_p
     )
 
     trace_lines = (tmp_path / "normalized" / "clarification_trace.jsonl").read_text().splitlines()
+    outcome_lines = (tmp_path / "normalized" / "clarification_outcomes.jsonl").read_text().splitlines()
     assert len(trace_lines) == 1
+    assert len(outcome_lines) == 1
     row = json.loads(trace_lines[0])
+    outcome = json.loads(outcome_lines[0])
     assert row["clarification_id"] == "clarification:0:0"
     assert row["remaining_turns"] == 4
     assert row["oracle_enabled"] is True
@@ -298,6 +301,9 @@ def test_result_converter_writes_clarification_trace_with_next_action_link(tmp_p
     assert row["next_physical_action_progress_delta"] == 0.15
     assert row["next_action_was_original_top_candidate"] is True
     assert "_private_note" not in str(row)
+    assert outcome["clarification_id"] == row["clarification_id"]
+    assert outcome["outcome"] == "neutral"
+    assert outcome["outcome_reasons"] == ["same_action_after_clarification"]
 
 
 def test_result_converter_tracks_clarification_resolution_and_progress_delta(tmp_path):
