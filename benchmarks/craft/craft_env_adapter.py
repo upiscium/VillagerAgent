@@ -829,6 +829,9 @@ def _clarification_suppression_reason(
     previous_actions: list[dict],
 ) -> str | None:
     gate_config = config.get("dual_dag", {}).get("gated_clarification", {})
+    oracle_reason = _oracle_aware_suppression_reason(action=action, gate_metadata=gate_metadata, config=config)
+    if oracle_reason:
+        return oracle_reason
     prior_clarifications = [prior for prior in previous_actions if prior.get("action") == "clarify"]
     max_clarifications = gate_config.get("max_clarifications_per_episode")
     if max_clarifications is not None and len(prior_clarifications) >= int(max_clarifications):
@@ -857,6 +860,47 @@ def _clarification_suppression_reason(
         if current_key and current_key in previous_keys:
             return "duplicate_clarification"
     return None
+
+
+def _oracle_aware_suppression_reason(*, action: dict, gate_metadata: dict, config: dict) -> str | None:
+    gate_config = config.get("dual_dag", {}).get("gated_clarification", {})
+    oracle_rules = gate_config.get("oracle_aware_rules", {}) or {}
+    if not (config.get("craft", {}).get("use_oracle", False) and oracle_rules.get("enabled", False)):
+        return None
+    metadata = action.get("_action_candidate_metadata") or {}
+    candidates = metadata.get("candidates", []) or []
+    if not candidates:
+        return None
+    if _has_execution_blocker(action=action, gate_metadata=gate_metadata):
+        return None
+    executable_candidates = [candidate for candidate in candidates if candidate.get("state") == "executable"]
+    if len(candidates) == 1 and executable_candidates:
+        return "single_oracle_candidate_executable"
+    margin = _top_candidate_margin(candidates)
+    min_margin = oracle_rules.get("min_top_candidate_margin")
+    if min_margin is not None and margin is not None and margin >= float(min_margin):
+        return "oracle_candidate_margin_sufficient"
+    return None
+
+
+def _has_execution_blocker(*, action: dict, gate_metadata: dict) -> bool:
+    reasons = set(gate_metadata.get("reasons", []) or [])
+    if "large_block_span_uncertainty" in reasons:
+        return True
+    if not action.get("action"):
+        return True
+    if action.get("action") == "place" and (not action.get("position") or action.get("layer") is None or not action.get("block")):
+        return True
+    if action.get("action") == "remove" and (not action.get("position") or action.get("layer") is None):
+        return True
+    return False
+
+
+def _top_candidate_margin(candidates: list[dict]) -> float | None:
+    scores = sorted((float(candidate.get("confidence", 0.0) or 0.0) for candidate in candidates), reverse=True)
+    if len(scores) < 2:
+        return None
+    return scores[0] - scores[1]
 
 
 def _last_clarification_turn(actions: list[dict]) -> int | None:

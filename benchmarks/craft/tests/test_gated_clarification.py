@@ -390,6 +390,139 @@ def test_gate_suppresses_duplicate_clarification_key():
     assert second["_gated_clarification"]["suppression_reason"] == "duplicate_clarification"
 
 
+def test_oracle_aware_rule_suppresses_single_executable_candidate():
+    action = {
+        "action": "place",
+        "block": "ys",
+        "position": "(0,0)",
+        "layer": 0,
+        "_action_candidate_metadata": {
+            "chosen_confidence": 0.1,
+            "candidates": [{
+                "node_id": "action:1:0",
+                "state": "executable",
+                "confidence": 0.1,
+                "action": {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+            }],
+        },
+    }
+
+    gated = _apply_clarification_gate(
+        action,
+        {
+            "craft": {"use_oracle": True},
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {
+                    "enabled": True,
+                    "oracle_aware_rules": {"enabled": True},
+                },
+            },
+        },
+    )
+
+    assert gated["action"] == "place"
+    assert gated["_gated_clarification"]["suppression_reason"] == "single_oracle_candidate_executable"
+
+
+def test_oracle_aware_rule_allows_execution_blocker():
+    action = {
+        "action": "place",
+        "block": "yl",
+        "position": "(0,0)",
+        "layer": 0,
+        "_action_candidate_metadata": {
+            "chosen_candidate_id": "action:1:0",
+            "chosen_confidence": 0.9,
+            "candidates": [{
+                "node_id": "action:1:0",
+                "state": "executable",
+                "confidence": 0.9,
+                "action": {"action": "place", "block": "yl", "position": "(0,0)", "layer": 0},
+            }],
+        },
+    }
+
+    gated = _apply_clarification_gate(
+        action,
+        {
+            "craft": {"use_oracle": True},
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {
+                    "enabled": True,
+                    "oracle_aware_rules": {"enabled": True},
+                },
+            },
+        },
+    )
+
+    assert gated["action"] == "clarify"
+    assert gated["_gated_clarification"]["reason"] == "large_block_span_uncertainty"
+
+
+def test_oracle_aware_rule_suppresses_large_candidate_margin():
+    action = {
+        "action": "place",
+        "block": "ys",
+        "position": "(0,0)",
+        "layer": 0,
+        "_action_candidate_metadata": {
+            "chosen_confidence": 0.4,
+            "candidates": [
+                {"node_id": "a", "state": "executable", "confidence": 0.9, "action": {"action": "place"}},
+                {"node_id": "b", "state": "executable", "confidence": 0.2, "action": {"action": "place"}},
+            ],
+        },
+    }
+
+    gated = _apply_clarification_gate(
+        action,
+        {
+            "craft": {"use_oracle": True},
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {
+                    "enabled": True,
+                    "oracle_aware_rules": {"enabled": True, "min_top_candidate_margin": 0.5},
+                },
+            },
+        },
+    )
+
+    assert gated["action"] == "place"
+    assert gated["_gated_clarification"]["suppression_reason"] == "oracle_candidate_margin_sufficient"
+
+
+def test_oracle_aware_rule_does_not_change_non_oracle_mode():
+    action = {
+        "action": "place",
+        "block": "ys",
+        "position": "(0,0)",
+        "layer": 0,
+        "_action_candidate_metadata": {
+            "chosen_confidence": 0.1,
+            "candidates": [{"node_id": "a", "state": "executable", "confidence": 0.1, "action": {"action": "place"}}],
+        },
+    }
+
+    gated = _apply_clarification_gate(
+        action,
+        {
+            "craft": {"use_oracle": False},
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {
+                    "enabled": True,
+                    "oracle_aware_rules": {"enabled": True},
+                },
+            },
+        },
+    )
+
+    assert gated["action"] == "clarify"
+
+
 def test_required_evidence_clarification_references_public_claim_only():
     action = _apply_clarification_gate(
         {
