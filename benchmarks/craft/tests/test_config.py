@@ -145,6 +145,7 @@ def test_gemma4_ablation_configs_keep_villageragent_parity_and_flags():
     clarify_only = load_config("configs/craft/eval_gemma4_12b_ollama_dual_dag_clarify_only.yaml")
     full_dual_dag = load_config("configs/craft/eval_gemma4_12b_ollama_dual_dag.yaml")
     clarify_fix = load_config("configs/craft/eval_gemma4_12b_ollama_dual_dag_clarify_throughput_fix.yaml")
+    voi = load_config("configs/craft/eval_gemma4_12b_ollama_dual_dag_value_of_information.yaml")
 
     for config in (
         metadata_only,
@@ -154,6 +155,7 @@ def test_gemma4_ablation_configs_keep_villageragent_parity_and_flags():
         clarify_only,
         full_dual_dag,
         clarify_fix,
+        voi,
     ):
         assert config["craft"] == baseline["craft"]
         assert config["villageragent"] == baseline["villageragent"]
@@ -172,3 +174,4 @@ def test_gemma4_ablation_configs_keep_villageragent_parity_and_flags():
     assert clarify_only["dual_dag"]["gated_clarification"]["coordination_actions"]["enabled"] is True
     assert full_dual_dag["dual_dag"]["gated_clarification"]["enabled"] is True
     assert clarify_fix["dual_dag"]["gated_clarification"]["suppress_executable_low_confidence"] is True
+    assert voi["dual_dag"]["gated_clarification"]["policy"] == "value_of_information"
