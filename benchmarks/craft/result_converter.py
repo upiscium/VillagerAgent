@@ -2,6 +2,7 @@ import csv
 import json
 from pathlib import Path
 
+from benchmarks.craft.clarification_outcomes import classify_clarification_outcome
 from benchmarks.craft.dual_dag.schema import DUAL_DAG_SCHEMA_VERSION, dual_dag_schema_registry
 
 
@@ -771,6 +772,10 @@ def _write_clarification_trace(*, normalized_dir: Path, games: list[dict], confi
     with (normalized_dir / "clarification_trace.jsonl").open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    with (normalized_dir / "clarification_outcomes.jsonl").open("w", encoding="utf-8") as f:
+        for row in rows:
+            outcome = classify_clarification_outcome(row)
+            f.write(json.dumps({**row, **outcome}, ensure_ascii=False) + "\n")
 
 
 def _remaining_turns(config: dict, turn_index: int | None) -> int | None:
