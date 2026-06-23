@@ -1,4 +1,5 @@
 DEFAULT_GATE_CONFIG = {
+    "policy": "current",
     "min_action_confidence": 0.55,
     "max_conflict_count": 0,
     "clarify_on_required_evidence": False,
@@ -6,6 +7,14 @@ DEFAULT_GATE_CONFIG = {
     "suppress_executable_low_confidence": False,
     "clarification_cost": 0.4,
     "mistake_cost_weight": 1.0,
+    "value_of_information": {
+        "resolution_probability": 0.55,
+        "required_evidence_resolution_bonus": 0.1,
+        "conflict_resolution_bonus": 0.1,
+        "mean_candidate_value": 0.05,
+        "clarification_failure_risk": 0.05,
+        "min_value": 0.0,
+    },
     "adaptive_thresholds": {
         "enabled": False,
         "min_confidence_floor": 0.35,
@@ -25,6 +34,7 @@ def should_clarify(*, candidate_metadata: dict, config: dict) -> tuple[bool, dic
     gate_config = dual_dag.get("gated_clarification", {})
     enabled = bool(dual_dag.get("enabled", False) and gate_config.get("enabled", False))
     thresholds = _gate_thresholds(gate_config)
+    policy = str(thresholds.get("policy", "current") or "current")
     chosen_confidence = float(candidate_metadata.get("chosen_confidence", 0.0) or 0.0)
     conflict_count = int(candidate_metadata.get("claim_conflict_count", 0) or 0)
     required_evidence_count = int(candidate_metadata.get("claim_required_evidence_count", 0) or 0)
@@ -54,9 +64,22 @@ def should_clarify(*, candidate_metadata: dict, config: dict) -> tuple[bool, dic
             reasons.append("large_block_span_uncertainty")
     if enabled and thresholds.get("suppress_executable_low_confidence", False):
         reasons = _suppress_executable_low_confidence(reasons, candidate_metadata)
+    voi = _value_of_information_components(
+        candidate_metadata=candidate_metadata,
+        thresholds=thresholds,
+        chosen_confidence=chosen_confidence,
+        conflict_count=conflict_count,
+        required_evidence_count=required_evidence_count,
+    )
+    if policy == "disabled":
+        reasons = []
+    elif policy == "value_of_information" and reasons:
+        if voi["value_of_clarification"] <= float(thresholds["value_of_information"].get("min_value", 0.0)):
+            reasons = []
     return bool(reasons), {
         "enabled": enabled,
         "should_clarify": bool(reasons),
+        "policy": policy,
         "reason": reasons[0] if reasons else "none",
         "reasons": reasons,
         "chosen_confidence": chosen_confidence,
@@ -65,6 +88,8 @@ def should_clarify(*, candidate_metadata: dict, config: dict) -> tuple[bool, dic
         "claim_required_evidence_count": required_evidence_count,
         "risk_score": risk_score,
         "risk_exceeds_clarification_cost": risk_exceeds_cost,
+        "value_of_clarification": voi["value_of_clarification"],
+        "voi_components": voi,
         "thresholds": thresholds,
     }
 
@@ -111,6 +136,10 @@ def _gate_thresholds(gate_config: dict) -> dict:
         **DEFAULT_GATE_CONFIG["adaptive_thresholds"],
         **(gate_config.get("adaptive_thresholds", {}) or {}),
     }
+    thresholds["value_of_information"] = {
+        **DEFAULT_GATE_CONFIG["value_of_information"],
+        **(gate_config.get("value_of_information", {}) or {}),
+    }
     return thresholds
 
 
@@ -134,6 +163,57 @@ def _suppress_executable_low_confidence(reasons: list[str], candidate_metadata: 
     if chosen and chosen.get("state") == "executable":
         return []
     return reasons
+
+
+def _value_of_information_components(
+    *,
+    candidate_metadata: dict,
+    thresholds: dict,
+    chosen_confidence: float,
+    conflict_count: int,
+    required_evidence_count: int,
+) -> dict:
+    voi_config = thresholds.get("value_of_information", {}) or {}
+    p_wrong = 1.0 - _clamp(chosen_confidence, 0.0, 1.0)
+    p_resolution = _clamp(
+        float(voi_config.get("resolution_probability", 0.55))
+        + required_evidence_count * float(voi_config.get("required_evidence_resolution_bonus", 0.1))
+        + conflict_count * float(voi_config.get("conflict_resolution_bonus", 0.1)),
+        0.0,
+        1.0,
+    )
+    mistake_cost = float(thresholds.get("mistake_cost_weight", 1.0))
+    mean_candidate_value = float(voi_config.get("mean_candidate_value", 0.05))
+    expected_avoided_mistake_cost = p_wrong * p_resolution * mistake_cost
+    expected_future_unlock_value = p_resolution * required_evidence_count * mean_candidate_value
+    turn_opportunity_cost = _turn_opportunity_cost(candidate_metadata, mean_candidate_value)
+    clarification_cost = float(thresholds.get("clarification_cost", 0.4))
+    clarification_failure_risk = float(voi_config.get("clarification_failure_risk", 0.05))
+    value = (
+        expected_avoided_mistake_cost
+        + expected_future_unlock_value
+        - turn_opportunity_cost
+        - clarification_cost
+        - clarification_failure_risk
+    )
+    return {
+        "p_wrong": p_wrong,
+        "p_resolution": p_resolution,
+        "expected_avoided_mistake_cost": expected_avoided_mistake_cost,
+        "expected_future_unlock_value": expected_future_unlock_value,
+        "turn_opportunity_cost": turn_opportunity_cost,
+        "clarification_cost": clarification_cost,
+        "clarification_failure_risk": clarification_failure_risk,
+        "value_of_clarification": value,
+    }
+
+
+def _turn_opportunity_cost(candidate_metadata: dict, mean_candidate_value: float) -> float:
+    chosen = _chosen_candidate(candidate_metadata)
+    if not chosen or chosen.get("state") != "executable":
+        return 0.0
+    confidence = _clamp(float(chosen.get("confidence", candidate_metadata.get("chosen_confidence", 0.0)) or 0.0), 0.0, 1.0)
+    return confidence * mean_candidate_value
 
 
 def _chosen_candidate(candidate_metadata: dict) -> dict | None:

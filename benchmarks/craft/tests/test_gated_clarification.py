@@ -64,6 +64,79 @@ def test_gate_allows_medium_confidence_after_tuning():
     assert metadata["thresholds"]["adaptive_thresholds"]["enabled"] is False
 
 
+def test_disabled_policy_suppresses_clarification():
+    should_gate, metadata = should_clarify(
+        candidate_metadata={"chosen_confidence": 0.1, "claim_conflict_count": 2},
+        config={
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {"enabled": True, "policy": "disabled"},
+            }
+        },
+    )
+
+    assert should_gate is False
+    assert metadata["policy"] == "disabled"
+    assert metadata["reason"] == "none"
+
+
+def test_value_of_information_policy_suppresses_low_value_clarification():
+    should_gate, metadata = should_clarify(
+        candidate_metadata={
+            "chosen_candidate_id": "action:1:0",
+            "chosen_confidence": 0.52,
+            "claim_conflict_count": 0,
+            "claim_required_evidence_count": 0,
+            "candidates": [{"node_id": "action:1:0", "state": "executable", "confidence": 0.52}],
+        },
+        config={
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {
+                    "enabled": True,
+                    "policy": "value_of_information",
+                    "min_action_confidence": 0.55,
+                    "clarification_cost": 0.4,
+                },
+            }
+        },
+    )
+
+    assert should_gate is False
+    assert metadata["policy"] == "value_of_information"
+    assert metadata["value_of_clarification"] < 0
+    assert metadata["reason"] == "none"
+
+
+def test_value_of_information_policy_allows_high_value_clarification():
+    should_gate, metadata = should_clarify(
+        candidate_metadata={
+            "chosen_confidence": 0.1,
+            "claim_conflict_count": 1,
+            "claim_required_evidence_count": 2,
+        },
+        config={
+            "dual_dag": {
+                "enabled": True,
+                "gated_clarification": {
+                    "enabled": True,
+                    "policy": "value_of_information",
+                    "min_action_confidence": 0.55,
+                    "clarify_on_required_evidence": True,
+                    "clarification_cost": 0.1,
+                    "value_of_information": {"mean_candidate_value": 0.1, "clarification_failure_risk": 0.0},
+                },
+            }
+        },
+    )
+
+    assert should_gate is True
+    assert metadata["policy"] == "value_of_information"
+    assert metadata["value_of_clarification"] > 0
+    assert metadata["voi_components"]["expected_avoided_mistake_cost"] > 0
+    assert "low_action_confidence" in metadata["reasons"]
+
+
 def test_gate_can_suppress_low_confidence_for_executable_candidate():
     should_gate, metadata = should_clarify(
         candidate_metadata={
