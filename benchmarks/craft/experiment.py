@@ -189,6 +189,8 @@ def _validate_run_spec(run) -> None:
         raise ExperimentConfigError("experiment.runs[].structures must be a list[int].")
     if "suffix" in run and not isinstance(run["suffix"], str):
         raise ExperimentConfigError("experiment.runs[].suffix must be a string.")
+    if "overrides" in run and not isinstance(run["overrides"], dict):
+        raise ExperimentConfigError("experiment.runs[].overrides must be a mapping.")
 
 
 def _expand_run_specs(runs: list, base_overrides: dict) -> list[dict]:
@@ -201,6 +203,7 @@ def _expand_run_specs(runs: list, base_overrides: dict) -> list[dict]:
         suffix = run.get("suffix", "")
         for seed in seeds:
             overrides = dict(base_overrides)
+            overrides = _merge_overrides(overrides, run.get("overrides", {}) or {})
             if seed is not None:
                 overrides["seed"] = seed
             if run.get("structures") is not None:
@@ -214,6 +217,16 @@ def _expand_run_specs(runs: list, base_overrides: dict) -> list[dict]:
                 overrides["run_name_suffix"] = override_suffix
             expanded.append({"config": run["config"], "overrides": overrides})
     return expanded
+
+
+def _merge_overrides(base: dict, updates: dict) -> dict:
+    merged = dict(base)
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_overrides(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _is_int_list(value) -> bool:

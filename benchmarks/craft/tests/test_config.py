@@ -35,6 +35,20 @@ def test_condition_override_preserves_comparison_axes():
     assert config["run"]["seed"] == 7
 
 
+def test_nested_overrides_update_craft_and_dual_dag_sections():
+    config = load_config(
+        "configs/craft/eval_gemma4_12b_ollama_dual_dag.yaml",
+        overrides={
+            "craft": {"oracle_n": 5},
+            "dual_dag": {"gated_clarification": {"enabled": False}},
+        },
+    )
+
+    assert config["craft"]["oracle_n"] == 5
+    assert config["dual_dag"]["runtime_decision_support"]["enabled"] is True
+    assert config["dual_dag"]["gated_clarification"]["enabled"] is False
+
+
 def test_qwen_ollama_config_uses_native_provider_without_openai_key():
     config = load_config("configs/craft/villageragent_qwen_ollama.yaml")
     assert config["models"]["director"]["provider"] == "ollama_native"

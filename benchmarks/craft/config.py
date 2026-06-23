@@ -72,7 +72,19 @@ def _apply_overrides(config: dict, overrides: dict | None) -> dict:
             va["ablation"] = "single_director"
         elif va.get("ablation") == "single_director":
             va.pop("ablation")
+    for section in ("craft", "dual_dag", "villageragent", "models", "logging"):
+        if isinstance(overrides.get(section), dict):
+            _deep_update(config.setdefault(section, {}), overrides[section])
     return config
+
+
+def _deep_update(target: dict, updates: dict) -> dict:
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_update(target[key], value)
+        else:
+            target[key] = value
+    return target
 
 
 def load_config(path: str, *, overrides: dict | None = None, require_api_keys: bool = False) -> dict:

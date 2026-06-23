@@ -1,0 +1,32 @@
+experiment:
+  name: craft_gemma4_12b_clarify_policy_smoke
+  description: Implementation smoke for available Clarify policies; not final performance evidence.
+  result_root: result/craft
+  continue_on_error: true
+  overrides:
+    turns: 5
+  runs:
+    - config: configs/craft/eval_gemma4_12b_ollama.yaml
+      suffix: _v0_va_baseline
+      seeds: [1, 3, 5]
+      structures: [0, 1, 2, 3, 4]
+    - config: configs/craft/eval_gemma4_12b_ollama_dual_dag_retrieval.yaml
+      suffix: _v1_dual_dag_clarify_disabled
+      seeds: [1, 3, 5]
+      structures: [0, 1, 2, 3, 4]
+    - config: configs/craft/eval_gemma4_12b_ollama_dual_dag.yaml
+      suffix: _v2_dual_dag_current_clarify
+      seeds: [1, 3, 5]
+      structures: [0, 1, 2, 3, 4]
+    - config: configs/craft/eval_gemma4_12b_ollama_dual_dag_clarify_throughput_fix.yaml
+      suffix: _v3_dual_dag_throughput_fix
+      seeds: [1, 3, 5]
+      structures: [0, 1, 2, 3, 4]
+  report:
+    output: result/craft/comparison_gemma4_12b_clarify_policy_smoke.csv
+    json_output: result/craft/comparison_gemma4_12b_clarify_policy_smoke.json
+    compact_summary_output: result/craft/summary_gemma4_12b_clarify_policy_smoke.csv
+    compact_summary_json_output: result/craft/summary_gemma4_12b_clarify_policy_smoke.json
+    variance_summary_output: result/craft/variance_gemma4_12b_clarify_policy_smoke.csv
+    variance_summary_json_output: result/craft/variance_gemma4_12b_clarify_policy_smoke.json
+    variance_group_by: run_group

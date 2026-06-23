@@ -122,6 +122,25 @@ def test_load_gemma4_ablation_smoke_manifest_covers_c0_to_c6():
     ]
 
 
+def test_load_gemma4_clarify_policy_manifests():
+    smoke = load_experiment("configs/craft/experiments/gemma4_12b_clarify_policy_smoke.yaml")["experiment"]
+    official = load_experiment("configs/craft/experiments/gemma4_12b_clarify_policy_official.yaml")["experiment"]
+    sensitivity = load_experiment("configs/craft/experiments/gemma4_12b_clarify_policy_sensitivity.yaml")["experiment"]
+
+    assert smoke["overrides"]["turns"] == 5
+    assert [run["suffix"] for run in smoke["runs"]] == [
+        "_v0_va_baseline",
+        "_v1_dual_dag_clarify_disabled",
+        "_v2_dual_dag_current_clarify",
+        "_v3_dual_dag_throughput_fix",
+    ]
+    assert official["overrides"]["turns"] == 20
+    assert all(run["overrides"]["craft"]["oracle_n"] == 5 for run in official["runs"])
+    assert all(run["structures"] == list(range(20)) for run in official["runs"])
+    assert len(sensitivity["runs"]) == 11
+    assert any(run.get("overrides", {}).get("turns") == 30 for run in sensitivity["runs"])
+
+
 def test_load_experiment_rejects_empty_runs(tmp_path):
     manifest_path = tmp_path / "empty.yaml"
     manifest_path.write_text(yaml.safe_dump({"experiment": {"runs": []}}), encoding="utf-8")
@@ -146,6 +165,16 @@ def test_load_experiment_rejects_bad_run_spec(tmp_path):
         encoding="utf-8",
     )
     with pytest.raises(ExperimentConfigError, match="seeds"):
+        load_experiment(str(manifest_path))
+
+
+def test_load_experiment_rejects_bad_run_overrides(tmp_path):
+    manifest_path = tmp_path / "bad_run_overrides.yaml"
+    manifest_path.write_text(
+        yaml.safe_dump({"experiment": {"runs": [{"config": "config.yaml", "overrides": ["bad"]}]}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ExperimentConfigError, match=r"runs\[\].overrides"):
         load_experiment(str(manifest_path))
 
 
@@ -192,6 +221,25 @@ def test_expand_run_specs_adds_seed_suffix_and_structure_override():
             },
         },
     ]
+
+
+def test_expand_run_specs_merges_nested_run_overrides():
+    runs = [{
+        "config": "configs/craft/eval_gemma4_12b_ollama.yaml",
+        "suffix": "_oracle5",
+        "overrides": {"craft": {"oracle_n": 5}},
+    }]
+
+    expanded = _expand_run_specs(runs, {"turns": 20, "craft": {"use_oracle": True}})
+
+    assert expanded == [{
+        "config": "configs/craft/eval_gemma4_12b_ollama.yaml",
+        "overrides": {
+            "turns": 20,
+            "craft": {"use_oracle": True, "oracle_n": 5},
+            "run_name_suffix": "_oracle5",
+        },
+    }]
 
 
 def test_run_experiment_dry_run_creates_run_output(tmp_path):
