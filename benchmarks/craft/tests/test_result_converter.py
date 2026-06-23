@@ -305,6 +305,17 @@ def test_result_converter_writes_clarification_trace_with_next_action_link(tmp_p
     assert outcome["outcome"] == "neutral"
     assert outcome["outcome_reasons"] == ["same_action_after_clarification"]
 
+    summary = json.loads((tmp_path / "normalized" / "summary.json").read_text())
+    runtime = summary["runtime"]
+    assert runtime["progress_at_turn_5"] == 0.25
+    assert runtime["progress_at_turn_20"] == 0.25
+    assert runtime["progress_at_turn_30"] == 0.25
+    assert runtime["normalized_progress_auc"] == 0.175
+    assert runtime["neutral_clarification_count"] == 1
+    assert runtime["same_action_after_clarification_rate"] == 1.0
+    assert runtime["mean_clarification_to_action_latency"] == 1.0
+    assert runtime["mean_progress_after_clarification"] == 0.15
+
 
 def test_result_converter_tracks_clarification_resolution_and_progress_delta(tmp_path):
     config = {

@@ -28,6 +28,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
     epistemic_counts = _epistemic_counts(turns)
     action_candidate_metrics = _action_candidate_metrics(turns)
     clarification_metrics = _clarification_metrics(turns)
+    clarification_outcome_metrics = _clarification_outcome_metrics(games, config)
     retrieval_metrics = _retrieval_metrics(turns)
     progress_action_metrics = _aggregate_progress_action_metrics(games)
     dual_dag_metrics = _dual_dag_metrics(games)
@@ -63,6 +64,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
             "hypothesis_count": hypothesis_count,
             **action_candidate_metrics,
             **clarification_metrics,
+            **clarification_outcome_metrics,
             **retrieval_metrics,
             **progress_action_metrics,
             **dual_dag_metrics,
@@ -119,6 +121,10 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
         "negative_progress_turn_count",
         "mean_progress_delta_per_turn",
         "mean_progress_delta_per_physical_action",
+        "progress_at_turn_5",
+        "progress_at_turn_20",
+        "progress_at_turn_30",
+        "normalized_progress_auc",
         "observed_fact_count",
         "reported_claim_count",
         "hypothesis_count",
@@ -158,6 +164,15 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
         "clarification_to_positive_action_count",
         "clarification_to_positive_action_latency",
         "clarification_without_state_change_count",
+        "beneficial_clarification_count",
+        "neutral_clarification_count",
+        "harmful_clarification_count",
+        "failed_clarification_count",
+        "beneficial_clarification_rate",
+        "same_action_after_clarification_count",
+        "same_action_after_clarification_rate",
+        "mean_clarification_to_action_latency",
+        "mean_progress_after_clarification",
         "gate_invocation_count",
         "gate_allow_count",
         "gate_block_count",
@@ -200,6 +215,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
             game_epistemic_counts = _epistemic_counts(game.get("turns", []))
             game_action_candidate_metrics = _action_candidate_metrics(game.get("turns", []))
             game_clarification_metrics = _clarification_metrics(game.get("turns", []))
+            game_clarification_outcome_metrics = _clarification_outcome_metrics([game], config)
             game_retrieval_metrics = _retrieval_metrics(game.get("turns", []))
             game_progress_action_metrics = _progress_action_metrics(game)
             game_dual_dag_metrics = _dual_dag_metrics([game])
@@ -242,6 +258,10 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
                 "negative_progress_turn_count": game_progress_action_metrics["negative_progress_turn_count"],
                 "mean_progress_delta_per_turn": game_progress_action_metrics["mean_progress_delta_per_turn"],
                 "mean_progress_delta_per_physical_action": game_progress_action_metrics["mean_progress_delta_per_physical_action"],
+                "progress_at_turn_5": game_progress_action_metrics["progress_at_turn_5"],
+                "progress_at_turn_20": game_progress_action_metrics["progress_at_turn_20"],
+                "progress_at_turn_30": game_progress_action_metrics["progress_at_turn_30"],
+                "normalized_progress_auc": game_progress_action_metrics["normalized_progress_auc"],
                 "observed_fact_count": game_epistemic_counts["observed_fact_count"],
                 "reported_claim_count": game_epistemic_counts["reported_claim_count"],
                 "hypothesis_count": game_hypothesis_count,
@@ -281,6 +301,15 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
                 "clarification_to_positive_action_count": game_clarification_metrics["clarification_to_positive_action_count"],
                 "clarification_to_positive_action_latency": game_clarification_metrics["clarification_to_positive_action_latency"],
                 "clarification_without_state_change_count": game_clarification_metrics["clarification_without_state_change_count"],
+                "beneficial_clarification_count": game_clarification_outcome_metrics["beneficial_clarification_count"],
+                "neutral_clarification_count": game_clarification_outcome_metrics["neutral_clarification_count"],
+                "harmful_clarification_count": game_clarification_outcome_metrics["harmful_clarification_count"],
+                "failed_clarification_count": game_clarification_outcome_metrics["failed_clarification_count"],
+                "beneficial_clarification_rate": game_clarification_outcome_metrics["beneficial_clarification_rate"],
+                "same_action_after_clarification_count": game_clarification_outcome_metrics["same_action_after_clarification_count"],
+                "same_action_after_clarification_rate": game_clarification_outcome_metrics["same_action_after_clarification_rate"],
+                "mean_clarification_to_action_latency": game_clarification_outcome_metrics["mean_clarification_to_action_latency"],
+                "mean_progress_after_clarification": game_clarification_outcome_metrics["mean_progress_after_clarification"],
                 "gate_invocation_count": game_clarification_metrics["gate_invocation_count"],
                 "gate_allow_count": game_clarification_metrics["gate_allow_count"],
                 "gate_block_count": game_clarification_metrics["gate_block_count"],
@@ -363,6 +392,10 @@ def _aggregate_progress_action_metrics(games: list[dict]) -> dict:
     return {
         "max_progress": _mean([metric["max_progress"] for metric in game_metrics]),
         "progress_auc": _mean([metric["progress_auc"] for metric in game_metrics]),
+        "progress_at_turn_5": _mean([metric["progress_at_turn_5"] for metric in game_metrics]),
+        "progress_at_turn_20": _mean([metric["progress_at_turn_20"] for metric in game_metrics]),
+        "progress_at_turn_30": _mean([metric["progress_at_turn_30"] for metric in game_metrics]),
+        "normalized_progress_auc": _mean([metric["normalized_progress_auc"] for metric in game_metrics]),
         "physical_action_count": sum(metric["physical_action_count"] for metric in game_metrics),
         "place_action_count": sum(metric["place_action_count"] for metric in game_metrics),
         "remove_action_count": sum(metric["remove_action_count"] for metric in game_metrics),
@@ -400,6 +433,10 @@ def _progress_action_metrics(game: dict) -> dict:
     return {
         "max_progress": max(progress_values) if progress_values else 0.0,
         "progress_auc": _mean(progress_values),
+        "progress_at_turn_5": _progress_at_turn(progress_values, 5),
+        "progress_at_turn_20": _progress_at_turn(progress_values, 20),
+        "progress_at_turn_30": _progress_at_turn(progress_values, 30),
+        "normalized_progress_auc": _mean(progress_values),
         **action_counts,
         "positive_progress_turn_count": sum(1 for delta in deltas if delta > 0.0),
         "zero_progress_turn_count": sum(1 for delta in deltas if delta == 0.0),
@@ -445,10 +482,20 @@ def _action_throughput_counts(turns: list[dict]) -> dict:
     return counts
 
 
+def _progress_at_turn(progress_values: list[float], turn_number: int) -> float:
+    if not progress_values:
+        return 0.0
+    return progress_values[min(turn_number, len(progress_values)) - 1]
+
+
 def _empty_progress_action_metrics() -> dict:
     return {
         "max_progress": 0.0,
         "progress_auc": 0.0,
+        "progress_at_turn_5": 0.0,
+        "progress_at_turn_20": 0.0,
+        "progress_at_turn_30": 0.0,
+        "normalized_progress_auc": 0.0,
         "physical_action_count": 0,
         "place_action_count": 0,
         "remove_action_count": 0,
@@ -776,6 +823,37 @@ def _write_clarification_trace(*, normalized_dir: Path, games: list[dict], confi
         for row in rows:
             outcome = classify_clarification_outcome(row)
             f.write(json.dumps({**row, **outcome}, ensure_ascii=False) + "\n")
+
+
+def _clarification_outcome_metrics(games: list[dict], config: dict) -> dict:
+    counts = {"beneficial": 0, "neutral": 0, "harmful": 0, "failed": 0}
+    same_action_count = 0
+    latencies = []
+    progress_deltas = []
+    rows = _clarification_trace_rows(games=games, config=config)
+    for row in rows:
+        outcome = classify_clarification_outcome(row)
+        counts[outcome["outcome"]] = counts.get(outcome["outcome"], 0) + 1
+        if row.get("next_action_was_original_top_candidate") or row.get("same_top_action_after_clarification"):
+            same_action_count += 1
+        latency = row.get("clarification_to_action_latency")
+        if latency is not None:
+            latencies.append(float(latency))
+        progress_delta = row.get("next_physical_action_progress_delta")
+        if progress_delta is not None:
+            progress_deltas.append(float(progress_delta))
+    total = len(rows)
+    return {
+        "beneficial_clarification_count": counts["beneficial"],
+        "neutral_clarification_count": counts["neutral"],
+        "harmful_clarification_count": counts["harmful"],
+        "failed_clarification_count": counts["failed"],
+        "beneficial_clarification_rate": counts["beneficial"] / total if total else 0.0,
+        "same_action_after_clarification_count": same_action_count,
+        "same_action_after_clarification_rate": same_action_count / total if total else 0.0,
+        "mean_clarification_to_action_latency": _mean(latencies) if latencies else 0.0,
+        "mean_progress_after_clarification": _mean(progress_deltas) if progress_deltas else 0.0,
+    }
 
 
 def _remaining_turns(config: dict, turn_index: int | None) -> int | None:
