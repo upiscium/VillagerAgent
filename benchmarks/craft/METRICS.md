@@ -8,6 +8,10 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 - `final_progress`: Per-structure final progress. This is the per-game value used to compute `mean_final_progress`.
 - `max_progress`: Maximum per-turn progress reached in an episode, averaged across games for run-level summaries.
 - `progress_auc`: Turn-normalized mean progress across observed turns. This is useful for comparing early progress within the same horizon without changing `mean_final_progress`.
+- `progress_at_turn_5`: Progress at turn 5, or the final observed progress for shorter runs.
+- `progress_at_turn_20`: Progress at turn 20, or the final observed progress for shorter runs. This is retained for 30-turn runs to compare against the official 20-turn horizon.
+- `progress_at_turn_30`: Progress at turn 30, or the final observed progress for shorter runs.
+- `normalized_progress_auc`: Alias for the turn-normalized progress AUC used by newer Clarify-policy reports.
 - `completion_rate`: Fraction of games that reached the complete-state condition. With short turn budgets this is usually low or zero.
 - `positive_progress_turn_count`: Number of turns with positive progress delta relative to the previous turn.
 - `zero_progress_turn_count`: Number of turns with no progress delta relative to the previous turn.
@@ -69,6 +73,15 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 - `clarification_to_positive_action_count`: Number of clarification turns followed by a later non-clarify turn with higher progress.
 - `clarification_to_positive_action_latency`: Mean turn distance from clarification to the later positive-progress non-clarify action.
 - `clarification_without_state_change_count`: Number of clarification turns without downstream resolution under the existing unlock heuristic.
+- `beneficial_clarification_count`: Number of Clarify events classified as beneficial by deterministic offline rules.
+- `neutral_clarification_count`: Number of Clarify events classified as neutral.
+- `harmful_clarification_count`: Number of Clarify events classified as harmful.
+- `failed_clarification_count`: Number of Clarify events classified as failed.
+- `beneficial_clarification_rate`: `beneficial_clarification_count / clarification_count` when Clarify events exist.
+- `same_action_after_clarification_count`: Number of Clarify events followed by the original top candidate/action.
+- `same_action_after_clarification_rate`: `same_action_after_clarification_count / clarification_count` when Clarify events exist.
+- `mean_clarification_to_action_latency`: Mean turn distance from Clarify to the next physical action.
+- `mean_progress_after_clarification`: Mean progress delta from Clarify to the next physical action.
 - `gate_invocation_count`: Number of persisted gate decision metadata records. Current artifacts persist intervention decisions; future allow decisions are counted when stored with `reason=none` or `decision=allow`.
 - `gate_allow_count`: Number of persisted allow decisions.
 - `gate_block_count`: Number of persisted gate interventions that blocked the candidate action.

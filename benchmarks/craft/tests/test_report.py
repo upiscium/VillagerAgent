@@ -45,6 +45,8 @@ def test_report_aggregates_multiple_runs(tmp_path):
     assert rows[1]["builder_fallback_count"] == 1
     assert rows[1]["builder_fallback_rate"] == 1.0
     assert rows[1]["progress_auc"] == 0.3
+    assert rows[1]["progress_at_turn_20"] == 0.4
+    assert rows[1]["normalized_progress_auc"] == 0.3
     assert rows[1]["physical_action_count"] == 2
     assert rows[1]["mean_progress_delta_per_physical_action"] == 0.2
     assert rows[1]["mean_action_confidence"] == 0.6
@@ -66,6 +68,9 @@ def test_report_aggregates_multiple_runs(tmp_path):
     assert rows[1]["clarification_to_unlock_rate"] == 0.5
     assert rows[1]["mean_clarification_quality_score"] == 0.75
     assert rows[1]["mean_risk_score"] == 0.4
+    assert rows[1]["beneficial_clarification_count"] == 1
+    assert rows[1]["same_action_after_clarification_rate"] == 0.5
+    assert rows[1]["mean_progress_after_clarification"] == 0.2
 
     csv_path = tmp_path / "comparison_summary.csv"
     json_path = tmp_path / "comparison_summary.json"
@@ -130,6 +135,8 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "leakage_passed",
                 "mean_action_confidence",
                 "progress_auc",
+                "progress_at_turn_20",
+                "normalized_progress_auc",
                 "physical_action_count",
                 "mean_progress_delta_per_physical_action",
                 "claim_support_count",
@@ -152,6 +159,9 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "mean_clarification_quality_score",
                 "mean_post_clarification_progress_delta",
                 "mean_risk_score",
+                "beneficial_clarification_count",
+                "same_action_after_clarification_rate",
+                "mean_progress_after_clarification",
             ],
         )
         writer.writeheader()
@@ -160,6 +170,8 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "leakage_passed": value,
                 "mean_action_confidence": "0.6",
                 "progress_auc": "0.3",
+                "progress_at_turn_20": "0.4",
+                "normalized_progress_auc": "0.3",
                 "physical_action_count": "2",
                 "mean_progress_delta_per_physical_action": "0.2",
                 "claim_support_count": "2",
@@ -182,6 +194,9 @@ def _write_run(tmp_path, run_name, *, condition, leakage_values, use_state_manag
                 "mean_clarification_quality_score": "0.75",
                 "mean_post_clarification_progress_delta": "0.2",
                 "mean_risk_score": "0.4",
+                "beneficial_clarification_count": "1",
+                "same_action_after_clarification_rate": "0.5",
+                "mean_progress_after_clarification": "0.2",
             })
 
 

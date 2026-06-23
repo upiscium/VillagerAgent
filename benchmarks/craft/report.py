@@ -6,7 +6,12 @@ from pathlib import Path
 import yaml
 
 from benchmarks.craft.config import repo_root
-from benchmarks.craft.result_converter import _clarification_metrics, _progress_action_metrics, _retrieval_metrics
+from benchmarks.craft.result_converter import (
+    _clarification_metrics,
+    _clarification_outcome_metrics,
+    _progress_action_metrics,
+    _retrieval_metrics,
+)
 
 
 REPORT_FIELDS = [
@@ -44,6 +49,10 @@ REPORT_FIELDS = [
     "negative_progress_turn_count",
     "mean_progress_delta_per_turn",
     "mean_progress_delta_per_physical_action",
+    "progress_at_turn_5",
+    "progress_at_turn_20",
+    "progress_at_turn_30",
+    "normalized_progress_auc",
     "observed_fact_count",
     "reported_claim_count",
     "hypothesis_count",
@@ -83,6 +92,15 @@ REPORT_FIELDS = [
     "clarification_to_positive_action_count",
     "clarification_to_positive_action_latency",
     "clarification_without_state_change_count",
+    "beneficial_clarification_count",
+    "neutral_clarification_count",
+    "harmful_clarification_count",
+    "failed_clarification_count",
+    "beneficial_clarification_rate",
+    "same_action_after_clarification_count",
+    "same_action_after_clarification_rate",
+    "mean_clarification_to_action_latency",
+    "mean_progress_after_clarification",
     "gate_invocation_count",
     "gate_allow_count",
     "gate_block_count",
@@ -151,6 +169,7 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
         "final_progress": summary.get("mean_final_progress", 0.0),
     })
     clarification_metrics = _clarification_metrics(turns)
+    clarification_outcome_metrics = _clarification_outcome_metrics([{"turns": turns}], resolved_config or summary)
     retrieval_metrics = _retrieval_metrics(turns)
     active_directors = runtime.get("active_directors") or _active_directors_from_config(
         resolved_config,
@@ -243,6 +262,22 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
         "mean_progress_delta_per_physical_action": runtime.get(
             "mean_progress_delta_per_physical_action",
             _mean_metric_rows_or_default(metrics_rows, "mean_progress_delta_per_physical_action", progress_action_metrics["mean_progress_delta_per_physical_action"]),
+        ),
+        "progress_at_turn_5": runtime.get(
+            "progress_at_turn_5",
+            _mean_metric_rows_or_default(metrics_rows, "progress_at_turn_5", progress_action_metrics["progress_at_turn_5"]),
+        ),
+        "progress_at_turn_20": runtime.get(
+            "progress_at_turn_20",
+            _mean_metric_rows_or_default(metrics_rows, "progress_at_turn_20", progress_action_metrics["progress_at_turn_20"]),
+        ),
+        "progress_at_turn_30": runtime.get(
+            "progress_at_turn_30",
+            _mean_metric_rows_or_default(metrics_rows, "progress_at_turn_30", progress_action_metrics["progress_at_turn_30"]),
+        ),
+        "normalized_progress_auc": runtime.get(
+            "normalized_progress_auc",
+            _mean_metric_rows_or_default(metrics_rows, "normalized_progress_auc", progress_action_metrics["normalized_progress_auc"]),
         ),
         "observed_fact_count": runtime.get(
             "observed_fact_count",
@@ -399,6 +434,42 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
         "clarification_without_state_change_count": runtime.get(
             "clarification_without_state_change_count",
             _sum_metric_rows_or_default(metrics_rows, "clarification_without_state_change_count", clarification_metrics["clarification_without_state_change_count"]),
+        ),
+        "beneficial_clarification_count": runtime.get(
+            "beneficial_clarification_count",
+            _sum_metric_rows_or_default(metrics_rows, "beneficial_clarification_count", clarification_outcome_metrics["beneficial_clarification_count"]),
+        ),
+        "neutral_clarification_count": runtime.get(
+            "neutral_clarification_count",
+            _sum_metric_rows_or_default(metrics_rows, "neutral_clarification_count", clarification_outcome_metrics["neutral_clarification_count"]),
+        ),
+        "harmful_clarification_count": runtime.get(
+            "harmful_clarification_count",
+            _sum_metric_rows_or_default(metrics_rows, "harmful_clarification_count", clarification_outcome_metrics["harmful_clarification_count"]),
+        ),
+        "failed_clarification_count": runtime.get(
+            "failed_clarification_count",
+            _sum_metric_rows_or_default(metrics_rows, "failed_clarification_count", clarification_outcome_metrics["failed_clarification_count"]),
+        ),
+        "beneficial_clarification_rate": runtime.get(
+            "beneficial_clarification_rate",
+            _mean_metric_rows_or_default(metrics_rows, "beneficial_clarification_rate", clarification_outcome_metrics["beneficial_clarification_rate"]),
+        ),
+        "same_action_after_clarification_count": runtime.get(
+            "same_action_after_clarification_count",
+            _sum_metric_rows_or_default(metrics_rows, "same_action_after_clarification_count", clarification_outcome_metrics["same_action_after_clarification_count"]),
+        ),
+        "same_action_after_clarification_rate": runtime.get(
+            "same_action_after_clarification_rate",
+            _mean_metric_rows_or_default(metrics_rows, "same_action_after_clarification_rate", clarification_outcome_metrics["same_action_after_clarification_rate"]),
+        ),
+        "mean_clarification_to_action_latency": runtime.get(
+            "mean_clarification_to_action_latency",
+            _mean_metric_rows_or_default(metrics_rows, "mean_clarification_to_action_latency", clarification_outcome_metrics["mean_clarification_to_action_latency"]),
+        ),
+        "mean_progress_after_clarification": runtime.get(
+            "mean_progress_after_clarification",
+            _mean_metric_rows_or_default(metrics_rows, "mean_progress_after_clarification", clarification_outcome_metrics["mean_progress_after_clarification"]),
         ),
         "gate_invocation_count": runtime.get(
             "gate_invocation_count",
