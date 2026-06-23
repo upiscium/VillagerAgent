@@ -90,6 +90,7 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 - `gate_reason_counts`: JSON object aggregating persisted gate reasons.
 - `gated_clarification_count`: Number of turns where the Dual-DAG gate replaced a candidate action with `clarify`.
 - `gated_clarification_rate`: `gated_clarification_count / turn_count`.
+- Clarify budget controls are opt-in via `dual_dag.gated_clarification.max_clarifications_per_episode`, `clarification_cooldown_turns`, `prevent_duplicate_clarifications`, `min_remaining_turns_after_clarification`, and `disallow_after_turn_fraction`. Suppressed Clarify actions persist gate metadata with `decision=allow` and a `suppression_reason`.
 - Adaptive gated clarification is experimental and opt-in. When `dual_dag.gated_clarification.adaptive_thresholds.enabled=true`, the gate adjusts `min_action_confidence` and `clarification_cost` from public action metadata: support lowers intervention pressure, while conflicts and required evidence raise it. Static thresholds remain the default.
 - `clarification_resolution_count`: Number of clarification turns whose next non-clarify action shows downstream resolution. Resolution is heuristic-based: progress increases, chosen action confidence improves, or conflict/required-evidence counts decrease.
 - `clarification_resolution_rate`: `clarification_resolution_count / clarification_count`.
