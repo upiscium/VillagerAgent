@@ -1,0 +1,44 @@
+experiment:
+  name: craft_gemma4_12b_clarify_policy_official
+  description: Official oracle-assisted Clarify policy comparison using oracle_n=5 and turns=20.
+  result_root: result/craft
+  continue_on_error: true
+  overrides:
+    turns: 20
+  runs:
+    - config: configs/craft/eval_gemma4_12b_ollama.yaml
+      suffix: _v0_va_baseline_oracle5
+      seeds: [1, 3, 5]
+      structures: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+      overrides:
+        craft:
+          oracle_n: 5
+    - config: configs/craft/eval_gemma4_12b_ollama_dual_dag_retrieval.yaml
+      suffix: _v1_dual_dag_clarify_disabled_oracle5
+      seeds: [1, 3, 5]
+      structures: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+      overrides:
+        craft:
+          oracle_n: 5
+    - config: configs/craft/eval_gemma4_12b_ollama_dual_dag.yaml
+      suffix: _v2_dual_dag_current_clarify_oracle5
+      seeds: [1, 3, 5]
+      structures: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+      overrides:
+        craft:
+          oracle_n: 5
+    - config: configs/craft/eval_gemma4_12b_ollama_dual_dag_clarify_throughput_fix.yaml
+      suffix: _v3_dual_dag_throughput_fix_oracle5
+      seeds: [1, 3, 5]
+      structures: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+      overrides:
+        craft:
+          oracle_n: 5
+  report:
+    output: result/craft/comparison_gemma4_12b_clarify_policy_official.csv
+    json_output: result/craft/comparison_gemma4_12b_clarify_policy_official.json
+    compact_summary_output: result/craft/summary_gemma4_12b_clarify_policy_official.csv
+    compact_summary_json_output: result/craft/summary_gemma4_12b_clarify_policy_official.json
+    variance_summary_output: result/craft/variance_gemma4_12b_clarify_policy_official.csv
+    variance_summary_json_output: result/craft/variance_gemma4_12b_clarify_policy_official.json
+    variance_group_by: run_group
