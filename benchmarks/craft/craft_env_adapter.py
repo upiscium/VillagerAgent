@@ -182,7 +182,7 @@ class CraftEnvAdapter:
                         prompt_messages=prompt_messages,
                     )
                 forbidden = {
-                    "target_structure": sample.get("structure"),
+                    "target_structure": _target_structure_for_guard(sample=sample, game_state=game_state),
                     "oracle_moves": _oracle_moves_for_guard(game_state, self.config),
                 }
                 for other_id, view in private_views.items():
@@ -960,7 +960,7 @@ def _builder_forbidden_payloads(
     config: dict,
 ) -> dict:
     forbidden = {
-        "target_structure": sample.get("structure"),
+        "target_structure": _target_structure_for_guard(sample=sample, game_state=game_state),
         "oracle_moves": _oracle_moves_for_guard(game_state, config),
     }
     for director_id, view in private_views.items():
@@ -968,6 +968,23 @@ def _builder_forbidden_payloads(
     for key in BASE_HIDDEN_STATE_KEYS:
         forbidden[f"hidden_key:{key}"] = key
     return forbidden
+
+
+def _target_structure_for_guard(*, sample: dict, game_state) -> dict | None:
+    target = sample.get("structure")
+    if _structures_equal(getattr(game_state, "current_structure", None), target):
+        return None
+    return target
+
+
+def _structures_equal(left, right) -> bool:
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    return _canonical_structure(left) == _canonical_structure(right)
+
+
+def _canonical_structure(structure: dict) -> dict:
+    return {str(key): list(value or []) for key, value in sorted(structure.items(), key=lambda item: str(item[0]))}
 
 
 def _safe_progress_summary(game_state) -> dict:
