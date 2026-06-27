@@ -3,6 +3,12 @@ import json
 import pytest
 
 from benchmarks.craft.leakage_guard import LeakageGuard, PartialInformationLeakageError
+from benchmarks.craft.craft_env_adapter import _target_structure_for_guard
+
+
+class _GameState:
+    def __init__(self, current_structure):
+        self.current_structure = current_structure
 
 
 def test_oracle_moves_not_in_prompt():
@@ -103,3 +109,11 @@ def test_saved_builder_prompt_artifact_reports_hidden_key(tmp_path):
         )
 
     assert guard.reports[0]["violations"][0]["label"] == "hidden_key:target_structure"
+
+
+def test_target_structure_guard_allows_publicly_completed_structure():
+    target = {"(0,0)": ["gs"], "(0,1)": []}
+    sample = {"structure": target}
+
+    assert _target_structure_for_guard(sample=sample, game_state=_GameState({"(0,0)": [], "(0,1)": []})) == target
+    assert _target_structure_for_guard(sample=sample, game_state=_GameState({"(0,0)": ["gs"], "(0,1)": []})) is None
