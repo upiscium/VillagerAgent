@@ -1,6 +1,6 @@
 # CRAFT Clarification Policy Findings
 
-This records the Gemma4 12B Clarify policy smoke results for #148.
+This records the Gemma4 12B Clarify policy smoke and official results for #148.
 
 The run is diagnostic smoke, not final performance evaluation. It uses `gemma4:12b`, 5 turns, structures `[0, 1, 2, 3, 4]`, and seeds `[1, 3, 5]`.
 
@@ -61,3 +61,27 @@ For the next policy iteration, prioritize an explicit turn-budget opportunity-co
 ## Caveats
 
 This is a 5-turn diagnostic smoke only. It should not be reported as final performance. Official `oracle_n=5`, 20-turn policy results are still required before making claims about full CRAFT performance.
+
+## Official 20-Turn Evaluation
+
+After fixing the completed-public-structure leakage false positive in #158, the official `oracle_n=5`, 20-turn comparison completed for V0-V4 with seeds `[1, 3, 5]` and structures `[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]`.
+
+Artifacts:
+
+- `result/craft/comparison_gemma4_12b_clarify_policy_official_post_leakage_fix.json`
+- `result/craft/summary_gemma4_12b_clarify_policy_official_post_leakage_fix.csv`
+- `result/craft/variance_gemma4_12b_clarify_policy_official_post_leakage_fix.csv`
+
+| Policy | n | mean_final_progress | delta vs V0 | progress_auc | physical_action_count | clarify_count | neutral_clarification_count | failed_clarification_count | builder_fallback_rate | retrieved_node_count | leakage_passed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| V0 VA baseline | 3 | 0.763131497736379 | 0.0 | 0.338122418062063 | 400.0 | 0.0 | 0.0 | 0.0 | 0.044167 | 0.0 | true |
+| V1 Dual-DAG, Clarify disabled | 3 | 0.755134296375715 | -0.007997201360664 | 0.344422476527625 | 400.0 | 0.0 | 0.0 | 0.0 | 0.045833 | 0.0 | true |
+| V2 Dual-DAG, current Clarify | 3 | 0.748356992062942 | -0.014774505673438 | 0.477945195773800 | 269.0 | 131.0 | 1.0 | 130.0 | 0.0 | 0.0 | true |
+| V3 Dual-DAG, throughput fix | 3 | 0.748356992062942 | -0.014774505673438 | 0.434534854258872 | 290.0 | 110.0 | 14.666667 | 95.333333 | 0.0 | 0.0 | true |
+| V4 Dual-DAG, value of information | 3 | 0.766066632508662 | 0.002935134772282 | 0.338729654477652 | 399.0 | 1.0 | 1.0 | 0.0 | 0.043333 | 0.0 | true |
+
+Official results change the smoke-only conclusion: V4 is the only Clarify-enabled policy that avoids the high-clarification throughput collapse and slightly exceeds V0 mean final progress. V2 and V3 still reproduce the regression path, with 131 and 110 Clarify actions on average and physical actions reduced to 269 and 290 respectively.
+
+V1 Clarify-disabled Dual-DAG keeps physical throughput at 400 actions but trails V0 by `0.007997201360664` mean final progress. Retrieval did not activate in this official run (`retrieved_node_count` and `retrieval_used_in_top_action_count` are `0.0`), so the V1 difference should not be interpreted as retrieval behavior.
+
+The strongest config-gated candidate from this evaluation is V4 value-of-information. It preserves near-baseline physical throughput (`399.0` vs `400.0`), limits Clarify to `1.0` per run on average, and has no failed Clarify outcomes in this run. It should remain opt-in until replicated, but it is the first policy variant here with a positive official delta against V0.
