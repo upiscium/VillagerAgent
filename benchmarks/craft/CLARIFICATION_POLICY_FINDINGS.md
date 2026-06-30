@@ -85,3 +85,36 @@ Official results change the smoke-only conclusion: V4 is the only Clarify-enable
 V1 Clarify-disabled Dual-DAG keeps physical throughput at 400 actions but trails V0 by `0.007997201360664` mean final progress. Retrieval did not activate in this official run (`retrieved_node_count` and `retrieval_used_in_top_action_count` are `0.0`), so the V1 difference should not be interpreted as retrieval behavior.
 
 The strongest config-gated candidate from this evaluation is V4 value-of-information. It preserves near-baseline physical throughput (`399.0` vs `400.0`), limits Clarify to `1.0` per run on average, and has no failed Clarify outcomes in this run. It should remain opt-in until replicated, but it is the first policy variant here with a positive official delta against V0.
+
+## Sensitivity Evaluation
+
+The post-official sensitivity sweep completed for structures `[0, 1, 2, 3, 4]`, seeds `[1, 3, 5]`, oracle counts `[1, 3, 5]`, and 20 turns. It also includes 30-turn runs for V2-V4 at `oracle_n=5`. The 20-turn sensitivity comparison uses V1 Clarify-disabled Dual-DAG as the within-setting baseline because V0 VA baseline was not part of this manifest.
+
+Artifacts:
+
+- `result/craft/comparison_gemma4_12b_clarify_policy_sensitivity_post_official.json`
+- `result/craft/summary_gemma4_12b_clarify_policy_sensitivity_post_official.csv`
+- `result/craft/variance_gemma4_12b_clarify_policy_sensitivity_post_official.csv`
+
+| Policy | oracle_n | turns | n | mean_final_progress | delta vs V1 | progress_auc | physical_action_count | clarify_count | neutral_clarification_count | failed_clarification_count | builder_fallback_rate | retrieved_node_count | leakage_passed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| V1 Dual-DAG, Clarify disabled | 1 | 20 | 3 | 0.649131410725614 | 0.0 | 0.313576066043457 | 100.0 | 0.0 | 0.0 | 0.0 | 0.076667 | 0.0 | true |
+| V2 Dual-DAG, current Clarify | 1 | 20 | 3 | 0.642337704163791 | -0.006793706561822 | 0.421490261483015 | 74.0 | 26.0 | 4.666667 | 21.333333 | 0.06 | 0.0 | true |
+| V3 Dual-DAG, throughput fix | 1 | 20 | 3 | 0.656313012805766 | 0.007181602080153 | 0.412917142090331 | 74.0 | 26.0 | 7.333333 | 18.666667 | 0.05 | 0.0 | true |
+| V4 Dual-DAG, value of information | 1 | 20 | 3 | 0.661866274895260 | 0.012734864169647 | 0.316752217133377 | 99.666667 | 0.333333 | 0.333333 | 0.0 | 0.073333 | 0.0 | true |
+| V1 Dual-DAG, Clarify disabled | 3 | 20 | 3 | 0.643734989648033 | 0.0 | 0.275121164021164 | 100.0 | 0.0 | 0.0 | 0.0 | 0.066667 | 0.0 | true |
+| V2 Dual-DAG, current Clarify | 3 | 20 | 3 | 0.636849781458477 | -0.006885208189556 | 0.427002231423971 | 60.0 | 40.0 | 0.666667 | 39.333333 | 0.0 | 0.0 | true |
+| V3 Dual-DAG, throughput fix | 3 | 20 | 3 | 0.636849781458477 | -0.006885208189556 | 0.414224208266237 | 61.666667 | 38.333333 | 3.666667 | 34.666667 | 0.0 | 0.0 | true |
+| V4 Dual-DAG, value of information | 3 | 20 | 3 | 0.639732661326864 | -0.004002328321169 | 0.304584574175154 | 100.0 | 0.0 | 0.0 | 0.0 | 0.073333 | 0.0 | true |
+| V1 Dual-DAG, Clarify disabled | 5 | 20 | 3 | 0.655471373500359 | 0.0 | 0.289395219622031 | 100.0 | 0.0 | 0.0 | 0.0 | 0.056667 | 0.0 | true |
+| V2 Dual-DAG, current Clarify | 5 | 20 | 3 | 0.636849781458477 | -0.018621592041882 | 0.426905329345909 | 60.0 | 40.0 | 0.0 | 40.0 | 0.0 | 0.0 | true |
+| V3 Dual-DAG, throughput fix | 5 | 20 | 3 | 0.636849781458477 | -0.018621592041882 | 0.354985576259489 | 69.666667 | 30.333333 | 4.0 | 26.333333 | 0.0 | 0.0 | true |
+| V4 Dual-DAG, value of information | 5 | 20 | 3 | 0.652458679270273 | -0.003012694230085 | 0.292610789398471 | 100.0 | 0.0 | 0.0 | 0.0 | 0.073333 | 0.0 | true |
+
+The sensitivity sweep supports the official diagnosis that V2 and V3 still over-use Clarify. Across 20-turn oracle settings, V2 issues `26.0` to `40.0` Clarify actions per run and V3 issues `26.0` to `38.333333`, mostly failed. Their final-progress deltas are negative except V3 at `oracle_n=1`, where it improves final progress despite losing 26 physical actions.
+
+V4 is more stable than V2/V3. It issues at most `0.333333` Clarify actions per run in the 20-turn sensitivity settings, has no failed Clarify outcomes, and preserves physical-action throughput at `99.666667` to `100.0`. Its final-progress delta is positive at `oracle_n=1` and near V1 at `oracle_n=3` and `oracle_n=5`, with small negative deltas of `-0.004002328321169` and `-0.003012694230085`.
+
+The 30-turn `oracle_n=5` sensitivity runs did not include V1, so they are not causal comparisons against Clarify-disabled Dual-DAG. They still show the same behavior split: V2 and V3 spend `90.0` and `75.666667` turns on Clarify with many failed outcomes, while V4 spends `0.0` turns on Clarify and executes `150.0` physical actions.
+
+Retrieval still did not activate in this sensitivity sweep (`retrieved_node_count` and `retrieval_used_in_top_action_count` are `0.0`), and all runs passed the leakage guard. The remaining observed policy differences are therefore Clarify-policy and fallback/throughput effects rather than retrieval effects.
