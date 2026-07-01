@@ -95,6 +95,15 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 - Value-of-information Clarify is opt-in via `dual_dag.gated_clarification.policy=value_of_information`. It logs `value_of_clarification` and `voi_components` in gate metadata using only public action-candidate metadata, not hidden target state.
 - Adaptive gated clarification is experimental and opt-in. When `dual_dag.gated_clarification.adaptive_thresholds.enabled=true`, the gate adjusts `min_action_confidence` and `clarification_cost` from public action metadata: support lowers intervention pressure, while conflicts and required evidence raise it. Static thresholds remain the default.
 - Repeated zero-progress action suppression is experimental and opt-in via `dual_dag.action_selection.suppress_repeated_zero_progress.enabled`. It down-ranks candidate physical actions that recently repeated with zero or missing progress, using only public prior Builder actions and progress deltas.
+- `action_selection_suppression_enabled_count`: Number of turns with persisted repeated-zero suppression diagnostics while the policy was enabled.
+- `action_selection_suppression_disabled_count`: Number of turns with persisted repeated-zero suppression diagnostics while the policy was disabled.
+- `action_selection_suppression_attempt_count`: Number of enabled turns where candidates were evaluated for repeated-zero suppression.
+- `action_selection_repeated_zero_signature_count`: Total repeated zero/missing-progress action signatures detected in the lookback windows.
+- `action_selection_suppression_no_match_count`: Number of evaluated turns where repeated signatures existed but no current candidate matched them.
+- `action_selection_all_candidates_suppressed_count`: Number of evaluated turns where every current candidate matched a repeated signature, so ordering was preserved.
+- `action_selection_suppression_applied_count`: Number of turns where suppression reordered candidates.
+- `action_selection_suppressed_candidate_count`: Total candidates moved behind non-suppressed candidates.
+- `action_selection_no_candidate_count`: Number of diagnostic turns without action candidates to evaluate.
 - `clarification_resolution_count`: Number of clarification turns whose next non-clarify action shows downstream resolution. Resolution is heuristic-based: progress increases, chosen action confidence improves, or conflict/required-evidence counts decrease.
 - `clarification_resolution_rate`: `clarification_resolution_count / clarification_count`.
 - `mean_clarification_quality_score`: Mean heuristic specificity score for clarification turns. The score rewards explicit clarification wording, concrete gate reasons, conflict/required-evidence/span reasons, and public evidence context.

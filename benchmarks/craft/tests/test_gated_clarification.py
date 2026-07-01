@@ -54,6 +54,10 @@ def test_repeated_zero_progress_suppression_reorders_candidates_when_enabled():
     assert result["applied"] is True
     assert result["oracle_moves"][0]["block"] == "bs"
     assert result["action_candidates"][0].action["block"] == "bs"
+    assert result["metadata"]["enabled"] is True
+    assert result["metadata"]["attempted"] is True
+    assert result["metadata"]["applied"] is True
+    assert result["metadata"]["detected_signature_count"] == 1
     assert result["metadata"]["suppressed_candidate_ids"] == ["action:3:0"]
 
 
@@ -77,6 +81,8 @@ def test_repeated_zero_progress_suppression_is_disabled_by_default():
     assert result["applied"] is False
     assert result["oracle_moves"] == moves
     assert result["action_candidates"] == candidates
+    assert result["metadata"]["enabled"] is False
+    assert result["metadata"]["attempted"] is False
 
 
 def test_repeated_zero_progress_suppression_preserves_order_when_all_candidates_suppressed():
@@ -100,6 +106,35 @@ def test_repeated_zero_progress_suppression_preserves_order_when_all_candidates_
 
     assert result["applied"] is False
     assert result["oracle_moves"] == moves
+    assert result["metadata"]["attempted"] is True
+    assert result["metadata"]["all_candidates_suppressed"] is True
+    assert result["metadata"]["suppressed_candidate_ids"] == ["action:3:0"]
+
+
+def test_repeated_zero_progress_suppression_reports_no_match():
+    moves = [{"action": "place", "block": "bs", "position": "(0,1)", "layer": 0}]
+    candidates = action_candidates_from_moves(moves=moves, reported_claims={}, turn_index=3)
+
+    result = _suppress_repeated_zero_progress_candidates(
+        oracle_moves=moves,
+        action_candidates=candidates,
+        previous_actions=[
+            {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0, "_progress_delta": 0.0},
+            {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0, "_progress_delta": 0.0},
+        ],
+        config={
+            "dual_dag": {
+                "enabled": True,
+                "action_selection": {"suppress_repeated_zero_progress": {"enabled": True}},
+            }
+        },
+    )
+
+    assert result["applied"] is False
+    assert result["metadata"]["attempted"] is True
+    assert result["metadata"]["detected_signature_count"] == 1
+    assert result["metadata"]["no_match"] is True
+    assert result["metadata"]["suppressed_candidate_ids"] == []
 
 
 def test_gate_fires_on_low_confidence():
