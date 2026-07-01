@@ -442,7 +442,7 @@ class CraftEnvAdapter:
             previous_actions=previous_builder_actions or [],
             config=self.config,
         )
-        if suppression_metadata["applied"]:
+        if suppression_metadata["metadata"]:
             oracle_moves = suppression_metadata["oracle_moves"]
             action_candidates = suppression_metadata["action_candidates"]
             decision_support = {
@@ -512,6 +512,7 @@ class CraftEnvAdapter:
         parsed["_builder_response_info"] = getattr(client, "last_response_info", {})
         parsed["_builder_raw_first_line"] = first_line
         if not action_candidates:
+            action_selection_support = (decision_support or {}).get("action_selection")
             action_candidates = [action_candidate_from_parsed_action(
                 action=parsed,
                 reported_claims=epistemic_claims,
@@ -523,6 +524,11 @@ class CraftEnvAdapter:
                 config=self.config,
                 turn_index=turn_index,
             )
+            if action_selection_support:
+                decision_support = {
+                    **(decision_support or {}),
+                    "action_selection": action_selection_support,
+                }
         public_evidence_summary = (
             build_public_evidence_summary(
                 candidates=[candidate.to_dict() for candidate in action_candidates],
@@ -758,18 +764,35 @@ def _suppress_repeated_zero_progress_candidates(
         or {}
     )
     enabled = bool(config.get("dual_dag", {}).get("enabled", False) and selection_config.get("enabled", False))
-    if not enabled or not action_candidates:
-        return {"applied": False, "oracle_moves": oracle_moves, "action_candidates": action_candidates, "metadata": {}}
     window_turns = int(selection_config.get("window_turns", 6) or 6)
     max_repeats = int(selection_config.get("max_repeats", 2) or 2)
+    metadata = {
+        "policy": "suppress_repeated_zero_progress",
+        "enabled": enabled,
+        "attempted": False,
+        "applied": False,
+        "detected_signature_count": 0,
+        "suppressed_candidate_ids": [],
+        "suppressed_action_signatures": [],
+        "no_match": False,
+        "all_candidates_suppressed": False,
+        "no_candidates": not bool(action_candidates),
+        "window_turns": window_turns,
+        "max_repeats": max_repeats,
+    }
+    if not enabled or not action_candidates:
+        return {"applied": False, "oracle_moves": oracle_moves, "action_candidates": action_candidates, "metadata": metadata}
     signatures = _repeated_zero_progress_signatures(
         previous_actions=previous_actions,
         window_turns=window_turns,
         max_repeats=max_repeats,
         treat_missing_progress_as_zero=bool(selection_config.get("treat_missing_progress_as_zero", True)),
     )
+    metadata["attempted"] = True
+    metadata["detected_signature_count"] = len(signatures)
+    metadata["suppressed_action_signatures"] = sorted(signatures)
     if not signatures:
-        return {"applied": False, "oracle_moves": oracle_moves, "action_candidates": action_candidates, "metadata": {}}
+        return {"applied": False, "oracle_moves": oracle_moves, "action_candidates": action_candidates, "metadata": metadata}
 
     indexed = list(enumerate(action_candidates))
     suppressed = [
@@ -777,25 +800,25 @@ def _suppress_repeated_zero_progress_candidates(
         for index, candidate in indexed
         if _public_action_signature(candidate.action) in signatures
     ]
-    if not suppressed or len(suppressed) == len(indexed):
-        return {"applied": False, "oracle_moves": oracle_moves, "action_candidates": action_candidates, "metadata": {}}
+    if not suppressed:
+        metadata["no_match"] = True
+        return {"applied": False, "oracle_moves": oracle_moves, "action_candidates": action_candidates, "metadata": metadata}
+    metadata["suppressed_candidate_ids"] = [candidate.node_id for _, candidate in suppressed]
+    if len(suppressed) == len(indexed):
+        metadata["all_candidates_suppressed"] = True
+        return {"applied": False, "oracle_moves": oracle_moves, "action_candidates": action_candidates, "metadata": metadata}
 
     kept = [(index, candidate) for index, candidate in indexed if (index, candidate) not in suppressed]
     reordered = kept + suppressed
     reordered_moves = None
     if oracle_moves is not None:
         reordered_moves = [oracle_moves[index] for index, _ in reordered]
+    metadata["applied"] = True
     return {
         "applied": True,
         "oracle_moves": reordered_moves,
         "action_candidates": [candidate for _, candidate in reordered],
-        "metadata": {
-            "policy": "suppress_repeated_zero_progress",
-            "suppressed_candidate_ids": [candidate.node_id for _, candidate in suppressed],
-            "suppressed_action_signatures": sorted(signatures),
-            "window_turns": window_turns,
-            "max_repeats": max_repeats,
-        },
+        "metadata": metadata,
     }
 
 

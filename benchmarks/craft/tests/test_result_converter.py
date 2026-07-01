@@ -180,6 +180,92 @@ def test_result_converter_counts_action_candidate_metadata(tmp_path):
     assert "mean_action_confidence" in metrics_text
 
 
+def test_result_converter_counts_action_selection_suppression_metadata(tmp_path):
+    config = {
+        "run": {"name": "test", "seed": 3, "structures": [0], "turns": 3},
+        "models": {"director": {"model": "d"}, "builder": {"model": "b"}},
+        "villageragent": {"enabled": True},
+    }
+    normalize_results(
+        config=config,
+        condition="villageragent_directors",
+        raw_result={
+            "structure_id": 0,
+            "turns": [
+                {
+                    "builder_action": {
+                        "action": "place",
+                        "_action_candidate_metadata": {
+                            "decision_support": {
+                                "action_selection": {
+                                    "policy": "suppress_repeated_zero_progress",
+                                    "enabled": True,
+                                    "attempted": True,
+                                    "applied": False,
+                                    "detected_signature_count": 2,
+                                    "suppressed_candidate_ids": [],
+                                    "no_match": True,
+                                }
+                            }
+                        },
+                    },
+                },
+                {
+                    "builder_action": {
+                        "action": "place",
+                        "_action_candidate_metadata": {
+                            "decision_support": {
+                                "action_selection": {
+                                    "policy": "suppress_repeated_zero_progress",
+                                    "enabled": True,
+                                    "attempted": True,
+                                    "applied": False,
+                                    "detected_signature_count": 1,
+                                    "suppressed_candidate_ids": ["action:2:0"],
+                                    "all_candidates_suppressed": True,
+                                }
+                            }
+                        },
+                    },
+                },
+                {
+                    "builder_action": {
+                        "action": "place",
+                        "_action_candidate_metadata": {
+                            "decision_support": {
+                                "action_selection": {
+                                    "policy": "suppress_repeated_zero_progress",
+                                    "enabled": False,
+                                    "attempted": False,
+                                    "applied": False,
+                                    "no_candidates": True,
+                                }
+                            }
+                        },
+                    },
+                },
+            ],
+            "final_progress": 0.0,
+            "completed": False,
+        },
+        output_dir=tmp_path,
+    )
+
+    summary = json.loads((tmp_path / "normalized" / "summary.json").read_text())
+    with (tmp_path / "normalized" / "metrics.csv").open(newline="") as f:
+        row = next(csv.DictReader(f))
+    runtime = summary["runtime"]
+    assert runtime["action_selection_suppression_enabled_count"] == 2
+    assert runtime["action_selection_suppression_disabled_count"] == 1
+    assert runtime["action_selection_suppression_attempt_count"] == 2
+    assert runtime["action_selection_repeated_zero_signature_count"] == 3
+    assert runtime["action_selection_suppression_no_match_count"] == 1
+    assert runtime["action_selection_all_candidates_suppressed_count"] == 1
+    assert runtime["action_selection_suppressed_candidate_count"] == 1
+    assert runtime["action_selection_no_candidate_count"] == 1
+    assert row["action_selection_suppression_attempt_count"] == "2"
+
+
 def test_result_converter_counts_gated_clarification_metadata(tmp_path):
     config = {
         "run": {"name": "test", "seed": 3, "structures": [0], "turns": 1},

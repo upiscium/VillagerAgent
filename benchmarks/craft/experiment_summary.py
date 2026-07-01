@@ -4,7 +4,12 @@ import json
 from pathlib import Path
 
 from benchmarks.craft.config import repo_root
-from benchmarks.craft.result_converter import _clarification_metrics, _progress_action_metrics, _retrieval_metrics
+from benchmarks.craft.result_converter import (
+    _action_selection_metrics,
+    _clarification_metrics,
+    _progress_action_metrics,
+    _retrieval_metrics,
+)
 
 
 SUMMARY_FIELDS = [
@@ -88,6 +93,15 @@ SUMMARY_FIELDS = [
     "candidate_executed_count",
     "candidate_invalidated_count",
     "candidate_repeated_after_execution_count",
+    "action_selection_suppression_enabled_count",
+    "action_selection_suppression_disabled_count",
+    "action_selection_suppression_attempt_count",
+    "action_selection_repeated_zero_signature_count",
+    "action_selection_suppression_no_match_count",
+    "action_selection_all_candidates_suppressed_count",
+    "action_selection_suppression_applied_count",
+    "action_selection_suppressed_candidate_count",
+    "action_selection_no_candidate_count",
     "candidate_state_transition_counts",
     "coordination_action_count",
     "clarify_coordination_action_count",
@@ -231,6 +245,7 @@ def _summarize_run(run_name: str, *, result_root: Path, analysis: dict | None = 
     })
     clarification_metrics = _clarification_metrics(turns)
     retrieval_metrics = _retrieval_metrics(turns)
+    action_selection_metrics = _action_selection_metrics(turns)
     return {
         "run_name": summary.get("run_name", run_name),
         "run_group": _run_group(summary.get("run_name", run_name)),
@@ -312,6 +327,15 @@ def _summarize_run(run_name: str, *, result_root: Path, analysis: dict | None = 
         "candidate_executed_count": runtime.get("candidate_executed_count", runtime.get("action_candidate_executed_count", 0)),
         "candidate_invalidated_count": runtime.get("candidate_invalidated_count", runtime.get("action_candidate_invalidated_count", 0)),
         "candidate_repeated_after_execution_count": runtime.get("candidate_repeated_after_execution_count", 0),
+        "action_selection_suppression_enabled_count": runtime.get("action_selection_suppression_enabled_count", action_selection_metrics["action_selection_suppression_enabled_count"]),
+        "action_selection_suppression_disabled_count": runtime.get("action_selection_suppression_disabled_count", action_selection_metrics["action_selection_suppression_disabled_count"]),
+        "action_selection_suppression_attempt_count": runtime.get("action_selection_suppression_attempt_count", action_selection_metrics["action_selection_suppression_attempt_count"]),
+        "action_selection_repeated_zero_signature_count": runtime.get("action_selection_repeated_zero_signature_count", action_selection_metrics["action_selection_repeated_zero_signature_count"]),
+        "action_selection_suppression_no_match_count": runtime.get("action_selection_suppression_no_match_count", action_selection_metrics["action_selection_suppression_no_match_count"]),
+        "action_selection_all_candidates_suppressed_count": runtime.get("action_selection_all_candidates_suppressed_count", action_selection_metrics["action_selection_all_candidates_suppressed_count"]),
+        "action_selection_suppression_applied_count": runtime.get("action_selection_suppression_applied_count", action_selection_metrics["action_selection_suppression_applied_count"]),
+        "action_selection_suppressed_candidate_count": runtime.get("action_selection_suppressed_candidate_count", action_selection_metrics["action_selection_suppressed_candidate_count"]),
+        "action_selection_no_candidate_count": runtime.get("action_selection_no_candidate_count", action_selection_metrics["action_selection_no_candidate_count"]),
         "candidate_state_transition_counts": runtime.get("candidate_state_transition_counts", "{}"),
         "coordination_action_count": runtime.get("coordination_action_count", sum(analysis.get("coordination_action_counts", {}).values())),
         "clarify_coordination_action_count": runtime.get("clarify_coordination_action_count", analysis.get("coordination_action_counts", {}).get("clarify", 0)),

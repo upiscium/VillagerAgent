@@ -399,6 +399,42 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
             "candidate_count",
             _sum_metric_rows(metrics_rows, "candidate_count"),
         ),
+        "action_selection_suppression_enabled_count": runtime.get(
+            "action_selection_suppression_enabled_count",
+            _sum_metric_rows(metrics_rows, "action_selection_suppression_enabled_count"),
+        ),
+        "action_selection_suppression_disabled_count": runtime.get(
+            "action_selection_suppression_disabled_count",
+            _sum_metric_rows(metrics_rows, "action_selection_suppression_disabled_count"),
+        ),
+        "action_selection_suppression_attempt_count": runtime.get(
+            "action_selection_suppression_attempt_count",
+            _sum_metric_rows(metrics_rows, "action_selection_suppression_attempt_count"),
+        ),
+        "action_selection_repeated_zero_signature_count": runtime.get(
+            "action_selection_repeated_zero_signature_count",
+            _sum_metric_rows(metrics_rows, "action_selection_repeated_zero_signature_count"),
+        ),
+        "action_selection_suppression_no_match_count": runtime.get(
+            "action_selection_suppression_no_match_count",
+            _sum_metric_rows(metrics_rows, "action_selection_suppression_no_match_count"),
+        ),
+        "action_selection_all_candidates_suppressed_count": runtime.get(
+            "action_selection_all_candidates_suppressed_count",
+            _sum_metric_rows(metrics_rows, "action_selection_all_candidates_suppressed_count"),
+        ),
+        "action_selection_suppression_applied_count": runtime.get(
+            "action_selection_suppression_applied_count",
+            _sum_metric_rows(metrics_rows, "action_selection_suppression_applied_count"),
+        ),
+        "action_selection_suppressed_candidate_count": runtime.get(
+            "action_selection_suppressed_candidate_count",
+            _sum_metric_rows(metrics_rows, "action_selection_suppressed_candidate_count"),
+        ),
+        "action_selection_no_candidate_count": runtime.get(
+            "action_selection_no_candidate_count",
+            _sum_metric_rows(metrics_rows, "action_selection_no_candidate_count"),
+        ),
         "clarification_count": runtime.get(
             "clarification_count",
             _sum_metric_rows_or_default(metrics_rows, "clarification_count", clarification_metrics["clarification_count"]),

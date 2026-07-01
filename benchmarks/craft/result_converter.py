@@ -27,6 +27,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
     active_directors = _active_directors(config, condition)
     epistemic_counts = _epistemic_counts(turns)
     action_candidate_metrics = _action_candidate_metrics(turns)
+    action_selection_metrics = _action_selection_metrics(turns)
     clarification_metrics = _clarification_metrics(turns)
     clarification_outcome_metrics = _clarification_outcome_metrics(games, config)
     retrieval_metrics = _retrieval_metrics(turns)
@@ -63,6 +64,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
             **epistemic_counts,
             "hypothesis_count": hypothesis_count,
             **action_candidate_metrics,
+            **action_selection_metrics,
             **clarification_metrics,
             **clarification_outcome_metrics,
             **retrieval_metrics,
@@ -155,6 +157,15 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
         "claim_conflict_count",
         "claim_required_evidence_count",
         "candidate_count",
+        "action_selection_suppression_enabled_count",
+        "action_selection_suppression_disabled_count",
+        "action_selection_suppression_attempt_count",
+        "action_selection_repeated_zero_signature_count",
+        "action_selection_suppression_no_match_count",
+        "action_selection_all_candidates_suppressed_count",
+        "action_selection_suppression_applied_count",
+        "action_selection_suppressed_candidate_count",
+        "action_selection_no_candidate_count",
         "clarification_count",
         "unique_clarification_count",
         "repeated_clarification_count",
@@ -214,6 +225,7 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
         for game in games:
             game_epistemic_counts = _epistemic_counts(game.get("turns", []))
             game_action_candidate_metrics = _action_candidate_metrics(game.get("turns", []))
+            game_action_selection_metrics = _action_selection_metrics(game.get("turns", []))
             game_clarification_metrics = _clarification_metrics(game.get("turns", []))
             game_clarification_outcome_metrics = _clarification_outcome_metrics([game], config)
             game_retrieval_metrics = _retrieval_metrics(game.get("turns", []))
@@ -292,6 +304,15 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
                 "claim_conflict_count": game_action_candidate_metrics["claim_conflict_count"],
                 "claim_required_evidence_count": game_action_candidate_metrics["claim_required_evidence_count"],
                 "candidate_count": game_action_candidate_metrics["candidate_count"],
+                "action_selection_suppression_enabled_count": game_action_selection_metrics["action_selection_suppression_enabled_count"],
+                "action_selection_suppression_disabled_count": game_action_selection_metrics["action_selection_suppression_disabled_count"],
+                "action_selection_suppression_attempt_count": game_action_selection_metrics["action_selection_suppression_attempt_count"],
+                "action_selection_repeated_zero_signature_count": game_action_selection_metrics["action_selection_repeated_zero_signature_count"],
+                "action_selection_suppression_no_match_count": game_action_selection_metrics["action_selection_suppression_no_match_count"],
+                "action_selection_all_candidates_suppressed_count": game_action_selection_metrics["action_selection_all_candidates_suppressed_count"],
+                "action_selection_suppression_applied_count": game_action_selection_metrics["action_selection_suppression_applied_count"],
+                "action_selection_suppressed_candidate_count": game_action_selection_metrics["action_selection_suppressed_candidate_count"],
+                "action_selection_no_candidate_count": game_action_selection_metrics["action_selection_no_candidate_count"],
                 "clarification_count": game_clarification_metrics["clarification_count"],
                 "unique_clarification_count": game_clarification_metrics["unique_clarification_count"],
                 "repeated_clarification_count": game_clarification_metrics["repeated_clarification_count"],
@@ -556,6 +577,50 @@ def _action_candidate_metrics(turns: list[dict]) -> dict:
         "claim_conflict_count": claim_conflict_count,
         "claim_required_evidence_count": claim_required_evidence_count,
         "candidate_count": candidate_count,
+    }
+
+
+def _action_selection_metrics(turns: list[dict]) -> dict:
+    enabled_count = 0
+    disabled_count = 0
+    attempt_count = 0
+    repeated_zero_signature_count = 0
+    no_match_count = 0
+    all_candidates_suppressed_count = 0
+    applied_count = 0
+    suppressed_candidate_count = 0
+    no_candidate_count = 0
+    for turn in turns:
+        metadata = (turn.get("builder_action") or {}).get("_action_candidate_metadata") or {}
+        action_selection = (metadata.get("decision_support") or {}).get("action_selection") or {}
+        if action_selection.get("policy") != "suppress_repeated_zero_progress":
+            continue
+        if action_selection.get("enabled"):
+            enabled_count += 1
+        else:
+            disabled_count += 1
+        if action_selection.get("attempted"):
+            attempt_count += 1
+        repeated_zero_signature_count += int(action_selection.get("detected_signature_count", 0) or 0)
+        if action_selection.get("no_match"):
+            no_match_count += 1
+        if action_selection.get("all_candidates_suppressed"):
+            all_candidates_suppressed_count += 1
+        if action_selection.get("applied"):
+            applied_count += 1
+        suppressed_candidate_count += len(action_selection.get("suppressed_candidate_ids", []) or [])
+        if action_selection.get("no_candidates"):
+            no_candidate_count += 1
+    return {
+        "action_selection_suppression_enabled_count": enabled_count,
+        "action_selection_suppression_disabled_count": disabled_count,
+        "action_selection_suppression_attempt_count": attempt_count,
+        "action_selection_repeated_zero_signature_count": repeated_zero_signature_count,
+        "action_selection_suppression_no_match_count": no_match_count,
+        "action_selection_all_candidates_suppressed_count": all_candidates_suppressed_count,
+        "action_selection_suppression_applied_count": applied_count,
+        "action_selection_suppressed_candidate_count": suppressed_candidate_count,
+        "action_selection_no_candidate_count": no_candidate_count,
     }
 
 
