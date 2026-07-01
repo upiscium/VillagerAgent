@@ -15,6 +15,12 @@ Artifacts inspected:
 - `normalized/turns.jsonl`
 - `result/craft/comparison_gemma4_12b_clarify_policy_sensitivity_post_official.csv`
 
+Generated trace comparisons:
+
+- `result/craft/trace_compare_v1_v4_oracle5_turn30_seed1.json`
+- `result/craft/trace_compare_v1_v4_oracle5_turn30_seed3.json`
+- `result/craft/trace_compare_v1_v4_oracle5_turn30_seed5.json`
+
 ## Aggregate Result
 
 | Policy | n | mean_final_progress | delta vs V1 | progress_auc | physical_action_count | clarify_count | failed_clarification_count | builder_fallback_rate | retrieved_node_count |
@@ -23,6 +29,18 @@ Artifacts inspected:
 | V4 Dual-DAG, value of information | 3 | 0.647042265303135 | -0.013669475988316 | 0.260894673210132 | 150.0 | 0.0 | 0.0 | 0.111111 | 0.0 |
 
 V4 preserves physical throughput and avoids Clarify, so the remaining progress gap is not a communication-turn loss.
+
+## Automated Trace Comparison
+
+`benchmarks.craft.trace_compare` compares normalized `metrics.csv` and `turns.jsonl` artifacts for a baseline/variant run pair. For the three V1/V4 seeds, it reports:
+
+- Mean final-progress delta: `-0.013669475988316582`.
+- Negative structure-level deltas: `3 / 15` structure-seed pairs.
+- Positive structure-level deltas: `3 / 15` structure-seed pairs.
+- Mean max repeated zero-or-missing-progress streak: V1 `3.0`, V4 `5.066666666666666`.
+- Total zero-or-missing-progress physical turns: V1 `143`, V4 `168`.
+- Total negative-progress turns: V1 `74`, V4 `62`.
+- V4 has a larger repeated zero-or-missing-progress streak than V1 in `10 / 15` structure-seed pairs.
 
 ## Structure-Level Pattern
 
