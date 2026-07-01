@@ -4,6 +4,7 @@ from benchmarks.craft.craft_env_adapter import (
     _apply_clarification_gate,
     _prepare_runtime_action_candidates,
     _prioritize_supported_candidates,
+    _suppress_repeated_zero_progress_candidates,
     _runtime_decision_support,
 )
 from benchmarks.craft.dual_dag.action_candidates import action_candidates_from_moves
@@ -20,6 +21,85 @@ def test_gate_does_not_fire_when_dual_dag_disabled():
     assert should_gate is False
     assert metadata["enabled"] is False
     assert metadata["reason"] == "none"
+
+
+def test_repeated_zero_progress_suppression_reorders_candidates_when_enabled():
+    moves = [
+        {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+        {"action": "place", "block": "bs", "position": "(0,1)", "layer": 0},
+    ]
+    candidates = action_candidates_from_moves(moves=moves, reported_claims={}, turn_index=3)
+    result = _suppress_repeated_zero_progress_candidates(
+        oracle_moves=moves,
+        action_candidates=candidates,
+        previous_actions=[
+            {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0, "_progress_delta": 0.0},
+            {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0, "_progress_delta": None},
+        ],
+        config={
+            "dual_dag": {
+                "enabled": True,
+                "action_selection": {
+                    "suppress_repeated_zero_progress": {
+                        "enabled": True,
+                        "window_turns": 4,
+                        "max_repeats": 2,
+                        "treat_missing_progress_as_zero": True,
+                    }
+                },
+            }
+        },
+    )
+
+    assert result["applied"] is True
+    assert result["oracle_moves"][0]["block"] == "bs"
+    assert result["action_candidates"][0].action["block"] == "bs"
+    assert result["metadata"]["suppressed_candidate_ids"] == ["action:3:0"]
+
+
+def test_repeated_zero_progress_suppression_is_disabled_by_default():
+    moves = [
+        {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0},
+        {"action": "place", "block": "bs", "position": "(0,1)", "layer": 0},
+    ]
+    candidates = action_candidates_from_moves(moves=moves, reported_claims={}, turn_index=3)
+
+    result = _suppress_repeated_zero_progress_candidates(
+        oracle_moves=moves,
+        action_candidates=candidates,
+        previous_actions=[
+            {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0, "_progress_delta": 0.0},
+            {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0, "_progress_delta": 0.0},
+        ],
+        config={"dual_dag": {"enabled": True}},
+    )
+
+    assert result["applied"] is False
+    assert result["oracle_moves"] == moves
+    assert result["action_candidates"] == candidates
+
+
+def test_repeated_zero_progress_suppression_preserves_order_when_all_candidates_suppressed():
+    moves = [{"action": "place", "block": "ys", "position": "(0,0)", "layer": 0}]
+    candidates = action_candidates_from_moves(moves=moves, reported_claims={}, turn_index=3)
+
+    result = _suppress_repeated_zero_progress_candidates(
+        oracle_moves=moves,
+        action_candidates=candidates,
+        previous_actions=[
+            {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0, "_progress_delta": 0.0},
+            {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0, "_progress_delta": 0.0},
+        ],
+        config={
+            "dual_dag": {
+                "enabled": True,
+                "action_selection": {"suppress_repeated_zero_progress": {"enabled": True}},
+            }
+        },
+    )
+
+    assert result["applied"] is False
+    assert result["oracle_moves"] == moves
 
 
 def test_gate_fires_on_low_confidence():

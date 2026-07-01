@@ -134,11 +134,12 @@ def test_load_gemma4_clarify_policy_manifests():
         "_v2_dual_dag_current_clarify",
         "_v3_dual_dag_throughput_fix",
         "_v4_dual_dag_value_of_information",
+        "_v5_dual_dag_voi_repeated_zero_fix",
     ]
     assert official["overrides"]["turns"] == 20
     assert all(run["overrides"]["craft"]["oracle_n"] == 5 for run in official["runs"])
     assert all(run["structures"] == list(range(20)) for run in official["runs"])
-    assert len(sensitivity["runs"]) == 15
+    assert len(sensitivity["runs"]) == 19
     assert any(run.get("overrides", {}).get("turns") == 30 for run in sensitivity["runs"])
 
 
