@@ -229,6 +229,7 @@ class CraftEnvAdapter:
                 success, progress_data, *_ = game_state.execute_move(builder_action)
                 move_executed = bool(success)
                 progress = progress_data
+            builder_action["_progress_delta"] = _extract_progress_delta(progress)
             dual_dag_runtime.add_public_builder_action(
                 turn_index=turn_index,
                 action=builder_action,
@@ -435,6 +436,19 @@ class CraftEnvAdapter:
                 action_candidates=action_candidates,
                 decision_support=decision_support,
             )
+        suppression_metadata = _suppress_repeated_zero_progress_candidates(
+            oracle_moves=oracle_moves,
+            action_candidates=action_candidates,
+            previous_actions=previous_builder_actions or [],
+            config=self.config,
+        )
+        if suppression_metadata["applied"]:
+            oracle_moves = suppression_metadata["oracle_moves"]
+            action_candidates = suppression_metadata["action_candidates"]
+            decision_support = {
+                **(decision_support or {}),
+                "action_selection": suppression_metadata["metadata"],
+            }
         prompt_builder = object.__new__(BuilderAgent)
         prompt = prompt_builder.get_builder_prompt(
             director_discussion=discussion,
@@ -730,6 +744,92 @@ def _prioritize_supported_candidates(
     return prioritized_moves, prioritized_candidates
 
 
+def _suppress_repeated_zero_progress_candidates(
+    *,
+    oracle_moves: list[dict] | None,
+    action_candidates: list,
+    previous_actions: list[dict],
+    config: dict,
+) -> dict:
+    selection_config = (
+        config.get("dual_dag", {})
+        .get("action_selection", {})
+        .get("suppress_repeated_zero_progress", {})
+        or {}
+    )
+    enabled = bool(config.get("dual_dag", {}).get("enabled", False) and selection_config.get("enabled", False))
+    if not enabled or not action_candidates:
+        return {"applied": False, "oracle_moves": oracle_moves, "action_candidates": action_candidates, "metadata": {}}
+    window_turns = int(selection_config.get("window_turns", 6) or 6)
+    max_repeats = int(selection_config.get("max_repeats", 2) or 2)
+    signatures = _repeated_zero_progress_signatures(
+        previous_actions=previous_actions,
+        window_turns=window_turns,
+        max_repeats=max_repeats,
+        treat_missing_progress_as_zero=bool(selection_config.get("treat_missing_progress_as_zero", True)),
+    )
+    if not signatures:
+        return {"applied": False, "oracle_moves": oracle_moves, "action_candidates": action_candidates, "metadata": {}}
+
+    indexed = list(enumerate(action_candidates))
+    suppressed = [
+        (index, candidate)
+        for index, candidate in indexed
+        if _public_action_signature(candidate.action) in signatures
+    ]
+    if not suppressed or len(suppressed) == len(indexed):
+        return {"applied": False, "oracle_moves": oracle_moves, "action_candidates": action_candidates, "metadata": {}}
+
+    kept = [(index, candidate) for index, candidate in indexed if (index, candidate) not in suppressed]
+    reordered = kept + suppressed
+    reordered_moves = None
+    if oracle_moves is not None:
+        reordered_moves = [oracle_moves[index] for index, _ in reordered]
+    return {
+        "applied": True,
+        "oracle_moves": reordered_moves,
+        "action_candidates": [candidate for _, candidate in reordered],
+        "metadata": {
+            "policy": "suppress_repeated_zero_progress",
+            "suppressed_candidate_ids": [candidate.node_id for _, candidate in suppressed],
+            "suppressed_action_signatures": sorted(signatures),
+            "window_turns": window_turns,
+            "max_repeats": max_repeats,
+        },
+    }
+
+
+def _repeated_zero_progress_signatures(
+    *,
+    previous_actions: list[dict],
+    window_turns: int,
+    max_repeats: int,
+    treat_missing_progress_as_zero: bool,
+) -> set[str]:
+    counts: dict[str, int] = {}
+    for action in previous_actions[-max(1, window_turns):]:
+        if action.get("action") not in {"place", "remove"}:
+            continue
+        progress_delta = action.get("_progress_delta")
+        if progress_delta is None and not treat_missing_progress_as_zero:
+            continue
+        if progress_delta is not None and float(progress_delta) != 0.0:
+            continue
+        signature = _public_action_signature(action)
+        counts[signature] = counts.get(signature, 0) + 1
+    return {signature for signature, count in counts.items() if count >= max(1, max_repeats)}
+
+
+def _public_action_signature(action: dict) -> str:
+    return "|".join([
+        str(action.get("action", "")),
+        str(action.get("block", "")),
+        str(action.get("position", "")),
+        str(action.get("layer", "")),
+        str(action.get("span_to", "")),
+    ])
+
+
 def _matches_oracle_candidate(action: dict, oracle_moves: list[dict]) -> bool:
     return any(
         action.get("action") == move.get("action")
@@ -1004,6 +1104,18 @@ def _extract_progress(progress: Any) -> float:
         if isinstance(metrics, dict) and "overall_progress" in metrics:
             return float(metrics["overall_progress"])
     return 0.0
+
+
+def _extract_progress_delta(progress: Any) -> float | None:
+    if not isinstance(progress, dict):
+        return None
+    value = progress.get("progress_delta")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _official_runner_command(
