@@ -75,7 +75,7 @@ The current suppression trigger is likely too narrow: it only down-ranks a candi
 
 V5 should remain experimental and opt-in. The next implementation should focus on making the action-selection intervention observable and better aligned with the failure mode:
 
-- Add explicit metrics for action-selection suppression attempts and applications.
+- Post-instrumentation diagnostics are recorded in `benchmarks/craft/V5_ACTION_SELECTION_DIAGNOSTICS.md`.
 - Consider suppressing or penalizing broader repeated no-progress regions, not only exact current-candidate repeats.
 - Consider terminal-turn loop handling for large block place/remove cycles.
-- Re-run the same V1/V4/V5 turn30 comparison after the trigger is made observable and confirmed to activate.
+- Prototype V6 first as relaxed-match diagnostics, then enable ordering changes after the trigger is verified.
