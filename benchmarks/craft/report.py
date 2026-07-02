@@ -435,6 +435,42 @@ def load_run_summary(run_name: str, *, result_root: Path) -> dict:
             "action_selection_no_candidate_count",
             _sum_metric_rows(metrics_rows, "action_selection_no_candidate_count"),
         ),
+        "action_selection_relaxed_diagnostics_enabled_count": runtime.get(
+            "action_selection_relaxed_diagnostics_enabled_count",
+            _sum_metric_rows(metrics_rows, "action_selection_relaxed_diagnostics_enabled_count"),
+        ),
+        "action_selection_relaxed_region_signature_count": runtime.get(
+            "action_selection_relaxed_region_signature_count",
+            _sum_metric_rows(metrics_rows, "action_selection_relaxed_region_signature_count"),
+        ),
+        "action_selection_relaxed_span_signature_count": runtime.get(
+            "action_selection_relaxed_span_signature_count",
+            _sum_metric_rows(metrics_rows, "action_selection_relaxed_span_signature_count"),
+        ),
+        "action_selection_relaxed_inverse_loop_signature_count": runtime.get(
+            "action_selection_relaxed_inverse_loop_signature_count",
+            _sum_metric_rows(metrics_rows, "action_selection_relaxed_inverse_loop_signature_count"),
+        ),
+        "action_selection_relaxed_current_candidate_match_count": runtime.get(
+            "action_selection_relaxed_current_candidate_match_count",
+            _sum_metric_rows(metrics_rows, "action_selection_relaxed_current_candidate_match_count"),
+        ),
+        "action_selection_relaxed_inverse_loop_candidate_count": runtime.get(
+            "action_selection_relaxed_inverse_loop_candidate_count",
+            _sum_metric_rows(metrics_rows, "action_selection_relaxed_inverse_loop_candidate_count"),
+        ),
+        "action_selection_relaxed_all_candidates_match_count": runtime.get(
+            "action_selection_relaxed_all_candidates_match_count",
+            _sum_metric_rows(metrics_rows, "action_selection_relaxed_all_candidates_match_count"),
+        ),
+        "action_selection_relaxed_would_suppress_candidate_count": runtime.get(
+            "action_selection_relaxed_would_suppress_candidate_count",
+            _sum_metric_rows(metrics_rows, "action_selection_relaxed_would_suppress_candidate_count"),
+        ),
+        "action_selection_relaxed_no_candidate_signature_count": runtime.get(
+            "action_selection_relaxed_no_candidate_signature_count",
+            _sum_metric_rows(metrics_rows, "action_selection_relaxed_no_candidate_signature_count"),
+        ),
         "clarification_count": runtime.get(
             "clarification_count",
             _sum_metric_rows_or_default(metrics_rows, "clarification_count", clarification_metrics["clarification_count"]),

@@ -149,6 +149,9 @@ def test_gemma4_ablation_configs_keep_villageragent_parity_and_flags():
     repeated_zero_fix = load_config(
         "configs/craft/eval_gemma4_12b_ollama_dual_dag_value_of_information_repeated_zero_fix.yaml"
     )
+    relaxed_diagnostics = load_config(
+        "configs/craft/eval_gemma4_12b_ollama_dual_dag_value_of_information_relaxed_diagnostics.yaml"
+    )
 
     for config in (
         metadata_only,
@@ -160,6 +163,7 @@ def test_gemma4_ablation_configs_keep_villageragent_parity_and_flags():
         clarify_fix,
         voi,
         repeated_zero_fix,
+        relaxed_diagnostics,
     ):
         assert config["craft"] == baseline["craft"]
         assert config["villageragent"] == baseline["villageragent"]
@@ -181,3 +185,4 @@ def test_gemma4_ablation_configs_keep_villageragent_parity_and_flags():
     assert voi["dual_dag"]["gated_clarification"]["policy"] == "value_of_information"
     assert repeated_zero_fix["dual_dag"]["gated_clarification"]["policy"] == "value_of_information"
     assert repeated_zero_fix["dual_dag"]["action_selection"]["suppress_repeated_zero_progress"]["enabled"] is True
+    assert relaxed_diagnostics["dual_dag"]["action_selection"]["suppress_repeated_zero_progress"]["relaxed_diagnostics"]["enabled"] is True

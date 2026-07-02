@@ -205,6 +205,15 @@ def test_result_converter_counts_action_selection_suppression_metadata(tmp_path)
                                     "detected_signature_count": 2,
                                     "suppressed_candidate_ids": [],
                                     "no_match": True,
+                                    "relaxed_diagnostics_enabled": True,
+                                    "relaxed_region_signature_count": 2,
+                                    "relaxed_span_signature_count": 1,
+                                    "relaxed_inverse_loop_signature_count": 1,
+                                    "relaxed_current_candidate_match_count": 2,
+                                    "relaxed_inverse_loop_candidate_count": 1,
+                                    "relaxed_all_candidates_match": True,
+                                    "relaxed_would_suppress_candidate_ids": ["action:1:0", "action:1:1"],
+                                    "relaxed_no_candidate_signature_count": 0,
                                 }
                             }
                         },
@@ -223,6 +232,10 @@ def test_result_converter_counts_action_selection_suppression_metadata(tmp_path)
                                     "detected_signature_count": 1,
                                     "suppressed_candidate_ids": ["action:2:0"],
                                     "all_candidates_suppressed": True,
+                                    "relaxed_diagnostics_enabled": True,
+                                    "relaxed_region_signature_count": 1,
+                                    "relaxed_current_candidate_match_count": 1,
+                                    "relaxed_would_suppress_candidate_ids": ["action:2:0"],
                                 }
                             }
                         },
@@ -263,7 +276,16 @@ def test_result_converter_counts_action_selection_suppression_metadata(tmp_path)
     assert runtime["action_selection_all_candidates_suppressed_count"] == 1
     assert runtime["action_selection_suppressed_candidate_count"] == 1
     assert runtime["action_selection_no_candidate_count"] == 1
+    assert runtime["action_selection_relaxed_diagnostics_enabled_count"] == 2
+    assert runtime["action_selection_relaxed_region_signature_count"] == 3
+    assert runtime["action_selection_relaxed_span_signature_count"] == 1
+    assert runtime["action_selection_relaxed_inverse_loop_signature_count"] == 1
+    assert runtime["action_selection_relaxed_current_candidate_match_count"] == 3
+    assert runtime["action_selection_relaxed_inverse_loop_candidate_count"] == 1
+    assert runtime["action_selection_relaxed_all_candidates_match_count"] == 1
+    assert runtime["action_selection_relaxed_would_suppress_candidate_count"] == 3
     assert row["action_selection_suppression_attempt_count"] == "2"
+    assert row["action_selection_relaxed_current_candidate_match_count"] == "3"
 
 
 def test_result_converter_counts_gated_clarification_metadata(tmp_path):
