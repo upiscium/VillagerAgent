@@ -769,6 +769,7 @@ def _suppress_repeated_zero_progress_candidates(
     metadata = {
         "policy": "suppress_repeated_zero_progress",
         "enabled": enabled,
+        "relaxed_diagnostics_enabled": bool(selection_config.get("relaxed_diagnostics", {}).get("enabled", False)),
         "attempted": False,
         "applied": False,
         "detected_signature_count": 0,
@@ -780,6 +781,14 @@ def _suppress_repeated_zero_progress_candidates(
         "window_turns": window_turns,
         "max_repeats": max_repeats,
     }
+    _add_relaxed_action_selection_diagnostics(
+        metadata=metadata,
+        action_candidates=action_candidates,
+        previous_actions=previous_actions,
+        window_turns=window_turns,
+        max_repeats=max_repeats,
+        treat_missing_progress_as_zero=bool(selection_config.get("treat_missing_progress_as_zero", True)),
+    )
     if not enabled or not action_candidates:
         return {"applied": False, "oracle_moves": oracle_moves, "action_candidates": action_candidates, "metadata": metadata}
     signatures = _repeated_zero_progress_signatures(
@@ -843,9 +852,127 @@ def _repeated_zero_progress_signatures(
     return {signature for signature, count in counts.items() if count >= max(1, max_repeats)}
 
 
+def _add_relaxed_action_selection_diagnostics(
+    *,
+    metadata: dict,
+    action_candidates: list,
+    previous_actions: list[dict],
+    window_turns: int,
+    max_repeats: int,
+    treat_missing_progress_as_zero: bool,
+) -> None:
+    metadata.update({
+        "relaxed_region_signature_count": 0,
+        "relaxed_span_signature_count": 0,
+        "relaxed_inverse_loop_signature_count": 0,
+        "relaxed_current_candidate_match_count": 0,
+        "relaxed_inverse_loop_candidate_count": 0,
+        "relaxed_all_candidates_match": False,
+        "relaxed_would_suppress_candidate_ids": [],
+        "relaxed_no_candidate_signature_count": 0,
+    })
+    if not metadata.get("relaxed_diagnostics_enabled"):
+        return
+
+    relaxed = _relaxed_repeated_zero_progress_signatures(
+        previous_actions=previous_actions,
+        window_turns=window_turns,
+        max_repeats=max_repeats,
+        treat_missing_progress_as_zero=treat_missing_progress_as_zero,
+    )
+    metadata["relaxed_region_signature_count"] = len(relaxed["regions"])
+    metadata["relaxed_span_signature_count"] = len(relaxed["spans"])
+    metadata["relaxed_inverse_loop_signature_count"] = len(relaxed["inverse_loops"])
+    if not action_candidates:
+        metadata["relaxed_no_candidate_signature_count"] = (
+            len(relaxed["regions"]) + len(relaxed["spans"]) + len(relaxed["inverse_loops"])
+        )
+        return
+
+    matched_ids = []
+    inverse_matched_ids = []
+    for candidate in action_candidates:
+        action = candidate.action
+        region_match = _public_region_signature(action) in relaxed["regions"]
+        span_match = _public_span_signature(action) in relaxed["spans"]
+        inverse_match = _public_inverse_loop_signature(action) in relaxed["inverse_loops"]
+        if region_match or span_match or inverse_match:
+            matched_ids.append(candidate.node_id)
+        if inverse_match:
+            inverse_matched_ids.append(candidate.node_id)
+    metadata["relaxed_current_candidate_match_count"] = len(matched_ids)
+    metadata["relaxed_inverse_loop_candidate_count"] = len(inverse_matched_ids)
+    metadata["relaxed_all_candidates_match"] = bool(matched_ids) and len(matched_ids) == len(action_candidates)
+    metadata["relaxed_would_suppress_candidate_ids"] = matched_ids
+
+
+def _relaxed_repeated_zero_progress_signatures(
+    *,
+    previous_actions: list[dict],
+    window_turns: int,
+    max_repeats: int,
+    treat_missing_progress_as_zero: bool,
+) -> dict[str, set[str]]:
+    region_counts: dict[str, int] = {}
+    span_counts: dict[str, int] = {}
+    inverse_actions: dict[str, set[str]] = {}
+    for action in previous_actions[-max(1, window_turns):]:
+        if action.get("action") not in {"place", "remove"}:
+            continue
+        progress_delta = action.get("_progress_delta")
+        if progress_delta is None and not treat_missing_progress_as_zero:
+            continue
+        if progress_delta is not None and float(progress_delta) != 0.0:
+            continue
+        region = _public_region_signature(action)
+        region_counts[region] = region_counts.get(region, 0) + 1
+        span = _public_span_signature(action)
+        if span:
+            span_counts[span] = span_counts.get(span, 0) + 1
+        inverse = _public_inverse_loop_signature(action)
+        inverse_actions.setdefault(inverse, set()).add(str(action.get("action", "")))
+    return {
+        "regions": {signature for signature, count in region_counts.items() if count >= max(1, max_repeats)},
+        "spans": {signature for signature, count in span_counts.items() if count >= max(1, max_repeats)},
+        "inverse_loops": {
+            signature
+            for signature, actions in inverse_actions.items()
+            if {"place", "remove"}.issubset(actions)
+        },
+    }
+
+
 def _public_action_signature(action: dict) -> str:
     return "|".join([
         str(action.get("action", "")),
+        str(action.get("block", "")),
+        str(action.get("position", "")),
+        str(action.get("layer", "")),
+        str(action.get("span_to", "")),
+    ])
+
+
+def _public_region_signature(action: dict) -> str:
+    return "|".join([
+        str(action.get("position", "")),
+        str(action.get("layer", "")),
+        str(action.get("span_to", "")),
+    ])
+
+
+def _public_span_signature(action: dict) -> str:
+    span_to = action.get("span_to")
+    if not span_to:
+        return ""
+    return "|".join([
+        str(action.get("position", "")),
+        str(span_to),
+        str(action.get("layer", "")),
+    ])
+
+
+def _public_inverse_loop_signature(action: dict) -> str:
+    return "|".join([
         str(action.get("block", "")),
         str(action.get("position", "")),
         str(action.get("layer", "")),

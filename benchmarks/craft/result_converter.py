@@ -166,6 +166,15 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
         "action_selection_suppression_applied_count",
         "action_selection_suppressed_candidate_count",
         "action_selection_no_candidate_count",
+        "action_selection_relaxed_diagnostics_enabled_count",
+        "action_selection_relaxed_region_signature_count",
+        "action_selection_relaxed_span_signature_count",
+        "action_selection_relaxed_inverse_loop_signature_count",
+        "action_selection_relaxed_current_candidate_match_count",
+        "action_selection_relaxed_inverse_loop_candidate_count",
+        "action_selection_relaxed_all_candidates_match_count",
+        "action_selection_relaxed_would_suppress_candidate_count",
+        "action_selection_relaxed_no_candidate_signature_count",
         "clarification_count",
         "unique_clarification_count",
         "repeated_clarification_count",
@@ -313,6 +322,15 @@ def normalize_results(*, config: dict, condition: str, raw_result: dict, output_
                 "action_selection_suppression_applied_count": game_action_selection_metrics["action_selection_suppression_applied_count"],
                 "action_selection_suppressed_candidate_count": game_action_selection_metrics["action_selection_suppressed_candidate_count"],
                 "action_selection_no_candidate_count": game_action_selection_metrics["action_selection_no_candidate_count"],
+                "action_selection_relaxed_diagnostics_enabled_count": game_action_selection_metrics["action_selection_relaxed_diagnostics_enabled_count"],
+                "action_selection_relaxed_region_signature_count": game_action_selection_metrics["action_selection_relaxed_region_signature_count"],
+                "action_selection_relaxed_span_signature_count": game_action_selection_metrics["action_selection_relaxed_span_signature_count"],
+                "action_selection_relaxed_inverse_loop_signature_count": game_action_selection_metrics["action_selection_relaxed_inverse_loop_signature_count"],
+                "action_selection_relaxed_current_candidate_match_count": game_action_selection_metrics["action_selection_relaxed_current_candidate_match_count"],
+                "action_selection_relaxed_inverse_loop_candidate_count": game_action_selection_metrics["action_selection_relaxed_inverse_loop_candidate_count"],
+                "action_selection_relaxed_all_candidates_match_count": game_action_selection_metrics["action_selection_relaxed_all_candidates_match_count"],
+                "action_selection_relaxed_would_suppress_candidate_count": game_action_selection_metrics["action_selection_relaxed_would_suppress_candidate_count"],
+                "action_selection_relaxed_no_candidate_signature_count": game_action_selection_metrics["action_selection_relaxed_no_candidate_signature_count"],
                 "clarification_count": game_clarification_metrics["clarification_count"],
                 "unique_clarification_count": game_clarification_metrics["unique_clarification_count"],
                 "repeated_clarification_count": game_clarification_metrics["repeated_clarification_count"],
@@ -590,6 +608,15 @@ def _action_selection_metrics(turns: list[dict]) -> dict:
     applied_count = 0
     suppressed_candidate_count = 0
     no_candidate_count = 0
+    relaxed_diagnostics_enabled_count = 0
+    relaxed_region_signature_count = 0
+    relaxed_span_signature_count = 0
+    relaxed_inverse_loop_signature_count = 0
+    relaxed_current_candidate_match_count = 0
+    relaxed_inverse_loop_candidate_count = 0
+    relaxed_all_candidates_match_count = 0
+    relaxed_would_suppress_candidate_count = 0
+    relaxed_no_candidate_signature_count = 0
     for turn in turns:
         metadata = (turn.get("builder_action") or {}).get("_action_candidate_metadata") or {}
         action_selection = (metadata.get("decision_support") or {}).get("action_selection") or {}
@@ -611,6 +638,17 @@ def _action_selection_metrics(turns: list[dict]) -> dict:
         suppressed_candidate_count += len(action_selection.get("suppressed_candidate_ids", []) or [])
         if action_selection.get("no_candidates"):
             no_candidate_count += 1
+        if action_selection.get("relaxed_diagnostics_enabled"):
+            relaxed_diagnostics_enabled_count += 1
+        relaxed_region_signature_count += int(action_selection.get("relaxed_region_signature_count", 0) or 0)
+        relaxed_span_signature_count += int(action_selection.get("relaxed_span_signature_count", 0) or 0)
+        relaxed_inverse_loop_signature_count += int(action_selection.get("relaxed_inverse_loop_signature_count", 0) or 0)
+        relaxed_current_candidate_match_count += int(action_selection.get("relaxed_current_candidate_match_count", 0) or 0)
+        relaxed_inverse_loop_candidate_count += int(action_selection.get("relaxed_inverse_loop_candidate_count", 0) or 0)
+        if action_selection.get("relaxed_all_candidates_match"):
+            relaxed_all_candidates_match_count += 1
+        relaxed_would_suppress_candidate_count += len(action_selection.get("relaxed_would_suppress_candidate_ids", []) or [])
+        relaxed_no_candidate_signature_count += int(action_selection.get("relaxed_no_candidate_signature_count", 0) or 0)
     return {
         "action_selection_suppression_enabled_count": enabled_count,
         "action_selection_suppression_disabled_count": disabled_count,
@@ -621,6 +659,15 @@ def _action_selection_metrics(turns: list[dict]) -> dict:
         "action_selection_suppression_applied_count": applied_count,
         "action_selection_suppressed_candidate_count": suppressed_candidate_count,
         "action_selection_no_candidate_count": no_candidate_count,
+        "action_selection_relaxed_diagnostics_enabled_count": relaxed_diagnostics_enabled_count,
+        "action_selection_relaxed_region_signature_count": relaxed_region_signature_count,
+        "action_selection_relaxed_span_signature_count": relaxed_span_signature_count,
+        "action_selection_relaxed_inverse_loop_signature_count": relaxed_inverse_loop_signature_count,
+        "action_selection_relaxed_current_candidate_match_count": relaxed_current_candidate_match_count,
+        "action_selection_relaxed_inverse_loop_candidate_count": relaxed_inverse_loop_candidate_count,
+        "action_selection_relaxed_all_candidates_match_count": relaxed_all_candidates_match_count,
+        "action_selection_relaxed_would_suppress_candidate_count": relaxed_would_suppress_candidate_count,
+        "action_selection_relaxed_no_candidate_signature_count": relaxed_no_candidate_signature_count,
     }
 
 

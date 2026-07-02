@@ -137,6 +137,71 @@ def test_repeated_zero_progress_suppression_reports_no_match():
     assert result["metadata"]["suppressed_candidate_ids"] == []
 
 
+def test_repeated_zero_progress_relaxed_diagnostics_do_not_reorder_candidates():
+    moves = [
+        {"action": "place", "block": "gs", "position": "(0,0)", "layer": 0},
+        {"action": "place", "block": "bs", "position": "(1,0)", "layer": 0},
+    ]
+    candidates = action_candidates_from_moves(moves=moves, reported_claims={}, turn_index=4)
+
+    result = _suppress_repeated_zero_progress_candidates(
+        oracle_moves=moves,
+        action_candidates=candidates,
+        previous_actions=[
+            {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0, "_progress_delta": 0.0},
+            {"action": "remove", "block": "ys", "position": "(0,0)", "layer": 0, "_progress_delta": 0.0},
+        ],
+        config={
+            "dual_dag": {
+                "enabled": True,
+                "action_selection": {
+                    "suppress_repeated_zero_progress": {
+                        "enabled": True,
+                        "relaxed_diagnostics": {"enabled": True},
+                    }
+                },
+            }
+        },
+    )
+
+    assert result["applied"] is False
+    assert result["oracle_moves"] == moves
+    assert result["action_candidates"] == candidates
+    assert result["metadata"]["detected_signature_count"] == 0
+    assert result["metadata"]["relaxed_diagnostics_enabled"] is True
+    assert result["metadata"]["relaxed_region_signature_count"] == 1
+    assert result["metadata"]["relaxed_inverse_loop_signature_count"] == 1
+    assert result["metadata"]["relaxed_current_candidate_match_count"] == 1
+    assert result["metadata"]["relaxed_would_suppress_candidate_ids"] == ["action:4:0"]
+
+
+def test_repeated_zero_progress_relaxed_diagnostics_counts_no_candidate_signatures():
+    result = _suppress_repeated_zero_progress_candidates(
+        oracle_moves=[],
+        action_candidates=[],
+        previous_actions=[
+            {"action": "place", "block": "ys", "position": "(0,0)", "layer": 0, "_progress_delta": 0.0},
+            {"action": "place", "block": "bs", "position": "(0,0)", "layer": 0, "_progress_delta": 0.0},
+        ],
+        config={
+            "dual_dag": {
+                "enabled": True,
+                "action_selection": {
+                    "suppress_repeated_zero_progress": {
+                        "enabled": True,
+                        "relaxed_diagnostics": {"enabled": True},
+                    }
+                },
+            }
+        },
+    )
+
+    assert result["applied"] is False
+    assert result["metadata"]["no_candidates"] is True
+    assert result["metadata"]["relaxed_region_signature_count"] == 1
+    assert result["metadata"]["relaxed_no_candidate_signature_count"] == 1
+
+
 def test_gate_fires_on_low_confidence():
     should_gate, metadata = should_clarify(
         candidate_metadata={"chosen_confidence": 0.4, "claim_conflict_count": 0},

@@ -104,6 +104,16 @@ This document explains the CRAFT metrics emitted by the VillagerAgent CRAFT inte
 - `action_selection_suppression_applied_count`: Number of turns where suppression reordered candidates.
 - `action_selection_suppressed_candidate_count`: Total candidates moved behind non-suppressed candidates.
 - `action_selection_no_candidate_count`: Number of diagnostic turns without action candidates to evaluate.
+- Relaxed repeated-zero diagnostics are metrics-only and opt-in via `dual_dag.action_selection.suppress_repeated_zero_progress.relaxed_diagnostics.enabled`. They do not reorder candidates.
+- `action_selection_relaxed_diagnostics_enabled_count`: Number of turns with relaxed diagnostics enabled.
+- `action_selection_relaxed_region_signature_count`: Total repeated no-progress coordinate/layer/span signatures detected while ignoring action and block type.
+- `action_selection_relaxed_span_signature_count`: Total repeated no-progress large-block span signatures detected.
+- `action_selection_relaxed_inverse_loop_signature_count`: Total place/remove inverse-loop signatures detected over the same block/location/layer/span.
+- `action_selection_relaxed_current_candidate_match_count`: Total current candidates matching any relaxed repeated signature.
+- `action_selection_relaxed_inverse_loop_candidate_count`: Total current candidates matching an inverse-loop signature.
+- `action_selection_relaxed_all_candidates_match_count`: Number of turns where all current candidates matched relaxed signatures.
+- `action_selection_relaxed_would_suppress_candidate_count`: Total candidates that diagnostics would flag for down-ranking under a future relaxed policy. Current diagnostics do not down-rank them.
+- `action_selection_relaxed_no_candidate_signature_count`: Total relaxed signatures detected on turns with no action candidates.
 - `clarification_resolution_count`: Number of clarification turns whose next non-clarify action shows downstream resolution. Resolution is heuristic-based: progress increases, chosen action confidence improves, or conflict/required-evidence counts decrease.
 - `clarification_resolution_rate`: `clarification_resolution_count / clarification_count`.
 - `mean_clarification_quality_score`: Mean heuristic specificity score for clarification turns. The score rewards explicit clarification wording, concrete gate reasons, conflict/required-evidence/span reasons, and public evidence context.

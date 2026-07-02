@@ -42,6 +42,8 @@ def test_experiment_summary_combines_runtime_and_analysis_metrics(tmp_path):
     assert rows[0]["action_selection_suppression_attempt_count"] == 2
     assert rows[0]["action_selection_repeated_zero_signature_count"] == 3
     assert rows[0]["action_selection_suppression_applied_count"] == 1
+    assert rows[0]["action_selection_relaxed_current_candidate_match_count"] == 4
+    assert rows[0]["action_selection_relaxed_would_suppress_candidate_count"] == 4
     assert rows[0]["candidate_state_transition_counts"] == '{"executes_action:executed": 1}'
     assert rows[0]["coordination_action_count"] == 2
     assert rows[0]["supported_action_count"] == 2
@@ -88,6 +90,7 @@ def test_experiment_summary_writes_csv_and_json(tmp_path):
     assert csv_rows[0]["claim_required_evidence_count"] == "3"
     assert csv_rows[0]["action_candidate_executed_count"] == "1"
     assert csv_rows[0]["action_selection_suppression_attempt_count"] == "2"
+    assert csv_rows[0]["action_selection_relaxed_current_candidate_match_count"] == "4"
     assert json.loads(json_path.read_text(encoding="utf-8"))["runs"][0]["run_name"] == "craft_dual_dag"
 
 
@@ -284,6 +287,15 @@ def _write_run(
             "action_selection_suppression_applied_count": 1,
             "action_selection_suppressed_candidate_count": 2,
             "action_selection_no_candidate_count": 0,
+            "action_selection_relaxed_diagnostics_enabled_count": 2,
+            "action_selection_relaxed_region_signature_count": 3,
+            "action_selection_relaxed_span_signature_count": 1,
+            "action_selection_relaxed_inverse_loop_signature_count": 1,
+            "action_selection_relaxed_current_candidate_match_count": 4,
+            "action_selection_relaxed_inverse_loop_candidate_count": 1,
+            "action_selection_relaxed_all_candidates_match_count": 1,
+            "action_selection_relaxed_would_suppress_candidate_count": 4,
+            "action_selection_relaxed_no_candidate_signature_count": 0,
             "candidate_state_transition_counts": '{"executes_action:executed": 1}',
             "coordination_action_count": 2,
             "clarify_coordination_action_count": 1,
