@@ -1161,6 +1161,7 @@ def _late_contract_fixture(*, shutdown_complete=False):
         run_id=identity["run_id"], manifest_digest=identity["manifest_digest"],
         runtime_result=runtime, trace_artifact=trace,
         supervision=supervision, shutdown=shutdown,
+        expected_identity=identity,
     )
     return identity, trace, runtime, evidence
 
@@ -1443,13 +1444,23 @@ def test_k11_contract4_chain_digest_is_append_only_and_non_cyclic():
         "late_descendant_terminal", "late_process_group_terminal",
     )
     for index in range(3):
-        summary = {"run_id": f"run-{index}", "manifest_digest": "manifest",
+        summary = {"run_id": f"run-{index}", "manifest_digest": "b" * 64,
+                   "execution_revision": "a" * 40,
                    "validation_contract": RECONCILIATION_VALIDATION_CONTRACT,
-                   "measurement_snapshot": {"digest": f"cut-{index}",
+                   "measurement_snapshot_valid": True,
+                   "measurement_structurally_valid": True,
+                   "measurement_analysis_eligible": True,
+                   "trace_validation": {"valid": True},
+                   "analysis_validation": {"valid": True},
+                   "measurement_snapshot": {
+                    "digest": "sha256:" + f"{index + 1:064x}",
                     "event_prefix_high_water_sequence": index + 1,
                     "integrity": {"measurement_cut_mutated": False,
                                   "snapshot_valid": True}},
-                   "late_cleanup_evidence": {"digest": f"late-{index}"},
+                   "late_cleanup_evidence": {
+                       "artifact_id": RECONCILIATION_EVIDENCE_SCHEMA,
+                       "digest": "sha256:" + f"{index + 10:064x}",
+                   },
                    "late_cleanup": {"reconciliation": {
                        "valid": True, "active_count": 0, "items": [],
                        "new_post_close_effect_absent": True,
@@ -1632,6 +1643,9 @@ def test_k11_contract4_exact_terminal_and_all_authorities_admit_next_row():
         "run_id": "run", "manifest_digest": "manifest",
         "validation_contract": RECONCILIATION_VALIDATION_CONTRACT,
         "runtime_error": None, "cleanup_status": "qualified_late",
+        "measurement_snapshot_valid": True,
+        "measurement_structurally_valid": True,
+        "measurement_analysis_eligible": True,
         "measurement_snapshot": {
             "digest": "cut", "event_prefix_high_water_sequence": 2,
             "integrity": {"measurement_cut_mutated": False, "snapshot_valid": True},
@@ -1670,15 +1684,24 @@ def test_k11_contract4_chain_rejects_predecessor_domain_and_body_corruption(tmp_
     domain = {"host": "h", "port": 1, "world_initialization": None,
               "same_domain": True, "no_world_reset": True}
     predecessor = "sha256:" + "a" * 64
-    summary = {"run_id": "run", "manifest_digest": "manifest",
+    summary = {"run_id": "run", "manifest_digest": "b" * 64,
+               "execution_revision": "a" * 40,
                "validation_contract": RECONCILIATION_VALIDATION_CONTRACT,
                "runtime_error": None, "cleanup_status": "qualified_late",
                "censoring": {"uncertainty": False},
-               "measurement_snapshot": {"digest": "cut",
+               "measurement_snapshot_valid": True,
+               "measurement_structurally_valid": True,
+               "measurement_analysis_eligible": True,
+               "trace_validation": {"valid": True},
+               "analysis_validation": {"valid": True},
+               "measurement_snapshot": {"digest": "sha256:" + "c" * 64,
                    "event_prefix_high_water_sequence": 1,
                    "integrity": {"measurement_cut_mutated": False,
                                  "snapshot_valid": True}},
-               "late_cleanup_evidence": {"digest": "late"},
+               "late_cleanup_evidence": {
+                   "artifact_id": RECONCILIATION_EVIDENCE_SCHEMA,
+                   "digest": "sha256:" + "d" * 64,
+               },
                "late_cleanup": {"reconciliation": {"valid": True, "items": [],
                    "active_count": 0, "new_post_close_effect_absent": True},
                    "authority_terminal_monotonic_ns": 1,
@@ -1764,10 +1787,11 @@ def test_k11_contract4_persists_and_validates_explicit_genesis(tmp_path):
         )
 
 
-def test_k11_contract4_late_cleanup_routes_v4_identity_and_reconciliation():
-    identity, trace, runtime, _ = _late_contract_fixture()
+def test_k11_contract4_late_cleanup_routes_v4_identity_and_reconciliation(monkeypatch):
+    identity, trace, runtime, _ = _late_contract_fixture(shutdown_complete=True)
     identity = {**identity, "validation_contract": RECONCILIATION_VALIDATION_CONTRACT}
     trace["measurement_cut"]["identity"] = identity
+    runtime["controller"]["late_lifecycle_ledger"]["measurement_identity"] = identity
     trace["measurement_cut"]["open_lifecycles"] = {
         "items": [], "retention": {"retained": 0, "capacity": 8,
                                      "truncated": False, "dropped_count": 0},
@@ -1782,6 +1806,282 @@ def test_k11_contract4_late_cleanup_routes_v4_identity_and_reconciliation():
         shutdown={"processes_after_cleanup": []}, domain_identity={
             "host": "h", "port": 1, "world_initialization": None,
             "same_domain": True, "no_world_reset": True},
+        expected_identity=identity,
     )
     assert evidence["artifact_id"] == RECONCILIATION_EVIDENCE_SCHEMA
     assert evidence["reconciliation"]["valid"] is True
+    monkeypatch.setattr(
+        k11_pilot, "_late_trace_cleanup_evidence",
+        lambda _trace: {"provider": True, "tool_native": True, "agent": True},
+    )
+    domain = evidence["domain"]
+    projection = k11_pilot._late_cleanup_evidence_projection(
+        evidence, runtime_result=runtime, trace_artifact=trace,
+        expected_identity=identity, expected_actors=("Alice",),
+        expected_domain=domain,
+    )
+    assert projection["post_window_cleanup_status"] == "qualified_within_budget"
+    for field in ("timed_out", "post_artifact_linger", "post_parent_group_linger"):
+        broken = deepcopy(evidence)
+        broken["authorities"]["worker_process_and_group"][field] = True
+        result = k11_pilot._late_cleanup_evidence_projection(
+            broken, runtime_result=runtime, trace_artifact=trace,
+            expected_identity=identity, expected_actors=("Alice",),
+            expected_domain=domain,
+        )
+        assert result["post_window_cleanup_status"] == "not_qualified"
+
+
+def _write_v5_prelaunch(run_dir, *, run_id="run", manifest_digest="manifest",
+                        predecessor="sha256:" + "a" * 64, domain=None):
+    domain = domain or {
+        "host": "h", "port": 1, "world_initialization": None,
+        "same_domain": True, "no_world_reset": True,
+    }
+    binding = {
+        "artifact_id": "minecraft-k11-p0-prelaunch-admission-binding",
+        "artifact_version": 1, "run_id": run_id,
+        "manifest_digest": manifest_digest,
+        "predecessor_admission_evidence_digest": predecessor,
+        "domain": domain,
+    }
+    binding["digest"] = k11_pilot._canonical_artifact_digest(binding)
+    run_dir.mkdir(parents=True)
+    (run_dir / "prelaunch_admission_binding.json").write_text(json.dumps(binding))
+    return binding
+
+
+def test_k11_contract4_row_start_accepts_only_exact_prelaunch_binding(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    binding = _write_v5_prelaunch(run_dir)
+    domain = binding["domain"]
+    kwargs = {
+        "run_id": "run", "manifest_digest": "manifest",
+        "validation_contract": RECONCILIATION_VALIDATION_CONTRACT,
+        "prelaunch_binding_digest": binding["digest"],
+        "predecessor_digest": binding["predecessor_admission_evidence_digest"],
+        "domain_identity": domain,
+    }
+    _, path_identity = k11_pilot._validate_row_start_directory(run_dir, **kwargs)
+
+    class SetupReached(Exception):
+        pass
+
+    def recorder(*_args, **_kwargs):
+        raise SetupReached
+
+    monkeypatch.setattr(k11_pilot, "K11TraceRecorder", recorder)
+    premanifest = tmp_path / "premanifest.json"
+    premanifest.write_text(json.dumps({
+        "runtime_digest": "sha256:runtime", "premanifest_identity": "premanifest",
+    }))
+    with pytest.raises(SetupReached):
+        k11_pilot._run_single_row(
+            {"run_id": "run"}, run_dir, execution=object(),
+            execution_revision="a" * 40, premanifest_path=premanifest,
+            observation_horizon_seconds=600, manifest_digest="manifest",
+            cohort_mode="development_smoke",
+            validation_contract=RECONCILIATION_VALIDATION_CONTRACT,
+            trace_schema="minecraft-k11-trace/3", validation_artifact_version=5,
+            prospective=True, prelaunch_binding_digest=binding["digest"],
+            predecessor_digest=binding["predecessor_admission_evidence_digest"],
+            domain_identity=domain,
+        )
+
+    (run_dir / "extra.json").write_text("{}")
+    with pytest.raises(K11PilotContractError, match="exactly one"):
+        k11_pilot._validate_row_start_directory(run_dir, **kwargs)
+
+    (run_dir / "extra.json").unlink()
+    binding_path = run_dir / "prelaunch_admission_binding.json"
+    binding_path.unlink()
+    binding_path.write_text(json.dumps(binding))
+    with pytest.raises(K11PilotContractError, match="was replaced"):
+        k11_pilot._validate_row_start_directory(
+            run_dir, expected_path_identity=path_identity, **kwargs,
+        )
+
+
+def test_k11_row_start_preserves_historical_empty_directory_rule(tmp_path):
+    for contract in (
+        P0_VALIDATION_CONTRACT, PROSPECTIVE_VALIDATION_CONTRACT,
+        LATE_CLEANUP_VALIDATION_CONTRACT,
+    ):
+        run_dir = tmp_path / contract.rsplit("/", 1)[-1]
+        run_dir.mkdir()
+        k11_pilot._validate_row_start_directory(
+            run_dir, run_id="run", manifest_digest="manifest",
+            validation_contract=contract,
+        )
+        (run_dir / "preexisting.json").write_text("{}")
+        with pytest.raises(K11PilotContractError, match="already contains data"):
+            k11_pilot._validate_row_start_directory(
+                run_dir, run_id="run", manifest_digest="manifest",
+                validation_contract=contract,
+            )
+
+
+def test_k11_contract4_row_start_rejects_mismatch_and_prelaunch_symlink(tmp_path):
+    run_dir = tmp_path / "run"
+    binding = _write_v5_prelaunch(run_dir)
+    with pytest.raises(K11PilotContractError, match="binding is invalid"):
+        k11_pilot._validate_row_start_directory(
+            run_dir, run_id="run", manifest_digest="different",
+            validation_contract=RECONCILIATION_VALIDATION_CONTRACT,
+            prelaunch_binding_digest=binding["digest"],
+            predecessor_digest=binding["predecessor_admission_evidence_digest"],
+            domain_identity=binding["domain"],
+        )
+
+    (run_dir / "prelaunch_admission_binding.json").unlink()
+    target = tmp_path / "binding.json"
+    target.write_text(json.dumps(binding))
+    (run_dir / "prelaunch_admission_binding.json").symlink_to(target)
+    with pytest.raises(K11PilotContractError, match="exactly one"):
+        k11_pilot._validate_row_start_directory(
+            run_dir, run_id="run", manifest_digest="manifest",
+            validation_contract=RECONCILIATION_VALIDATION_CONTRACT,
+            prelaunch_binding_digest=binding["digest"],
+            predecessor_digest=binding["predecessor_admission_evidence_digest"],
+            domain_identity=binding["domain"],
+        )
+    target_before = target.read_text()
+    with pytest.raises(K11PilotContractError, match="refusing to replace"):
+        k11_pilot._write_json_exclusive_nofollow(
+            run_dir / "prelaunch_admission_binding.json", binding,
+        )
+    assert target.read_text() == target_before
+
+
+def test_k11_contract4_pre_runtime_failure_is_versioned_valid_and_denied(
+    tmp_path, monkeypatch,
+):
+    output = tmp_path / "output"
+    output.mkdir(mode=0o700)
+    premanifest = tmp_path / "premanifest.json"
+    premanifest.write_text(json.dumps({
+        "runtime_digest": "sha256:runtime", "premanifest_identity": "premanifest",
+    }))
+    supervision = {
+        "artifact_ready": False, "exit_code": 1, "timed_out": False,
+        "post_artifact_linger": False, "post_parent_group_linger": False,
+        "process_group_alive_after_cleanup": False,
+        "term_sent": False, "kill_sent": False,
+        "lingering_processes_before_cleanup": [], "duration": 1.0,
+    }
+    monkeypatch.setattr(k11_pilot, "supervise_process", lambda *_args, **_kwargs: supervision)
+    domain = {
+        "host": "h", "port": 1, "world_initialization": None,
+        "same_domain": True, "no_world_reset": True,
+    }
+    predecessor = "sha256:" + "a" * 64
+    summary = k11_pilot._run_isolated_row(
+        {"run_id": "run", "runtime": {"host": "h", "port": 1, "agent_num": 2}},
+        manifest_path=tmp_path / "manifest.json", output_root=output,
+        execution_revision="b" * 40, premanifest_path=premanifest,
+        manifest_digest="e" * 64, cohort_mode="development_smoke",
+        validation_contract=RECONCILIATION_VALIDATION_CONTRACT,
+        trace_schema="minecraft-k11-trace/3", validation_artifact_version=5,
+        prospective=True, predecessor_digest=predecessor, domain_identity=domain,
+    )
+    assert summary["runtime_error_type"] == "RunProcessFailure"
+    assert summary["process_supervision"]["exit_code"] == 1
+    assert summary["next_run_admission_allowed"] is False
+    assert summary["measurement_prefix_immutable"] is False
+    assert summary["execution_overlap_excluded"] is False
+    assert summary["admission_chain"]["body"]["measurement_cut_digest"] is None
+    assert summary["admission_chain"]["body"]["event_prefix_high_water_sequence"] is None
+    k11_pilot._validate_v5_chain_row(
+        summary, predecessor_digest=predecessor, domain=domain,
+    )
+
+    late = json.loads((output / "run" / "late_cleanup_evidence.json").read_text())
+    assert late["artifact_id"] == RECONCILIATION_EVIDENCE_SCHEMA
+    assert late["artifact_version"] == 2
+    assert late["identity"]["validation_contract"] == RECONCILIATION_VALIDATION_CONTRACT
+    assert late["measurement_cut"]["digest"] is None
+    assert late["h_active_executions"]["items"] == []
+    assert late["integrity"]["collection_errors"]
+
+
+def test_k11_contract3_pre_runtime_failure_retains_historical_late_schema():
+    identity = {
+        "run_id": "run", "manifest_digest": "manifest",
+        "execution_revision": "a" * 40, "runtime_digest": "sha256:runtime",
+        "premanifest_identity": "premanifest",
+        "validation_contract": LATE_CLEANUP_VALIDATION_CONTRACT,
+        "trace_schema": "minecraft-k11-trace/3",
+    }
+    evidence = k11_pilot._build_late_cleanup_evidence(
+        run_id="run", manifest_digest="manifest", runtime_result=None,
+        trace_artifact=None, supervision={}, shutdown=None,
+        expected_identity=identity,
+    )
+    assert evidence["artifact_id"] == LATE_CLEANUP_EVIDENCE_SCHEMA
+    assert evidence["artifact_version"] == 1
+    assert evidence["identity"]["validation_contract"] is None
+    assert evidence["measurement_cut"]["digest"] is None
+
+
+def test_k11_contract4_failed_first_row_stops_before_second_without_masking(
+    tmp_path, monkeypatch,
+):
+    rows = [{
+        "run_id": f"K11-P0-{index:02d}",
+        "runtime": {"host": "h", "port": 1},
+    } for index in range(1, 9)]
+    manifest = {
+        "artifact_version": RECONCILIATION_MANIFEST_VERSION,
+        "runs": rows, "runtime_hygiene": {},
+        "admission": {"same_domain": True, "no_world_reset": True},
+    }
+    monkeypatch.setattr(k11_pilot, "load_p0_manifest", lambda _path: manifest)
+    monkeypatch.setattr(
+        k11_pilot, "_prepare_execution_identity",
+        lambda root: (
+            object(), "b" * 40, root / "premanifest.json",
+            {"runtime_digest": "sha256:runtime", "premanifest_identity": "premanifest"},
+        ),
+    )
+    monkeypatch.setattr(
+        k11_pilot, "measure_inprocess_overhead",
+        lambda **_kwargs: {"traced": {"trace_validation": {"valid": True}}},
+    )
+    calls = []
+
+    def failed_row(row, **kwargs):
+        calls.append(row["run_id"])
+        summary = {
+            "run_id": row["run_id"], "manifest_digest": kwargs["manifest_digest"],
+            "execution_revision": kwargs["execution_revision"],
+            "validation_contract": RECONCILIATION_VALIDATION_CONTRACT,
+            "runtime_error": "worker failed", "runtime_error_type": "RunProcessFailure",
+            "trace_validation": {"valid": False},
+            "analysis_validation": {"valid": False},
+            "measurement_analysis_eligible": False,
+            "measurement_snapshot": {"valid": False},
+            "measurement_snapshot_valid": False,
+            "late_cleanup_evidence": {
+                "artifact_id": RECONCILIATION_EVIDENCE_SCHEMA,
+                "digest": "sha256:" + "c" * 64,
+            },
+            "late_cleanup": {}, "cleanup_status": "unknown",
+            "censoring": {"uncertainty": True},
+            "event_type_counts": {}, "agent_thread_pairs": [],
+            "model_call_sources": [],
+            "exposure_coverage": {"qualifying_event_count": 0},
+        }
+        return k11_pilot._apply_v5_reconciliation(
+            summary, predecessor_digest=kwargs["predecessor_digest"],
+            domain=kwargs["domain_identity"], decision_ns=1,
+        )
+
+    monkeypatch.setattr(k11_pilot, "_run_isolated_row", failed_row)
+    result = k11_pilot.run_p0_manifest(
+        tmp_path / "manifest.json", output_root=tmp_path / "output",
+    )
+    assert calls == ["K11-P0-01"]
+    assert result["run_count"] == 1
+    assert result["blocked_next_run_id"] == "K11-P0-02"
+    assert result["runs"][0]["runtime_error_type"] == "RunProcessFailure"
+    assert result["runs"][0]["next_run_admission_allowed"] is False

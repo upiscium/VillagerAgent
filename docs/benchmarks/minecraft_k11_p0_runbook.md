@@ -183,6 +183,15 @@ runtime_events.jsonl       # existing baseline runtime journal
 runtime/                   # isolated runtime artifacts
 ```
 
+At row start, historical validation `/1`-`/3` still requires an empty run
+directory. Validation `/4` requires the directory to contain exactly the already
+validated `prelaunch_admission_binding.json` and rejects any additional entry,
+symlink, or identity/digest mismatch. If a worker fails before producing a
+measurement, parent finalization still writes version-correct late evidence `/2`
+with explicit collection errors and a structurally valid admission artifact whose
+decision is false. That denied artifact preserves the original worker/process
+failure; it does not fabricate a cut or permit the next row.
+
 On runtime exception, `exception.txt` is preserved as pilot evidence.
 
 ## 9. P0 pass conditions

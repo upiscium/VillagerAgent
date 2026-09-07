@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import stat
 import subprocess
 import sys
@@ -116,6 +117,46 @@ def _secure_output_root(path: str | Path, *, create: bool) -> Path:
             "K11 P0 output root must not be group/other writable"
         )
     return root
+
+
+def _load_json_nofollow(path: Path) -> tuple[dict[str, Any], tuple[int, int, int, int]]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise K11PilotContractError(f"unsafe or unreadable JSON artifact: {path}") from exc
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise K11PilotContractError(f"JSON artifact is not a regular file: {path}")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            value = json.load(handle)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not isinstance(value, dict):
+        raise K11PilotContractError(f"JSON artifact must be an object: {path}")
+    return value, (
+        file_stat.st_dev, file_stat.st_ino,
+        file_stat.st_ctime_ns, file_stat.st_mtime_ns,
+    )
+
+
+def _write_json_exclusive_nofollow(path: Path, value: Mapping[str, Any]) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise K11PilotContractError(f"refusing to replace JSON artifact: {path}") from exc
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            json.dump(value, handle, ensure_ascii=True, indent=2, sort_keys=True)
+            handle.write("\n")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _v5_domain_identity(row: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -766,6 +807,63 @@ def _prospective_passes(*, summaries: list[Mapping[str, Any]], calibration_error
     )
 
 
+def _validate_row_start_directory(
+    run_dir: Path, *, run_id: str, manifest_digest: str,
+    validation_contract: str, prelaunch_binding_digest: str | None = None,
+    predecessor_digest: str | None = None,
+    domain_identity: Mapping[str, Any] | None = None,
+    expected_path_identity: tuple[int, ...] | None = None,
+) -> tuple[dict[str, Any] | None, tuple[int, ...]]:
+    """Enforce the versioned row-start directory and prelaunch contract."""
+    if run_dir.is_symlink() or not run_dir.is_dir():
+        raise K11PilotContractError("K11 P0 row-start directory is missing or unsafe")
+    directory_stat = run_dir.stat(follow_symlinks=False)
+    directory_identity = (directory_stat.st_dev, directory_stat.st_ino)
+    entries = list(run_dir.iterdir())
+    if validation_contract != RECONCILIATION_VALIDATION_CONTRACT:
+        if entries:
+            raise K11PilotContractError(
+                f"K11 P0 run directory already contains data: {run_dir}"
+            )
+        return None, (*directory_identity, 0, 0)
+    if (len(entries) != 1
+            or entries[0].name != "prelaunch_admission_binding.json"
+            or entries[0].is_symlink()
+            or not entries[0].is_file()
+            or not isinstance(prelaunch_binding_digest, str)
+            or not isinstance(domain_identity, Mapping)):
+        raise K11PilotContractError(
+            "K11 P0 v5 row start requires exactly one validated prelaunch binding"
+        )
+    binding, file_identity = _load_json_nofollow(entries[0])
+    path_identity = (*directory_identity, *file_identity)
+    binding_body = dict(binding)
+    observed_digest = binding_body.pop("digest", None)
+    if (observed_digest != prelaunch_binding_digest
+            or observed_digest != _canonical_artifact_digest(binding_body)
+            or binding.get("artifact_id")
+            != "minecraft-k11-p0-prelaunch-admission-binding"
+            or binding.get("artifact_version") != 1
+            or binding.get("run_id") != run_id
+            or binding.get("manifest_digest") != manifest_digest
+            or (predecessor_digest is not None
+                and binding.get("predecessor_admission_evidence_digest")
+                != predecessor_digest)
+            or not _valid_hex_digest(
+                binding.get("predecessor_admission_evidence_digest"),
+                length=64, prefix="sha256:",
+            )
+            or binding.get("domain") != dict(domain_identity)):
+        raise K11PilotContractError(
+            "K11 P0 v5 worker prelaunch predecessor binding is invalid"
+        )
+    if expected_path_identity is not None and path_identity != expected_path_identity:
+        raise K11PilotContractError(
+            "K11 P0 v5 prelaunch binding was replaced before row start"
+        )
+    return binding, path_identity
+
+
 def _run_single_row(
     row: Mapping[str, Any],
     run_dir: Path,
@@ -780,11 +878,21 @@ def _run_single_row(
     trace_schema: str = "minecraft-k11-trace/2",
     validation_artifact_version: int = P0_VALIDATION_ARTIFACT_VERSION,
     prospective: bool = False,
+    prelaunch_binding_digest: str | None = None,
+    predecessor_digest: str | None = None,
+    domain_identity: Mapping[str, Any] | None = None,
+    prelaunch_path_identity: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     run_id = row["run_id"]
-    if run_dir.exists() and any(run_dir.iterdir()):
-        raise K11PilotContractError(f"K11 P0 run directory already contains data: {run_dir}")
     run_dir.mkdir(parents=True, exist_ok=True)
+    _validate_row_start_directory(
+        run_dir, run_id=run_id, manifest_digest=manifest_digest,
+        validation_contract=validation_contract,
+        prelaunch_binding_digest=prelaunch_binding_digest,
+        predecessor_digest=predecessor_digest,
+        domain_identity=domain_identity,
+        expected_path_identity=prelaunch_path_identity,
+    )
     measurement_identity = None
     if prospective:
         premanifest = _load_json(premanifest_path)
@@ -1411,6 +1519,13 @@ def _canonical_artifact_digest(value: Any) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+def _valid_hex_digest(value: Any, *, length: int, prefix: str = "") -> bool:
+    if not isinstance(value, str) or not value.startswith(prefix):
+        return False
+    payload = value[len(prefix):]
+    return len(payload) == length and all(character in "0123456789abcdef" for character in payload)
+
+
 def _complete_inventory(value: Any) -> list[Any] | None:
     if not isinstance(value, Mapping):
         return None
@@ -1431,6 +1546,7 @@ def _complete_inventory(value: Any) -> list[Any] | None:
 def _build_late_cleanup_evidence(
     *, run_id: str, manifest_digest: str, runtime_result: Any,
     trace_artifact: Any, supervision: Mapping[str, Any], shutdown: Any,
+    expected_identity: Mapping[str, Any],
     domain_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Bind post-verdict authorities without modifying the scientific cut."""
@@ -1455,19 +1571,20 @@ def _build_late_cleanup_evidence(
     execution_ledger = controller.get("execution_ledger") if isinstance(controller, Mapping) else None
     provider_ledger = controller.get("provider_ledger") if isinstance(controller, Mapping) else None
     lifecycle_ledger = controller.get("late_lifecycle_ledger") if isinstance(controller, Mapping) else None
-    v5 = isinstance(identity, Mapping) and identity.get("validation_contract") == RECONCILIATION_VALIDATION_CONTRACT
+    v5 = expected_identity.get("validation_contract") == RECONCILIATION_VALIDATION_CONTRACT
+    evidence_identity = dict(expected_identity) if v5 else {
+        "run_id": run_id,
+        "manifest_digest": manifest_digest,
+        "execution_revision": identity.get("execution_revision") if isinstance(identity, Mapping) else None,
+        "runtime_digest": identity.get("runtime_digest") if isinstance(identity, Mapping) else None,
+        "premanifest_identity": identity.get("premanifest_identity") if isinstance(identity, Mapping) else None,
+        "validation_contract": identity.get("validation_contract") if isinstance(identity, Mapping) else None,
+        "trace_schema": identity.get("trace_schema") if isinstance(identity, Mapping) else None,
+    }
     evidence = {
         "artifact_id": RECONCILIATION_EVIDENCE_SCHEMA if v5 else LATE_CLEANUP_EVIDENCE_SCHEMA,
         "artifact_version": 2 if v5 else 1,
-        "identity": {
-            "run_id": run_id,
-            "manifest_digest": manifest_digest,
-            "execution_revision": identity.get("execution_revision") if isinstance(identity, Mapping) else None,
-            "runtime_digest": identity.get("runtime_digest") if isinstance(identity, Mapping) else None,
-            "premanifest_identity": identity.get("premanifest_identity") if isinstance(identity, Mapping) else None,
-            "validation_contract": identity.get("validation_contract") if isinstance(identity, Mapping) else None,
-            "trace_schema": identity.get("trace_schema") if isinstance(identity, Mapping) else None,
-        },
+        "identity": evidence_identity,
         "measurement_cut": {
             "identity": dict(identity) if isinstance(identity, Mapping) else None,
             "digest": _canonical_artifact_digest(cut) if isinstance(cut, Mapping) else None,
@@ -1868,6 +1985,12 @@ def _late_cleanup_evidence_projection(
         or process["term_sent"] or process["kill_sent"]
         or process["exit_code"] != 0 or not projection["late_bridge_terminal"]
         or not projection["late_movement_terminal"]
+        or (v5 and (
+            process["artifact_ready"] is not True
+            or process["timed_out"]
+            or process["post_artifact_linger"]
+            or process["post_parent_group_linger"]
+        ))
     )
     if affirmative_failure:
         projection["post_window_cleanup_status"] = "not_qualified"
@@ -1989,6 +2112,7 @@ def _v5_chain_evidence(*, predecessor_digest: str, domain: Mapping[str, Any],
     body = {
         "run_id": summary.get("run_id"),
         "manifest_digest": summary.get("manifest_digest"),
+        "execution_revision": summary.get("execution_revision"),
         "validation_contract": summary.get("validation_contract"),
         "predecessor_admission_evidence_digest": predecessor_digest,
         "domain": dict(domain),
@@ -2009,7 +2133,13 @@ def _apply_v5_reconciliation(summary: dict[str, Any], *, predecessor_digest: str
     reconciliation = late.get("reconciliation", {}) if isinstance(late, Mapping) else {}
     clean = summary.get("cleanup_status") in {"qualified_within_budget", "qualified_late"}
     snapshot = summary.get("measurement_snapshot")
-    prefix = (isinstance(snapshot, Mapping)
+    measurement_ready = (
+        summary.get("measurement_snapshot_valid") is True
+        and summary.get("measurement_structurally_valid") is True
+        and summary.get("measurement_analysis_eligible") is True
+    )
+    prefix = (measurement_ready
+              and isinstance(snapshot, Mapping)
               and isinstance(snapshot.get("digest"), str)
               and type(snapshot.get("event_prefix_high_water_sequence")) is int
               and snapshot.get("integrity") == {
@@ -2073,10 +2203,38 @@ def _validate_v5_chain_row(summary: Any, *, predecessor_digest: str,
         raise K11PilotContractError("K11 P0 v5 row admission evidence is missing")
     chain = summary.get("admission_chain")
     body = chain.get("body") if isinstance(chain, Mapping) else None
+    split = body.get("split_decisions") if isinstance(body, Mapping) else None
+    admitted = summary.get("next_run_admission_allowed")
+    snapshot = summary.get("measurement_snapshot")
+    late = summary.get("late_cleanup")
+    late_binding = summary.get("late_cleanup_evidence")
+    measurement_valid_value = summary.get("measurement_snapshot_valid")
+    measurement_valid = measurement_valid_value is True
+    measurement_ready = (
+        measurement_valid
+        and summary.get("measurement_structurally_valid") is True
+        and summary.get("measurement_analysis_eligible") is True
+    )
+    cut_digest = body.get("measurement_cut_digest") if isinstance(body, Mapping) else None
+    cut_high_water = body.get("event_prefix_high_water_sequence") if isinstance(body, Mapping) else None
+    cut_absent = cut_digest is None and cut_high_water is None
+    cut_bound = (_valid_hex_digest(cut_digest, length=64, prefix="sha256:")
+                 and type(cut_high_water) is int)
     if (not isinstance(chain, Mapping) or not isinstance(body, Mapping)
             or chain.get("digest") != _canonical_artifact_digest(body)
+            or not isinstance(summary.get("run_id"), str) or not summary["run_id"]
+            or not _valid_hex_digest(summary.get("manifest_digest"), length=64)
+            or not _valid_hex_digest(summary.get("execution_revision"), length=40)
+            or not _valid_hex_digest(predecessor_digest, length=64, prefix="sha256:")
+            or not isinstance(snapshot, Mapping)
+            or not isinstance(late, Mapping)
+            or not isinstance(late_binding, Mapping)
+            or late_binding.get("artifact_id") != RECONCILIATION_EVIDENCE_SCHEMA
+            or not _valid_hex_digest(late_binding.get("digest"), length=64, prefix="sha256:")
+            or type(measurement_valid_value) is not bool
             or body.get("run_id") != summary.get("run_id")
             or body.get("manifest_digest") != summary.get("manifest_digest")
+            or body.get("execution_revision") != summary.get("execution_revision")
             or body.get("validation_contract") != RECONCILIATION_VALIDATION_CONTRACT
             or body.get("predecessor_admission_evidence_digest") != predecessor_digest
             or body.get("domain") != dict(domain)
@@ -2087,12 +2245,60 @@ def _validate_v5_chain_row(summary: Any, *, predecessor_digest: str,
             or body.get("late_evidence_digest")
             != summary.get("late_cleanup_evidence", {}).get("digest")
             or body.get("reconciled_effects")
-            != summary.get("late_cleanup", {}).get("reconciliation")
-            or body.get("split_decisions")
+            != late.get("reconciliation", {})
+            or split
             != {key: summary.get(key) for key in _V5_SPLIT_FIELDS}
+            or not isinstance(split, Mapping)
+            or set(split) != set(_V5_SPLIT_FIELDS)
+            or any(type(value) is not bool for value in split.values())
+            or type(admitted) is not bool
             or type(body.get("decision_monotonic_ns")) is not int
-            or body.get("no_reset_no_rollback") is not True):
+            or body.get("no_reset_no_rollback") is not True
+            or not (cut_absent or cut_bound)
+            or (measurement_valid and not cut_bound)
+            or (not measurement_ready
+                and summary.get("measurement_prefix_immutable") is not False)
+            or summary.get("next_run_admission") is not admitted
+            or summary.get("cross_run_contamination_excluded") is not admitted
+            or summary.get("contamination_excluded") is not admitted):
         raise K11PilotContractError("K11 P0 v5 predecessor admission evidence is corrupt or mismatched")
+    if admitted and (
+            summary.get("measurement_snapshot_valid") is not True
+            or summary.get("measurement_structurally_valid") is not True
+            or summary.get("measurement_analysis_eligible") is not True
+            or not isinstance(summary.get("trace_validation"), Mapping)
+            or summary["trace_validation"].get("valid") is not True
+            or not isinstance(summary.get("analysis_validation"), Mapping)
+            or summary["analysis_validation"].get("valid") is not True
+            or snapshot.get("integrity") != {
+                "measurement_cut_mutated": False, "snapshot_valid": True,
+            }
+            or not isinstance(body.get("reconciled_effects"), Mapping)
+            or body.get("reconciled_effects", {}).get("valid") is not True
+            or any(late.get(field) is not True for field in (
+                "late_execution_capability_terminal", "late_provider_terminal",
+                "late_tool_native_terminal", "late_agent_lifecycle_terminal",
+                "late_movement_terminal", "late_bridge_terminal",
+                "late_descendant_terminal", "late_process_group_terminal",
+            ))
+            or not all(split.get(key) is True for key in (
+                "measurement_prefix_immutable", "execution_overlap_excluded",
+                "post_window_predecessor_mutation_resolved",
+                "new_post_close_effect_absent", "accumulated_no_reset_state",
+                "predecessor_state_chain_valid", "next_run_admission_allowed",
+            ))
+            or summary.get("cross_run_contamination_excluded") is not True
+            or summary.get("contamination_excluded") is not True
+            or summary.get("next_run_admission") is not True
+            or not isinstance(summary.get("censoring"), Mapping)
+            or summary["censoring"].get("uncertainty") is not False
+            or summary.get("runtime_error") is not None
+            or summary.get("cleanup_status") not in {
+                "qualified_within_budget", "qualified_late",
+            }):
+        raise K11PilotContractError(
+            "K11 P0 v5 positive admission lacks required measurement or terminal authority"
+        )
 
 
 def _apply_prospective_cleanup_projection(
@@ -2150,6 +2356,75 @@ def _validate_worker_summary_identity(
         )
 
 
+def _load_parent_validated_worker_artifacts(
+    *, validation_path: Path, run_dir: Path, premanifest_path: Path,
+    run_id: str, manifest_digest: str, cohort_mode: str,
+    validation_contract: str, trace_schema: str,
+    validation_artifact_version: int, execution_revision: str,
+    prospective: bool,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    summary = _load_json(validation_path)
+    _validate_worker_summary_identity(
+        summary, expected_run_id=run_id,
+        manifest_digest=manifest_digest, cohort_mode=cohort_mode,
+        validation_contract=validation_contract, trace_schema=trace_schema,
+        validation_artifact_version=validation_artifact_version,
+    )
+    if not prospective:
+        return summary, None
+    premanifest = _load_json(premanifest_path)
+    expected_measurement_identity = {
+        "run_id": run_id,
+        "manifest_digest": manifest_digest,
+        "execution_revision": execution_revision,
+        "runtime_digest": premanifest.get("runtime_digest"),
+        "premanifest_identity": premanifest.get("premanifest_identity"),
+        "validation_contract": validation_contract,
+        "trace_schema": trace_schema,
+    }
+    try:
+        persisted_trace = _load_json(run_dir / "k11_trace.json")
+    except (OSError, ValueError) as exc:
+        raise K11PilotContractError(
+            "prospective worker trace artifact is missing or malformed"
+        ) from exc
+    cut = persisted_trace.get("measurement_cut")
+    if (summary.get("measurement_identity") != expected_measurement_identity
+            or not isinstance(cut, Mapping)
+            or cut.get("identity") != expected_measurement_identity):
+        raise K11PilotContractError(
+            "prospective measurement identity differs from parent authority"
+        )
+    parent_generic_validation = validate_trace(persisted_trace)
+    parent_trace_validation = validate_p0_trace(persisted_trace)
+    try:
+        parent_analysis = analyze_trace(persisted_trace)
+    except Exception as exc:
+        parent_analysis = {
+            "artifact_id": "minecraft-k11-trace-analysis-draft",
+            "artifact_version": 1,
+            "prevalence_inference_allowed": False,
+            "run_id": run_id,
+            "analysis_error": str(exc),
+            "analysis_error_type": type(exc).__name__,
+        }
+    parent_analysis_validation = validate_p0_analysis(parent_analysis, persisted_trace)
+    try:
+        persisted_analysis = _load_json(run_dir / "k11_analysis.json")
+    except (OSError, ValueError) as exc:
+        raise K11PilotContractError(
+            "prospective worker analysis artifact is missing or malformed"
+        ) from exc
+    if (summary.get("generic_trace_validation") != parent_generic_validation
+            or summary.get("trace_validation") != parent_trace_validation
+            or persisted_analysis != parent_analysis
+            or summary.get("analysis_validation") != parent_analysis_validation):
+        raise K11PilotContractError(
+            "prospective worker scientific artifacts differ from parent validation"
+        )
+    return summary, persisted_trace
+
+
 def _run_isolated_row(
     row: Mapping[str, Any],
     *,
@@ -2192,9 +2467,8 @@ def _run_isolated_row(
         }
         binding["digest"] = _canonical_artifact_digest(binding)
         prelaunch_binding_digest = binding["digest"]
-        (run_dir / "prelaunch_admission_binding.json").write_text(
-            json.dumps(binding, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        _write_json_exclusive_nofollow(
+            run_dir / "prelaunch_admission_binding.json", binding,
         )
     validation_path = run_dir / "p0_validation.json"
     supervision = supervise_process(
@@ -2222,75 +2496,46 @@ def _run_isolated_row(
         json.dumps(supervision, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    process_failed = (
+        validation_contract == RECONCILIATION_VALIDATION_CONTRACT
+        and (supervision.get("timed_out") is True
+             or supervision.get("exit_code") not in (0, None)
+             or supervision.get("process_group_alive_after_cleanup") is True
+             or supervision.get("post_artifact_linger") is True
+             or supervision.get("post_parent_group_linger") is True)
+    )
     persisted_trace = None
+    artifact_error = None
     if validation_path.is_file():
-        summary = json.loads(validation_path.read_text(encoding="utf-8"))
-        _validate_worker_summary_identity(
-            summary, expected_run_id=run_id,
-            manifest_digest=manifest_digest, cohort_mode=cohort_mode,
-            validation_contract=validation_contract, trace_schema=trace_schema,
-            validation_artifact_version=validation_artifact_version,
-        )
-        if prospective:
-            premanifest = _load_json(premanifest_path)
-            expected_measurement_identity = {
-                "run_id": run_id,
-                "manifest_digest": manifest_digest,
-                "execution_revision": execution_revision,
-                "runtime_digest": premanifest.get("runtime_digest"),
-                "premanifest_identity": premanifest.get("premanifest_identity"),
-                "validation_contract": validation_contract,
-                "trace_schema": trace_schema,
-            }
-            trace_path = run_dir / "k11_trace.json"
-            try:
-                persisted_trace = _load_json(trace_path)
-            except (OSError, ValueError) as exc:
-                raise K11PilotContractError(
-                    "prospective worker trace artifact is missing or malformed"
-                ) from exc
-            cut = persisted_trace.get("measurement_cut")
-            if (summary.get("measurement_identity") != expected_measurement_identity
-                    or not isinstance(cut, Mapping)
-                    or cut.get("identity") != expected_measurement_identity):
-                raise K11PilotContractError(
-                    "prospective measurement identity differs from parent authority"
-                )
-            parent_generic_validation = validate_trace(persisted_trace)
-            parent_trace_validation = validate_p0_trace(persisted_trace)
-            try:
-                parent_analysis = analyze_trace(persisted_trace)
-            except Exception as exc:
-                parent_analysis = {
-                    "artifact_id": "minecraft-k11-trace-analysis-draft",
-                    "artifact_version": 1,
-                    "prevalence_inference_allowed": False,
-                    "run_id": run_id,
-                    "analysis_error": str(exc),
-                    "analysis_error_type": type(exc).__name__,
-                }
-            parent_analysis_validation = validate_p0_analysis(
-                parent_analysis, persisted_trace,
+        try:
+            summary, persisted_trace = _load_parent_validated_worker_artifacts(
+                validation_path=validation_path, run_dir=run_dir,
+                premanifest_path=premanifest_path, run_id=run_id,
+                manifest_digest=manifest_digest, cohort_mode=cohort_mode,
+                validation_contract=validation_contract, trace_schema=trace_schema,
+                validation_artifact_version=validation_artifact_version,
+                execution_revision=execution_revision, prospective=prospective,
             )
-            try:
-                persisted_analysis = _load_json(run_dir / "k11_analysis.json")
-            except (OSError, ValueError) as exc:
-                raise K11PilotContractError(
-                    "prospective worker analysis artifact is missing or malformed"
-                ) from exc
-            if (summary.get("generic_trace_validation") != parent_generic_validation
-                    or summary.get("trace_validation") != parent_trace_validation
-                    or persisted_analysis != parent_analysis
-                    or summary.get("analysis_validation") != parent_analysis_validation):
-                raise K11PilotContractError(
-                    "prospective worker scientific artifacts differ from parent validation"
-                )
+        except (K11PilotContractError, OSError, ValueError) as exc:
+            if not process_failed:
+                raise
+            artifact_error = f"{type(exc).__name__}: {exc}"
+            summary = _failed_process_summary(
+                run_id, supervision, manifest_digest=manifest_digest,
+                cohort_mode=cohort_mode, validation_contract=validation_contract,
+                trace_schema=trace_schema,
+                validation_artifact_version=validation_artifact_version,
+            )
     else:
         summary = _failed_process_summary(
             run_id, supervision, manifest_digest=manifest_digest, cohort_mode=cohort_mode,
             validation_contract=validation_contract, trace_schema=trace_schema,
             validation_artifact_version=validation_artifact_version,
         )
+    if artifact_error is not None:
+        summary["secondary_artifact_errors"] = [artifact_error]
+    if validation_contract == RECONCILIATION_VALIDATION_CONTRACT or not prospective:
+        _apply_process_outcome(summary, supervision)
     worker_shutdown_path = run_dir / "worker_shutdown.json"
     shutdown = None
     if worker_shutdown_path.is_file():
@@ -2367,6 +2612,7 @@ def _run_isolated_row(
                 run_id=run_id, manifest_digest=manifest_digest,
                 runtime_result=runtime_result, trace_artifact=persisted_trace,
                 supervision=supervision, shutdown=shutdown,
+                expected_identity=expected_runtime_identity,
                 domain_identity=domain_identity if validation_contract == RECONCILIATION_VALIDATION_CONTRACT else None,
             )
             (run_dir / LATE_CLEANUP_EVIDENCE_FILENAME).write_text(
@@ -2397,14 +2643,13 @@ def _run_isolated_row(
             )
         _apply_prospective_cleanup_projection(summary, cleanup_projection)
         if validation_contract == RECONCILIATION_VALIDATION_CONTRACT:
+            summary["execution_revision"] = execution_revision
             _apply_v5_reconciliation(
                 summary,
                 predecessor_digest=predecessor_digest or "",
                 domain=domain_identity or {},
                 decision_ns=time.monotonic_ns(),
             )
-    else:
-        summary = _apply_process_outcome(summary, supervision)
     validation_path.write_text(
         json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -2741,25 +2986,23 @@ def main(argv=None) -> int:
         run_dir = worker_root / args.worker_run_id
         if run_dir.is_symlink() or run_dir.resolve().parent != worker_root:
             raise K11PilotContractError("K11 P0 worker run directory is unsafe")
+        if (contract != RECONCILIATION_VALIDATION_CONTRACT
+                and not run_dir.exists()):
+            run_dir.mkdir(mode=0o700)
+        predecessor_digest = None
+        domain_identity = None
         if contract == RECONCILIATION_VALIDATION_CONTRACT:
-            binding = _load_json(run_dir / "prelaunch_admission_binding.json")
-            binding_body = dict(binding)
-            observed_digest = binding_body.pop("digest", None)
-            if (not isinstance(args.prelaunch_binding_digest, str)
-                    or observed_digest != args.prelaunch_binding_digest
-                    or observed_digest != _canonical_artifact_digest(binding_body)
-                    or binding.get("artifact_id")
-                    != "minecraft-k11-p0-prelaunch-admission-binding"
-                    or binding.get("artifact_version") != 1
-                    or binding.get("run_id") != args.worker_run_id
-                    or binding.get("manifest_digest") != args.manifest_digest
-                    or binding.get("domain") != _v5_domain_identity(matching_rows[0])
-                    or not isinstance(
-                        binding.get("predecessor_admission_evidence_digest"), str
-                    )):
-                raise K11PilotContractError(
-                    "K11 P0 v5 worker prelaunch predecessor binding is invalid"
-                )
+            domain_identity = _v5_domain_identity(matching_rows[0])
+        binding, prelaunch_path_identity = _validate_row_start_directory(
+            run_dir, run_id=args.worker_run_id,
+            manifest_digest=args.manifest_digest,
+            validation_contract=contract,
+            prelaunch_binding_digest=args.prelaunch_binding_digest,
+            predecessor_digest=predecessor_digest,
+            domain_identity=domain_identity,
+        )
+        if isinstance(binding, Mapping):
+            predecessor_digest = binding.get("predecessor_admission_evidence_digest")
         try:
             _run_single_row(
                 matching_rows[0],
@@ -2774,6 +3017,10 @@ def main(argv=None) -> int:
                 trace_schema=trace_schema,
                 validation_artifact_version=artifact_version,
                 prospective=prospective,
+                prelaunch_binding_digest=args.prelaunch_binding_digest,
+                predecessor_digest=predecessor_digest,
+                domain_identity=domain_identity,
+                prelaunch_path_identity=prelaunch_path_identity,
             )
         finally:
             cleanup = cleanup_process_group_descendants(
