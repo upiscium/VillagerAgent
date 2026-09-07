@@ -1188,6 +1188,7 @@ def test_k11_contract3_qualifies_only_direct_identity_bound_late_proof(monkeypat
 @pytest.mark.parametrize("mutation", [
     "missing_artifact", "missing_future_marker", "future_not_done",
     "future_start_marker_malformed", "cancellation_malformed",
+    "cancellation_ack_timestamp_without_flag",
     "cancellation_ack_without_request", "cancellation_time_reversed",
     "execution_identity_mismatch", "provider_open", "provider_wrong_execution",
     "provider_unbound", "provider_missing_for_model_start",
@@ -1214,6 +1215,8 @@ def test_k11_contract3_late_proof_fails_closed(monkeypatch, mutation):
         execution["future_started"]["event"] = "wrong"
     elif mutation == "cancellation_malformed":
         execution["cancellation"]["requested"] = "yes"
+    elif mutation == "cancellation_ack_timestamp_without_flag":
+        execution["cancellation"]["acknowledged"] = False
     elif mutation == "cancellation_ack_without_request":
         execution["cancellation"].update({
             "requested": False, "requested_at_monotonic_ns": None,

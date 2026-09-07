@@ -1104,6 +1104,170 @@ def test_shutdown_snapshot_preserves_last_phase_before_held_boundary(held_phase)
         controller.executor.shutdown(wait=True)
 
 
+def test_phase_acknowledgement_requires_requested_set_token_and_is_idempotent():
+    controller, _, _ = _controller()
+    group = TaskExecutionGroup(
+        task=Task("Cancellation acknowledgement", {}),
+        agents=[SimpleNamespace(name="Alice")],
+    )
+    token = threading.Event()
+    group.cancellation_tokens["Alice"] = token
+    future = Future()
+    future.set_running_or_notify_cancel()
+    group.futures["Alice"] = future
+    group.execution_ids["Alice"] = "execution-00000001"
+    controller._started_execution_groups = [group]
+    callback = controller._phase_callback(group, "Alice")
+
+    callback("before_request")
+    assert group.cancellation_acknowledged == set()
+    assert not any(
+        entry["event"] == "token_acknowledged"
+        for entry in group.phase_history["Alice"]
+    )
+
+    controller._request_shutdown()
+    controller._request_shutdown()
+    assert [
+        entry["event"] for entry in group.phase_history["Alice"]
+    ].count("token_requested") == 1
+    for _ in range(2):
+        with pytest.raises(AgentExecutionCancelledError):
+            callback("tool_end")
+
+    group.timeout_details["Alice"] = {"cancellation_acknowledged": False}
+    assert controller._acknowledge_cancellation(group, "Alice") is True
+    assert group.timeout_details["Alice"]["cancellation_acknowledged"] is True
+
+    assert group.cancellation_acknowledged == {"Alice"}
+    acknowledgement_events = [
+        entry for entry in group.phase_history["Alice"]
+        if entry["event"] == "token_acknowledged"
+    ]
+    assert len(acknowledgement_events) == 1
+    execution = controller.snapshot_execution_ledger()["groups"]["items"][0][
+        "executions"
+    ]["items"][0]
+    assert execution["cancellation"] == {
+        "requested": True,
+        "acknowledged": True,
+        "requested_at_monotonic_ns": next(
+            entry["monotonic_ns"] for entry in group.phase_history["Alice"]
+            if entry["event"] == "token_requested"
+        ),
+        "acknowledged_at_monotonic_ns": acknowledgement_events[0]["monotonic_ns"],
+        "requested_at_wall_time": group.cancellation_requested_at["Alice"],
+    }
+    future.set_result(("cancelled", {
+        "failure": {
+            "reason": "cancelled",
+            "cancellation_acknowledged": True,
+        },
+    }))
+
+
+def test_admission_closed_with_unset_or_missing_token_does_not_acknowledge():
+    controller, _, _ = _controller()
+    group = TaskExecutionGroup(
+        task=Task("Admission race", {}),
+        agents=[SimpleNamespace(name="Alice")],
+    )
+    callback = controller._phase_callback(group, "Alice")
+    controller._measurement_cut_admission_closed = True
+
+    with pytest.raises(AgentExecutionCancelledError):
+        callback("before_tool")
+
+    token = threading.Event()
+    group.cancellation_tokens["Alice"] = token
+    with pytest.raises(AgentExecutionCancelledError):
+        callback("before_tool")
+
+    assert token.is_set() is False
+    assert group.cancellation_requested == set()
+    assert group.cancellation_acknowledged == set()
+    assert not any(
+        entry["event"] == "token_acknowledged"
+        for entry in group.phase_history["Alice"]
+    )
+
+
+def test_cut_phase_then_shutdown_request_keeps_request_and_acknowledgement_distinct():
+    controller, _, _ = _controller()
+    group = TaskExecutionGroup(
+        task=Task("Cut to token race", {}),
+        agents=[SimpleNamespace(name="Alice")],
+    )
+    token = threading.Event()
+    pending = Future()
+    pending.set_running_or_notify_cancel()
+    group.cancellation_tokens["Alice"] = token
+    group.futures["Alice"] = pending
+    group.execution_ids["Alice"] = "execution-00000001"
+    controller._started_execution_groups = [group]
+    controller._measurement_cut_admission_closed = True
+
+    with pytest.raises(AgentExecutionCancelledError):
+        controller._phase_callback(group, "Alice")("before_retry")
+
+    assert token.is_set() is False
+    assert group.cancellation_requested == set()
+    assert group.cancellation_acknowledged == set()
+    assert [
+        entry["event"] for entry in group.phase_history["Alice"]
+    ] == ["phase"]
+
+    controller._request_shutdown()
+
+    assert token.is_set() is True
+    assert group.cancellation_requested == {"Alice"}
+    assert group.cancellation_acknowledged == set()
+    assert [
+        entry["event"] for entry in group.phase_history["Alice"]
+    ] == ["phase", "token_requested"]
+    pending.set_result(("finished", {}))
+
+
+@pytest.mark.parametrize("phase_acknowledged", [False, True])
+def test_future_reconciliation_uses_one_canonical_acknowledgement(phase_acknowledged):
+    controller, _, _ = _controller()
+    task = Task("Future acknowledgement", {})
+    agent = SimpleNamespace(name="Alice")
+    token = threading.Event()
+    future = Future()
+    group = TaskExecutionGroup(
+        task=task,
+        agents=[agent],
+        futures={"Alice": future},
+        cancellation_tokens={"Alice": token},
+        submission_complete=True,
+        execution_ids={"Alice": "execution-00000001"},
+    )
+    controller.result_queue = [group]
+    controller._started_execution_groups = [group]
+    controller._request_cancellation(group, "Alice", requested_at=time.time())
+    if phase_acknowledged:
+        with pytest.raises(AgentExecutionCancelledError):
+            controller._phase_callback(group, "Alice")("after_agent_invocation")
+    future.set_result(("cancelled", {
+        "failure": {
+            "reason": "cancelled",
+            "cancellation_acknowledged": True,
+        },
+    }))
+
+    controller._finalize_shutdown_groups()
+
+    assert group.cancellation_acknowledged == {"Alice"}
+    assert group.shutdown_reconciled is True
+    assert [
+        entry["event"] for entry in group.phase_history["Alice"]
+    ].count("token_acknowledged") == 1
+    assert controller.task_manager.status_updates[0][2]["reason"] == (
+        "controller_shutdown_cancelled"
+    )
+
+
 def test_execution_history_is_bounded_monotonic_and_redacts_unsafe_labels():
     controller, _, _ = _controller()
     task = Task("Bounded diagnostics", {})

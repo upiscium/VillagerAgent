@@ -345,13 +345,9 @@ class GlobalController:
                     future = group.futures.get(agent_name)
                     if future is None or future.done():
                         continue
-                    token.set()
-                    if agent_name not in group.cancellation_requested:
-                        self._record_execution_history(
-                            group, agent_name, "token_requested",
-                        )
-                    group.cancellation_requested.add(agent_name)
-                    group.cancellation_requested_at.setdefault(agent_name, time.time())
+                    self._request_cancellation(
+                        group, agent_name, requested_at=time.time(),
+                    )
             self._post_processing_cancellation_token().set()
             self.shutdown_event.set()
         with self._feedback_persistence_gate_lock():
@@ -486,18 +482,74 @@ class GlobalController:
             phase = str(phase)
             with self._execution_state_lock:
                 group.cancellation_phases[agent_name] = phase
-                self._record_execution_history(
+                self._record_execution_history_locked(
                     group, agent_name, "phase", phase=phase,
                 )
-                if group.cancellation_tokens[agent_name].is_set() or self._execution_admission_closed():
-                    self._record_execution_history(
-                        group, agent_name, "token_acknowledged", phase=phase,
-                    )
+                token = group.cancellation_tokens.get(agent_name)
+                token_set = (
+                    token is not None and token.is_set()
+                )
+                if token_set or self._execution_admission_closed():
+                    if token_set:
+                        self._acknowledge_cancellation(
+                            group, agent_name, phase=phase,
+                        )
                     operation = "confirmed" if any(marker in phase for marker in ("after", "_end", "return")) else "not_active"
                     raise AgentExecutionCancelledError(
                         phase=phase, blocking_operation_termination=operation,
                     )
         return update
+
+    def _acknowledge_cancellation(
+        self, group: TaskExecutionGroup, agent_name: str, *, phase=None,
+    ) -> bool:
+        """Atomically record the canonical cancellation acknowledgement.
+
+        An acknowledgement is valid only for an existing canonical request and
+        a token that has actually been set.  The set membership and its single
+        bounded lifecycle marker are deliberately updated under one lock.
+        """
+        with self._execution_state_lock:
+            token = group.cancellation_tokens.get(agent_name)
+            if (
+                token is None
+                or not token.is_set()
+                or agent_name not in group.cancellation_requested
+            ):
+                return False
+            timeout_detail = group.timeout_details.get(agent_name)
+            if isinstance(timeout_detail, dict):
+                timeout_detail["cancellation_acknowledged"] = True
+            if agent_name in group.cancellation_acknowledged:
+                return True
+            group.cancellation_acknowledged.add(agent_name)
+            self._record_execution_history_locked(
+                group, agent_name, "token_acknowledged",
+                phase=phase if phase is not None else group.cancellation_phases.get(
+                    agent_name, "unknown"
+                ),
+            )
+            return True
+
+    def _request_cancellation(
+        self, group: TaskExecutionGroup, agent_name: str, *, requested_at: float,
+    ) -> bool:
+        """Publish a cooperative cancellation request as one locked record."""
+        with self._execution_state_lock:
+            token = group.cancellation_tokens.get(agent_name)
+            if token is None:
+                return False
+            token.set()
+            timeout_detail = group.timeout_details.get(agent_name)
+            if isinstance(timeout_detail, dict):
+                timeout_detail["cancellation_requested"] = True
+            if agent_name not in group.cancellation_requested:
+                group.cancellation_requested.add(agent_name)
+                group.cancellation_requested_at[agent_name] = requested_at
+                self._record_execution_history_locked(
+                    group, agent_name, "token_requested",
+                )
+            return True
 
     def _post_processing_cancellation_token(self):
         token = getattr(self, "_post_processing_cancel_event", None)
@@ -957,20 +1009,27 @@ class GlobalController:
                 agent_name = agent.name
                 if future_snapshots[agent_name]["done"]:
                     continue
-                if agent_name not in group.timeout_detected:
-                    group.timeout_detected.add(agent_name)
-                    group.timeout_detected_at[agent_name] = now
-                    group.timeout_details[agent_name] = {
-                        "status": "timeout",
-                        "error": f"Task {group.task.description} timeout for agent {agent_name}",
-                        "cooperative_cancellation": agent_name in group.cancellation_tokens,
-                        "timeout_detected": True,
-                        "shutdown_escalated": False,
-                        "cancellation_requested": False,
-                        "cancellation_acknowledged": False,
-                        "cancellation_forced": False,
-                        "phase": group.cancellation_phases.get(agent_name, "unknown"),
-                    }
+                with self._execution_state_lock:
+                    if agent_name not in group.timeout_detected:
+                        group.timeout_detected.add(agent_name)
+                        group.timeout_detected_at[agent_name] = now
+                        group.timeout_details[agent_name] = {
+                            "status": "timeout",
+                            "error": f"Task {group.task.description} timeout for agent {agent_name}",
+                            "cooperative_cancellation": agent_name in group.cancellation_tokens,
+                            "timeout_detected": True,
+                            "shutdown_escalated": False,
+                            "cancellation_requested": (
+                                agent_name in group.cancellation_requested
+                            ),
+                            "cancellation_acknowledged": (
+                                agent_name in group.cancellation_acknowledged
+                            ),
+                            "cancellation_forced": False,
+                            "phase": group.cancellation_phases.get(
+                                agent_name, "unknown"
+                            ),
+                        }
 
                 # Completion may race with the deadline snapshot. Recheck before
                 # delivering a cancellation signal or deciding work is active.
@@ -980,25 +1039,17 @@ class GlobalController:
                 if future_snapshots[agent_name]["done"]:
                     continue
                 token = group.cancellation_tokens.get(agent_name)
-                if token is not None and agent_name not in group.cancellation_requested:
-                    token.set()
-                    group.cancellation_requested.add(agent_name)
-                    group.cancellation_requested_at[agent_name] = now
-                    group.timeout_details[agent_name]["cancellation_requested"] = True
-                    self._record_execution_history(
-                        group, agent_name, "token_requested",
+                if token is not None:
+                    self._request_cancellation(
+                        group, agent_name, requested_at=now,
                     )
 
-        for agent_name in group.cancellation_requested:
+        with self._execution_state_lock:
+            cancellation_requested = tuple(group.cancellation_requested)
+        for agent_name in cancellation_requested:
             snapshot = future_snapshots[agent_name]
             if snapshot["done"] and self._is_cancellation_acknowledgement(snapshot):
-                if agent_name not in group.cancellation_acknowledged:
-                    self._record_execution_history(
-                        group, agent_name, "token_acknowledged",
-                        phase=group.cancellation_phases.get(agent_name, "unknown"),
-                    )
-                group.cancellation_acknowledged.add(agent_name)
-                group.timeout_details[agent_name]["cancellation_acknowledged"] = True
+                self._acknowledge_cancellation(group, agent_name)
 
         active_agents = [
             agent_name
@@ -1028,9 +1079,12 @@ class GlobalController:
                     if not future_snapshots[agent_name]["done"]
                 ]
             if escalation_agents:
-                for agent_name in escalation_agents:
-                    group.shutdown_escalated.add(agent_name)
-                    group.timeout_details[agent_name]["shutdown_escalated"] = True
+                with self._execution_state_lock:
+                    for agent_name in escalation_agents:
+                        group.shutdown_escalated.add(agent_name)
+                        group.timeout_details[agent_name][
+                            "shutdown_escalated"
+                        ] = True
                 self._request_shutdown()
                 names = ", ".join(sorted(escalation_agents))
                 raise ControllerShutdownError(
@@ -1425,12 +1479,16 @@ class GlobalController:
                 for agent_name in active_agents:
                     token = group.cancellation_tokens.get(agent_name)
                     if token is not None:
-                        token.set()
-                        group.cancellation_requested.add(agent_name)
-                        group.cancellation_requested_at.setdefault(agent_name, now)
+                        self._request_cancellation(
+                            group, agent_name, requested_at=now,
+                        )
                     group.futures[agent_name].cancel()
+                with self._execution_state_lock:
+                    cancellation_requested_at = tuple(
+                        group.cancellation_requested_at.values()
+                    )
                 cancellation_started_at = min(
-                    group.cancellation_requested_at.values(),
+                    cancellation_requested_at,
                     default=observed_at + drain_grace,
                 )
                 if now - cancellation_started_at < cancellation_grace:
@@ -2783,22 +2841,37 @@ class GlobalController:
                     active_agent_ids.extend(agent.name for agent in group.agents)
                 continue
             try:
-                execution_may_still_be_active = any(
-                    future.running() for future in group.futures.values()
-                )
-                for agent_name, future in group.futures.items():
-                    if (agent_name in group.cancellation_requested
-                            and future.done()
-                            and self._is_cancellation_acknowledgement(
-                                self._snapshot_future(future))):
-                        group.cancellation_acknowledged.add(agent_name)
-                agent_names = [agent.name for agent in group.agents]
-                submitted_agent_names = list(group.futures)
-                active_group_agents = [
-                    agent_name
-                    for agent_name, future in group.futures.items()
-                    if future.running()
-                ]
+                with self._execution_state_lock:
+                    execution_may_still_be_active = any(
+                        future.running() for future in group.futures.values()
+                    )
+                    for agent_name, future in group.futures.items():
+                        if (agent_name in group.cancellation_requested
+                                and future.done()
+                                and self._is_cancellation_acknowledgement(
+                                    self._snapshot_future(future))):
+                            self._acknowledge_cancellation(group, agent_name)
+                    agent_names = [agent.name for agent in group.agents]
+                    submitted_agent_names = list(group.futures)
+                    active_group_agents = [
+                        agent_name
+                        for agent_name, future in group.futures.items()
+                        if future.running()
+                    ]
+                    submission_complete = group.submission_complete
+                    cancellation_requested = set(group.cancellation_requested)
+                    cancellation_acknowledged = set(
+                        group.cancellation_acknowledged
+                    )
+                    cancellation_phases = dict(group.cancellation_phases)
+                    timeout_detected = set(group.timeout_detected)
+                    shutdown_escalated = set(group.shutdown_escalated)
+                    cancellation_forced = set(group.cancellation_forced)
+                    timeout_details = deepcopy(group.timeout_details)
+                    terminal_snapshots = {
+                        agent_name: self._snapshot_future(future)
+                        for agent_name, future in group.futures.items()
+                    }
                 feedback = {
                     "reason": "controller_shutdown",
                     "execution_may_still_be_active": execution_may_still_be_active,
@@ -2807,37 +2880,33 @@ class GlobalController:
                     "active_agents": active_group_agents,
                     "unsubmitted_agents": [
                         agent_name for agent_name in agent_names
-                        if agent_name not in group.futures
+                        if agent_name not in submitted_agent_names
                     ],
-                    "submission_complete": group.submission_complete,
+                    "submission_complete": submission_complete,
                     "agent_reuse_blocked": True,
                     "requires_agent_reconciliation": True,
-                    "cancellation_requested": sorted(group.cancellation_requested),
-                    "cancellation_acknowledged": sorted(group.cancellation_acknowledged),
-                    "cancellation_phases": dict(group.cancellation_phases),
+                    "cancellation_requested": sorted(cancellation_requested),
+                    "cancellation_acknowledged": sorted(cancellation_acknowledged),
+                    "cancellation_phases": cancellation_phases,
                     "blocking_operation_termination": (
                         "unconfirmed" if execution_may_still_be_active
-                        else ("confirmed" if group.cancellation_acknowledged
+                        else ("confirmed" if cancellation_acknowledged
                               else "not_active")
                     ),
                 }
-                if group.timeout_detected:
+                if timeout_detected:
                     feedback.update({
-                        "timeout_detected": sorted(group.timeout_detected),
-                        "shutdown_escalated": sorted(group.shutdown_escalated),
-                        "cancellation_requested": sorted(group.cancellation_requested),
-                        "cancellation_acknowledged": sorted(group.cancellation_acknowledged),
-                        "cancellation_forced": sorted(group.cancellation_forced),
-                        "timeout_details": dict(group.timeout_details),
-                        "cancellation_phases": dict(group.cancellation_phases),
+                        "timeout_detected": sorted(timeout_detected),
+                        "shutdown_escalated": sorted(shutdown_escalated),
+                        "cancellation_requested": sorted(cancellation_requested),
+                        "cancellation_acknowledged": sorted(cancellation_acknowledged),
+                        "cancellation_forced": sorted(cancellation_forced),
+                        "timeout_details": timeout_details,
+                        "cancellation_phases": cancellation_phases,
                     })
-                terminal_snapshots = {
-                    agent_name: self._snapshot_future(future)
-                    for agent_name, future in group.futures.items()
-                }
                 clean_interruption = (
                     not execution_may_still_be_active
-                    and group.submission_complete
+                    and submission_complete
                     and all(
                         snapshot["done"] and snapshot["exception"] is None
                         for snapshot in terminal_snapshots.values()
@@ -2845,9 +2914,9 @@ class GlobalController:
                 )
                 if clean_interruption:
                     cancellation_confirmed = (
-                        bool(group.cancellation_requested)
-                        and group.cancellation_requested.issubset(
-                            group.cancellation_acknowledged
+                        bool(cancellation_requested)
+                        and cancellation_requested.issubset(
+                            cancellation_acknowledged
                         )
                     )
                     feedback["reason"] = (
@@ -2860,7 +2929,7 @@ class GlobalController:
                     group.shutdown_reconciled = True
                     group.post_processing_complete = True
                     group.completed = True
-                elif group.shutdown_escalated and execution_may_still_be_active:
+                elif shutdown_escalated and execution_may_still_be_active:
                     feedback["reason"] = "task_timeout_shutdown_escalation"
                     if not group.timeout_checkpoint_persisted:
                         self.task_manager.mark_task_status(group.task.id, Task.running, feedback)
@@ -2875,7 +2944,7 @@ class GlobalController:
                 if execution_may_still_be_active:
                     active_task_ids.append(group.task.id)
                     active_agent_ids.extend(active_group_agents)
-                if not group.submission_complete:
+                if not submission_complete:
                     incomplete_submission_task_ids.append(group.task.id)
             except BaseException as exc:
                 if queue_name not in undrained_queues:
