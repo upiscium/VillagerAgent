@@ -2,8 +2,8 @@
 
 Status: **DRAFT — NOT FROZEN**  
 Protocol identity: `minecraft-eac-k11-natural-prevalence`  
-Draft version: `0.2`<br>
-Issue lineage: `#511`, `#533`, `#535`<br>
+Draft version: `0.3`<br>
+Issue lineage: `#511`, `#533`, `#535`, `#546`<br>
 Subject repository: `upiscium/VillagerAgent`  
 Audited base before this draft: `66a904de8af2b0bbaf79071628f06bed91a40078`
 
@@ -162,7 +162,10 @@ analysis remains `minecraft-k11-trace-analysis-draft` version 1.
 `identity` has exactly `run_id`, `manifest_digest`, `execution_revision`,
 `runtime_digest`, `premanifest_identity`, `validation_contract`, and
 `trace_schema`; it is included in `snapshot_state_digest` and independently
-correlated with the parent runner authority.
+correlated with the parent runner authority. Prospective analysis `/2` is selected
+only when this identity binds validation contract `/4`; contracts `/2` and `/3`
+retain prospective analysis `/1`. This declaration routing changes no trace/cut
+schema and leaves the scientific D/N/EAdm/QC logic unchanged.
 
 For a fixed observation horizon, the cut is authoritative: post-close decision,
 native-effect, and evidence events are never allowed to complete or alter an
@@ -177,7 +180,31 @@ later receive `qualified_late` only from identity-bound, complete, non-truncated
 evidence that execution capability, providers, tool/native effects, movement,
 bridge children, worker descendants, and the process group are terminal. This
 late projection does not alter the cut, runtime error, or scientific fields;
-missing evidence remains `unknown`.
+missing evidence remains `unknown`. Late cleanup evidence is append-only and cannot
+rewrite the cut or scientific fields; a new tool/native entry after H is never
+admitted to the measurement.
+
+Rows are not independent. Runs remain in the same domain with no world reset and
+explicit accumulated state; each row records a predecessor chain and the next row
+is admitted only after the predecessor is terminal. An effect active at H remains
+right-censored for that row but may terminalize afterward only when its exact pre-H
+identity has one known matching completion and every associated execution and
+infrastructure authority is terminal before the next launch. This rule is fail-closed:
+unresolved, mismatched, duplicate, uncertain, or truncated evidence, any new post-H
+effect entry, or an unqualified predecessor stops the sequence. The current
+non-intrusive domain binding is the configured target endpoint plus explicit
+no-initialization/no-reset declarations; it does not claim an independently queried
+world-instance fingerprint or full world-state reconstruction.
+
+Validation contract `/4` reports the transition concepts separately as
+`measurement_prefix_immutable`, `execution_overlap_excluded`,
+`post_window_predecessor_mutation_observed`,
+`post_window_predecessor_mutation_resolved`, `new_post_close_effect_absent`,
+`accumulated_no_reset_state`, `predecessor_state_chain_valid`, and
+`next_run_admission_allowed`. The compatibility field
+`cross_run_contamination_excluded` means the conjunction of the complete `/4`
+transition, terminal-authority, and predecessor-chain gate; it no longer means that
+no effect was active at H and must not be used to claim reset or row independence.
 
 K11 introduces a dedicated append-only in-memory trace for all new K11 high-frequency instrumentation.
 
@@ -580,6 +607,7 @@ The following are not frozen in this draft because P0/P1 are explicitly designat
 - final analysis implementation digest;
 - exact trace-overhead acceptance measurement after P0 calibration;
 - whether a secondary Authority replay cohort is technically feasible;
+- whether final K11 uses a sequential persistent-domain population with terminal-before-next-row predecessor chaining, or a predeclared independent-domain allocation when independent baselines are required;
 - final paper wording.
 
 Deferral of these items is part of the prospective design and must not be concealed.

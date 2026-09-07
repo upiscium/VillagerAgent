@@ -12,6 +12,9 @@ from benchmarks.minecraft.k11_pilot import (
     P0_EXPECTED_RUNS,
     P0_VALIDATION_CONTRACT,
     PROSPECTIVE_VALIDATION_CONTRACT,
+    RECONCILIATION_EVIDENCE_SCHEMA,
+    RECONCILIATION_MANIFEST_VERSION,
+    RECONCILIATION_VALIDATION_CONTRACT,
     _apply_process_outcome,
     _coverage_summary,
     _in_window_evidence_metadata,
@@ -435,6 +438,7 @@ def test_k11_p0_worker_mode_uses_validated_manifest(tmp_path: Path, monkeypatch)
             "kill_sent": False, "processes_after_cleanup": [],
         },
     )
+    (tmp_path / "output").mkdir(mode=0o700)
 
     result = k11_pilot.main([
         "--manifest", str(tmp_path / "manifest.json"),
@@ -1308,3 +1312,476 @@ def test_k11_contract3_within_budget_and_contamination_gate(monkeypatch):
         k11_pilot._apply_prospective_cleanup_projection(blocked, result)
         assert blocked["cross_run_contamination_excluded"] is False
         assert blocked["next_run_admission_allowed"] is False
+
+
+def _v5_reconciliation_trace(*, new=False, duplicate=False):
+    request = {
+        "candidate_id": "candidate-1", "attempt_id": "attempt-1",
+        "action": {"identity": "MineBlock", "digest": "action-digest"},
+        "arguments": {"x": 1, "y": 2, "z": 3},
+    }
+    entered = {"event_type": "k11.tool_call_entered", "seq": 1,
+               "monotonic_ns": 1, "payload": {"tool_name": "MineBlock"},
+               "task_id": "task", "actor_id": "Alice", "agent_step_id": "step",
+               "tool_call_id": "tool-1"}
+    prepared = {
+        "event_type": "k11.eac_action_prepared", "seq": 2,
+        "monotonic_ns": 2, "task_id": "task", "actor_id": "Alice",
+        "agent_step_id": "step", "tool_call_id": "tool-1",
+        "payload": {"exact_request": request,
+                    "exact_request_digest": k11_pilot.exact_request_digest(request)},
+    }
+    exited = {"event_type": "k11.tool_call_exited", "seq": 4,
+              "monotonic_ns": 11,
+              "task_id": "task", "actor_id": "Alice", "agent_step_id": "step",
+              "tool_call_id": "tool-1",
+              "payload": {"tool_name": "MineBlock", "outcome": "returned"}}
+    events = [entered, prepared,
+              {"event_type": "k11.observation_window_closed", "seq": 3}, exited]
+    if duplicate:
+        events.append({**exited, "seq": 5})
+    if new:
+        events.append({"event_type": "k11.tool_call_entered", "seq": 6,
+                       "monotonic_ns": 12, "payload": {"tool_name": "MineBlock"},
+                       "task_id": "task", "actor_id": "Alice", "tool_call_id": "new"})
+    return {"measurement_cut": {
+        "event_prefix_high_water_sequence": 3,
+        "window_close_monotonic_ns": 10,
+        "open_lifecycles": {"items": [{"kind": "tool_call_id", "id": "tool-1",
+            "scope": {"task_id": "task", "actor_id": "Alice", "agent_step_id": "step",
+                       "tool_call_id": "tool-1"}, "start_sequence": 1,
+            "start_monotonic_ns": 1, "action": "MineBlock"}],
+            "retention": {"retained": 1, "capacity": 8, "truncated": False, "dropped_count": 0}},
+    }, "events": events}
+
+
+def test_k11_contract4_reconciles_pre_h_tool_and_rejects_new_or_duplicate():
+    assert k11_pilot._v5_reconcile_tool_native(_v5_reconciliation_trace())["valid"] is True
+    assert k11_pilot._v5_reconcile_tool_native(
+        _v5_reconciliation_trace(new=True))["valid"] is False
+    assert k11_pilot._v5_reconcile_tool_native(
+        _v5_reconciliation_trace(duplicate=True))["valid"] is False
+
+
+def test_k11_contract4_tool_requires_one_request_and_matching_terminal_action():
+    missing = _v5_reconciliation_trace()
+    missing["events"] = [
+        event for event in missing["events"]
+        if event["event_type"] != "k11.eac_action_prepared"
+    ]
+    assert k11_pilot._v5_reconcile_tool_native(missing)["valid"] is False
+
+    ambiguous = _v5_reconciliation_trace()
+    second = deepcopy(ambiguous["events"][1])
+    second["seq"] = 3
+    second["payload"]["exact_request"]["attempt_id"] = "attempt-2"
+    second["payload"]["exact_request_digest"] = k11_pilot.exact_request_digest(
+        second["payload"]["exact_request"]
+    )
+    ambiguous["events"].insert(2, second)
+    assert k11_pilot._v5_reconcile_tool_native(ambiguous)["valid"] is False
+
+    mismatched_action = _v5_reconciliation_trace()
+    mismatched_action["events"][-1]["payload"]["tool_name"] = "navigateTo"
+    assert k11_pilot._v5_reconcile_tool_native(mismatched_action)["valid"] is False
+
+
+def test_k11_contract4_reconciles_pre_h_native_with_exact_request_identity():
+    request = {
+        "candidate_id": "candidate-1", "attempt_id": "attempt-1",
+        "action": {"identity": "MineBlock", "digest": "action-digest"},
+        "arguments": {"x": 1, "y": 2, "z": 3},
+    }
+    scope = {
+        "task_id": "task", "actor_id": "Alice", "agent_step_id": "step",
+        "tool_call_id": "tool-1",
+    }
+    entered = {
+        "event_type": "k11.eac_native_effect_entered", "seq": 1,
+        "monotonic_ns": 1, **scope,
+        "payload": {"exact_request": request,
+                    "exact_request_digest": k11_pilot.exact_request_digest(request)},
+    }
+    completed = {
+        "event_type": "k11.eac_native_effect_completed", "seq": 3,
+        "monotonic_ns": 11, **scope,
+        "payload": {"exact_request": request, "outcome": "succeeded"},
+    }
+    trace = {
+        "measurement_cut": {
+            "event_prefix_high_water_sequence": 2,
+            "window_close_monotonic_ns": 10,
+            "open_lifecycles": {
+                "items": [{
+                    "kind": "native", "id": "candidate-1", "scope": scope,
+                    "start_sequence": 1, "start_monotonic_ns": 1,
+                    "action": "MineBlock",
+                }],
+                "retention": {
+                    "retained": 1, "capacity": 8,
+                    "truncated": False, "dropped_count": 0,
+                },
+            },
+        },
+        "events": [entered, {"event_type": "k11.observation_window_closed",
+                              "seq": 2, "monotonic_ns": 10}, completed],
+    }
+    result = k11_pilot._v5_reconcile_tool_native(trace)
+    assert result["valid"] is True
+    assert result["items"][0]["outcome"] == "succeeded"
+
+
+def test_k11_contract4_chain_digest_is_append_only_and_non_cyclic():
+    domain = {"host": "127.0.0.1", "port": 25565,
+              "world_initialization": None, "same_domain": True, "no_world_reset": True}
+    predecessor = k11_pilot._canonical_artifact_digest({"type": "genesis", "domain": domain})
+    rows = []
+    authority_fields = (
+        "late_execution_capability_terminal", "late_provider_terminal",
+        "late_tool_native_terminal", "late_agent_lifecycle_terminal",
+        "late_movement_terminal", "late_bridge_terminal",
+        "late_descendant_terminal", "late_process_group_terminal",
+    )
+    for index in range(3):
+        summary = {"run_id": f"run-{index}", "manifest_digest": "manifest",
+                   "validation_contract": RECONCILIATION_VALIDATION_CONTRACT,
+                   "measurement_snapshot": {"digest": f"cut-{index}",
+                    "event_prefix_high_water_sequence": index + 1,
+                    "integrity": {"measurement_cut_mutated": False,
+                                  "snapshot_valid": True}},
+                   "late_cleanup_evidence": {"digest": f"late-{index}"},
+                   "late_cleanup": {"reconciliation": {
+                       "valid": True, "active_count": 0, "items": [],
+                       "new_post_close_effect_absent": True,
+                   }, "authority_terminal_monotonic_ns": index + 9,
+                   **{field: True for field in authority_fields}},
+                   "runtime_error": None, "cleanup_status": "qualified_late",
+                   "censoring": {"uncertainty": False}}
+        k11_pilot._apply_v5_reconciliation(summary, predecessor_digest=predecessor,
+                                           domain=domain, decision_ns=index + 10)
+        rows.append(summary["admission_chain"])
+        assert summary["post_window_predecessor_mutation_observed"] is False
+        assert summary["next_run_admission_allowed"] is True
+        k11_pilot._validate_v5_chain_row(
+            summary, predecessor_digest=predecessor, domain=domain,
+        )
+        predecessor = rows[-1]["digest"]
+    assert len({row["digest"] for row in rows}) == 3
+    assert all(row["body"]["predecessor_admission_evidence_digest"] for row in rows)
+    assert all(row["body"]["predecessor_admission_evidence_digest"] != row["digest"]
+               for row in rows)
+
+
+def test_k11_contract4_checked_in_v4_manifest_has_exact_bound_identities():
+    root = Path(k11_pilot.__file__).resolve().parents[2]
+    manifest = load_p0_manifest(root / "configs/minecraft/k11-p0-natural-manifest-v4.json")
+
+    assert manifest["artifact_id"] == "minecraft-k11-p0-manifest"
+    assert manifest["artifact_version"] == RECONCILIATION_MANIFEST_VERSION
+    assert manifest["validation_contract"] == RECONCILIATION_VALIDATION_CONTRACT
+    assert manifest["trace_schema"] == "minecraft-k11-trace/3"
+    assert manifest["late_cleanup_evidence_contract"] == RECONCILIATION_EVIDENCE_SCHEMA
+    assert manifest["admission"] == {
+        "same_domain": True, "no_world_reset": True, "world_reset": False,
+        "fail_closed": True, "terminal_before_next_row": True,
+        "accumulated_state": True, "predecessor_chain": True,
+        "state_model": "append_only_accumulated_state",
+        "predecessor_model": "each_row_requires_terminal_predecessor",
+    }
+    identities = [k11_pilot._v5_domain_identity(row) for row in manifest["runs"]]
+    assert identities == [{
+        "host": "10.12.3.1", "port": 40000, "world_initialization": None,
+        "same_domain": True, "no_world_reset": True,
+    }] * 8
+
+
+def test_k11_manifest_rejects_run_id_path_traversal(tmp_path):
+    root = Path(k11_pilot.__file__).resolve().parents[2]
+    manifest = json.loads(
+        (root / "configs/minecraft/k11-p0-natural-manifest-v4.json").read_text()
+    )
+    manifest["runs"][0]["run_id"] = "../outside"
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(K11PilotContractError, match="safe path components"):
+        load_p0_manifest(path)
+
+
+def test_k11_isolated_row_rejects_symlink_run_directory(tmp_path):
+    output = tmp_path / "output"
+    outside = tmp_path / "outside"
+    output.mkdir()
+    outside.mkdir()
+    (output / "run").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(K11PilotContractError, match="must not be a symlink"):
+        k11_pilot._run_isolated_row(
+            {"run_id": "run"}, manifest_path="manifest.json", output_root=output,
+            execution_revision="revision", premanifest_path=tmp_path / "pre.json",
+            manifest_digest="manifest", cohort_mode="formal_p0",
+        )
+
+
+def test_k11_output_root_rejects_symlink_and_shared_write_permissions(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    with pytest.raises(K11PilotContractError, match="must not be a symlink"):
+        k11_pilot._secure_output_root(link, create=False)
+
+    real.chmod(0o722)
+    with pytest.raises(K11PilotContractError, match="group/other writable"):
+        k11_pilot._secure_output_root(real, create=False)
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing_terminal", "identity_mismatch", "duplicate", "unknown_outcome",
+    "retention_loss",
+])
+def test_k11_contract4_h_active_reconciliation_fails_closed(mutation):
+    trace = _v5_reconciliation_trace()
+    terminal = next(
+        event for event in trace["events"]
+        if event["event_type"] == "k11.tool_call_exited"
+    )
+    if mutation == "missing_terminal":
+        trace["events"].remove(terminal)
+    elif mutation == "identity_mismatch":
+        terminal["actor_id"] = "Bob"
+    elif mutation == "duplicate":
+        trace["events"].append({**terminal, "seq": 5})
+    elif mutation == "unknown_outcome":
+        terminal["payload"]["outcome"] = "unknown"
+    else:
+        trace["measurement_cut"]["open_lifecycles"]["retention"].update(
+            {"retained": 0, "truncated": True, "dropped_count": 1}
+        )
+    result = k11_pilot._v5_reconcile_tool_native(trace)
+    assert result["valid"] is False
+
+
+def test_k11_contract4_rejects_balanced_new_post_h_native_effect():
+    trace = _v5_reconciliation_trace()
+    trace["events"].extend([
+        {"event_type": "k11.eac_native_effect_entered", "seq": 6,
+         "monotonic_ns": 12,
+         "task_id": "task", "actor_id": "Alice", "agent_step_id": "step",
+         "payload": {"exact_request": {"candidate_id": "native-new",
+                                          "attempt_id": "attempt-new"}}},
+        {"event_type": "k11.eac_native_effect_completed", "seq": 7,
+         "monotonic_ns": 13,
+         "task_id": "task", "actor_id": "Alice", "agent_step_id": "step",
+         "payload": {"exact_request": {"candidate_id": "native-new",
+                                          "attempt_id": "attempt-new"},
+                     "outcome": "succeeded"}},
+    ])
+    assert k11_pilot._v5_reconcile_tool_native(trace)["valid"] is False
+
+
+def test_k11_contract4_rejects_balanced_new_post_h_tool_effect():
+    trace = _v5_reconciliation_trace(new=True)
+    trace["events"].append({
+        "event_type": "k11.tool_call_exited", "seq": 7, "monotonic_ns": 13,
+        "task_id": "task", "actor_id": "Alice", "tool_call_id": "new",
+        "payload": {"tool_name": "MineBlock", "outcome": "returned"},
+    })
+    assert k11_pilot._v5_reconcile_tool_native(trace)["valid"] is False
+
+
+def test_k11_contract4_unknown_authority_blocks_admission():
+    authority_fields = (
+        "late_execution_capability_terminal", "late_provider_terminal",
+        "late_tool_native_terminal", "late_agent_lifecycle_terminal",
+        "late_movement_terminal", "late_bridge_terminal",
+        "late_descendant_terminal", "late_process_group_terminal",
+    )
+    summary = {
+        "runtime_error": None, "cleanup_status": "qualified_late",
+        "measurement_snapshot": {"digest": "cut", "event_prefix_high_water_sequence": 2,
+                                  "integrity": {"measurement_cut_mutated": False,
+                                                "snapshot_valid": True}},
+        "late_cleanup": {
+            "reconciliation": {
+                "valid": True, "active_count": 1,
+                "items": [{"terminal_monotonic_ns": 1}],
+                "new_post_close_effect_absent": True,
+            },
+            "authority_terminal_monotonic_ns": 1,
+            **{field: True for field in authority_fields},
+        },
+        "late_cleanup_evidence": {"digest": "late"},
+        "censoring": {"uncertainty": False},
+    }
+    summary["late_cleanup"]["late_provider_terminal"] = None
+    k11_pilot._apply_v5_reconciliation(
+        summary, predecessor_digest="sha256:" + "a" * 64,
+        domain={"host": "h", "port": 1, "world_initialization": None,
+                "same_domain": True, "no_world_reset": True}, decision_ns=1,
+    )
+    assert summary["next_run_admission_allowed"] is False
+
+
+def test_k11_contract4_exact_terminal_and_all_authorities_admit_next_row():
+    authority_fields = (
+        "late_execution_capability_terminal", "late_provider_terminal",
+        "late_tool_native_terminal", "late_agent_lifecycle_terminal",
+        "late_movement_terminal", "late_bridge_terminal",
+        "late_descendant_terminal", "late_process_group_terminal",
+    )
+    summary = {
+        "run_id": "run", "manifest_digest": "manifest",
+        "validation_contract": RECONCILIATION_VALIDATION_CONTRACT,
+        "runtime_error": None, "cleanup_status": "qualified_late",
+        "measurement_snapshot": {
+            "digest": "cut", "event_prefix_high_water_sequence": 2,
+            "integrity": {"measurement_cut_mutated": False, "snapshot_valid": True},
+        },
+        "late_cleanup": {
+            "reconciliation": {
+                "valid": True, "active_count": 1, "resolved_count": 1,
+                "items": [{"terminal_monotonic_ns": 9}],
+                "new_post_close_effect_absent": True,
+            },
+            "authority_terminal_monotonic_ns": 9,
+            **{field: True for field in authority_fields},
+        },
+        "late_cleanup_evidence": {"digest": "late"},
+        "censoring": {"uncertainty": False},
+    }
+    domain = {"host": "h", "port": 1, "world_initialization": None,
+              "same_domain": True, "no_world_reset": True}
+    k11_pilot._apply_v5_reconciliation(
+        summary, predecessor_digest="sha256:" + "a" * 64,
+        domain=domain, decision_ns=10,
+    )
+    assert summary["post_window_predecessor_mutation_observed"] is True
+    assert summary["post_window_predecessor_mutation_resolved"] is True
+    assert summary["next_run_admission_allowed"] is True
+    future_dated = deepcopy(summary)
+    k11_pilot._apply_v5_reconciliation(
+        future_dated, predecessor_digest="sha256:" + "a" * 64,
+        domain=domain, decision_ns=8,
+    )
+    assert future_dated["post_window_predecessor_mutation_resolved"] is False
+    assert future_dated["next_run_admission_allowed"] is False
+
+
+def test_k11_contract4_chain_rejects_predecessor_domain_and_body_corruption(tmp_path):
+    domain = {"host": "h", "port": 1, "world_initialization": None,
+              "same_domain": True, "no_world_reset": True}
+    predecessor = "sha256:" + "a" * 64
+    summary = {"run_id": "run", "manifest_digest": "manifest",
+               "validation_contract": RECONCILIATION_VALIDATION_CONTRACT,
+               "runtime_error": None, "cleanup_status": "qualified_late",
+               "censoring": {"uncertainty": False},
+               "measurement_snapshot": {"digest": "cut",
+                   "event_prefix_high_water_sequence": 1,
+                   "integrity": {"measurement_cut_mutated": False,
+                                 "snapshot_valid": True}},
+               "late_cleanup_evidence": {"digest": "late"},
+               "late_cleanup": {"reconciliation": {"valid": True, "items": [],
+                   "active_count": 0, "new_post_close_effect_absent": True},
+                   "authority_terminal_monotonic_ns": 1,
+                   **{field: True for field in (
+                       "late_execution_capability_terminal", "late_provider_terminal",
+                       "late_tool_native_terminal", "late_agent_lifecycle_terminal",
+                       "late_movement_terminal", "late_bridge_terminal",
+                       "late_descendant_terminal", "late_process_group_terminal",
+                   )}}}
+    k11_pilot._apply_v5_reconciliation(summary, predecessor_digest=predecessor,
+                                       domain=domain, decision_ns=1)
+    k11_pilot._validate_v5_chain_row(summary, predecessor_digest=predecessor, domain=domain)
+    path = tmp_path / "admission_evidence.json"
+    path.write_text(json.dumps(summary["admission_chain"]))
+    k11_pilot._validate_v5_predecessor_artifact(
+        path, expected_digest=summary["admission_chain"]["digest"],
+        domain=domain, expected_artifact=summary["admission_chain"],
+    )
+    for bad_predecessor, bad_domain, mutate in [
+        ("sha256:" + "b" * 64, domain, False),
+        (predecessor, {**domain, "port": 2}, False),
+        (predecessor, domain, True),
+    ]:
+        broken = deepcopy(summary)
+        if mutate:
+            broken["admission_chain"]["body"]["run_id"] = "tampered"
+        with pytest.raises(K11PilotContractError, match="corrupt or mismatched"):
+            k11_pilot._validate_v5_chain_row(
+                broken, predecessor_digest=bad_predecessor, domain=bad_domain,
+            )
+    denied = deepcopy(summary["admission_chain"])
+    denied["body"]["split_decisions"]["next_run_admission_allowed"] = False
+    denied["digest"] = k11_pilot._canonical_artifact_digest(denied["body"])
+    path.write_text(json.dumps(denied))
+    with pytest.raises(K11PilotContractError, match="did not admit"):
+        k11_pilot._validate_v5_predecessor_artifact(
+            path, expected_digest=denied["digest"], domain=domain,
+            expected_artifact=denied,
+        )
+
+
+def test_k11_contract4_genesis_and_prelaunch_binding_are_explicit():
+    domain = {"host": "h", "port": 1, "world_initialization": None,
+              "same_domain": True, "no_world_reset": True}
+    genesis = k11_pilot._canonical_artifact_digest({"type": "genesis", "domain": domain})
+    command = k11_pilot._worker_command(
+        "manifest.json", Path("out"), run_id="run", execution_revision="r",
+        premanifest_path=Path("pre.json"), manifest_digest="m", cohort_mode="formal_p0",
+        validation_contract=RECONCILIATION_VALIDATION_CONTRACT,
+        trace_schema="minecraft-k11-trace/3", validation_artifact_version=5,
+        prelaunch_binding_digest=genesis,
+    )
+    assert command[-2:] == ["--prelaunch-binding-digest", genesis]
+    assert k11_pilot._canonical_artifact_digest({"type": "genesis", "domain": domain}) == genesis
+
+
+def test_k11_contract4_persists_and_validates_explicit_genesis(tmp_path):
+    domain = {"host": "h", "port": 1, "world_initialization": None,
+              "same_domain": True, "no_world_reset": True}
+    digest = k11_pilot._write_v5_genesis(
+        root=tmp_path, manifest_digest="manifest",
+        execution_revision="revision", domain=domain,
+    )
+    artifact = json.loads((tmp_path / "GENESIS_ADMISSION_EVIDENCE.json").read_text())
+    assert artifact["body"]["no_predecessor"] is True
+    assert artifact["body"]["no_reset_no_rollback"] is True
+    assert artifact["digest"] == digest
+    assert k11_pilot._validate_v5_predecessor_artifact(
+        tmp_path / "GENESIS_ADMISSION_EVIDENCE.json",
+        expected_digest=digest, domain=domain,
+    ) == artifact
+
+    artifact["body"]["domain"]["port"] = 2
+    (tmp_path / "GENESIS_ADMISSION_EVIDENCE.json").write_text(json.dumps(artifact))
+    with pytest.raises(K11PilotContractError, match="digest is invalid"):
+        k11_pilot._validate_v5_predecessor_artifact(
+            tmp_path / "GENESIS_ADMISSION_EVIDENCE.json",
+            expected_digest=digest, domain=domain,
+        )
+    with pytest.raises(K11PilotContractError, match="is missing"):
+        k11_pilot._validate_v5_predecessor_artifact(
+            tmp_path / "missing.json", expected_digest=digest, domain=domain,
+        )
+
+
+def test_k11_contract4_late_cleanup_routes_v4_identity_and_reconciliation():
+    identity, trace, runtime, _ = _late_contract_fixture()
+    identity = {**identity, "validation_contract": RECONCILIATION_VALIDATION_CONTRACT}
+    trace["measurement_cut"]["identity"] = identity
+    trace["measurement_cut"]["open_lifecycles"] = {
+        "items": [], "retention": {"retained": 0, "capacity": 8,
+                                     "truncated": False, "dropped_count": 0},
+    }
+    evidence = k11_pilot._build_late_cleanup_evidence(
+        run_id=identity["run_id"], manifest_digest=identity["manifest_digest"],
+        runtime_result=runtime, trace_artifact=trace,
+        supervision={"artifact_ready": True, "exit_code": 0, "timed_out": False,
+                     "post_artifact_linger": False, "post_parent_group_linger": False,
+                     "process_group_alive_after_cleanup": False, "term_sent": False,
+                     "kill_sent": False},
+        shutdown={"processes_after_cleanup": []}, domain_identity={
+            "host": "h", "port": 1, "world_initialization": None,
+            "same_domain": True, "no_world_reset": True},
+    )
+    assert evidence["artifact_id"] == RECONCILIATION_EVIDENCE_SCHEMA
+    assert evidence["reconciliation"]["valid"] is True

@@ -36,6 +36,8 @@ PROSPECTIVE_TRACE_SCHEMA = "minecraft-k11-trace/3"
 MEASUREMENT_CUT_SCHEMA = "minecraft-k11-measurement-cut/1"
 PROSPECTIVE_ANALYSIS_ID = "minecraft-k11-prospective-analysis"
 PROSPECTIVE_ANALYSIS_VERSION = 1
+VERSIONED_PROSPECTIVE_ANALYSIS_VERSION = 2
+VERSIONED_VALIDATION_CONTRACT = "minecraft-k11-p0-validation-contract/4"
 
 
 def _validate_measurement_cut(trace: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[int, int, str]]:
@@ -452,8 +454,15 @@ def analyze_prospective_trace(trace: Mapping[str, Any]) -> dict[str, Any]:
     prospective_validation = _prospective_validation(trace, cut)
     prospective_p0_validation = _prospective_p0_validation(trace)
     result["artifact_id"] = PROSPECTIVE_ANALYSIS_ID
-    result["artifact_version"] = PROSPECTIVE_ANALYSIS_VERSION
-    result["analysis_identity"] = {"schema_version": PROSPECTIVE_ANALYSIS_ID + "/1"}
+    # The versioned declaration contract is an analysis-routing identity only.
+    # It does not alter the /3 trace, measurement cut, or scientific classifier.
+    identity = cut.get("identity")
+    versioned = isinstance(identity, Mapping) and identity.get("validation_contract") == VERSIONED_VALIDATION_CONTRACT
+    analysis_version = (
+        VERSIONED_PROSPECTIVE_ANALYSIS_VERSION if versioned else PROSPECTIVE_ANALYSIS_VERSION
+    )
+    result["artifact_version"] = analysis_version
+    result["analysis_identity"] = {"schema_version": f"{PROSPECTIVE_ANALYSIS_ID}/{analysis_version}"}
     result["measurement_cut"] = cut
     result["measurement_bounds"] = list(bounds)
     result["trace_validation"] = prospective_validation
@@ -482,8 +491,23 @@ def validate_p0_analysis(analysis: Mapping[str, Any], trace: Mapping[str, Any] |
     """Validate that offline P0 replay diagnostics are complete and admissible."""
     if analysis.get("artifact_id") == PROSPECTIVE_ANALYSIS_ID:
         errors = []
-        if analysis.get("artifact_version") != PROSPECTIVE_ANALYSIS_VERSION:
+        analysis_version = analysis.get("artifact_version")
+        if analysis_version not in {
+                PROSPECTIVE_ANALYSIS_VERSION, VERSIONED_PROSPECTIVE_ANALYSIS_VERSION}:
             errors.append("prospective analysis version is invalid")
+        identity = trace.get("measurement_cut", {}).get("identity", {}) if trace else {}
+        expected_version = (
+            VERSIONED_PROSPECTIVE_ANALYSIS_VERSION
+            if isinstance(identity, Mapping)
+            and identity.get("validation_contract") == VERSIONED_VALIDATION_CONTRACT
+            else PROSPECTIVE_ANALYSIS_VERSION
+        )
+        if analysis_version != expected_version:
+            errors.append("prospective analysis version does not match validation contract")
+        if analysis.get("analysis_identity") != {
+            "schema_version": f"{PROSPECTIVE_ANALYSIS_ID}/{expected_version}"
+        }:
+            errors.append("prospective analysis schema identity is invalid")
         if analysis.get("prevalence_inference_allowed") is not False:
             errors.append("prospective analysis must forbid prevalence inference")
         if trace is not None:

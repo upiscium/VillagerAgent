@@ -74,18 +74,24 @@ The failed `061307a` development smoke then produced reasoning-only output until
 The prospective validation-contract manifest is:
 
 ```text
-configs/minecraft/k11-p0-natural-manifest-v2.json
+configs/minecraft/k11-p0-natural-manifest-v4.json
 ```
 
-`configs/minecraft/k11-p0-natural-manifest-v0.json` and v1 remain unchanged as provenance. The legacy v1 validation path retains contract `/1` and trace `/2`; the new prospective path requires manifest artifact version 3, `minecraft-k11-p0-validation-contract/2`, and trace schema `minecraft-k11-trace/3`. Earlier artifacts are never silently reinterpreted under the prospective semantics.
+`configs/minecraft/k11-p0-natural-manifest-v0.json` through v3 remain unchanged as provenance. The v4 prospective path has manifest artifact version **5**, validation contract `minecraft-k11-p0-validation-contract/4`, trace schema `minecraft-k11-trace/3`, and late-cleanup evidence contract `minecraft-k11-late-cleanup-evidence/2`. Earlier artifacts are never silently reinterpreted under these declarations.
 
-Every v2 per-run, development-smoke, and aggregate validation artifact records the canonical manifest digest and an explicit `cohort_mode` (`development_smoke` or `formal_p0`). The parent process rejects a worker validation artifact whose contract, manifest digest, or cohort mode differs from its invocation, so a detached smoke result cannot be accepted as a formal-cohort run artifact.
+This is historical compatibility, not a schema migration: v0-v3 bytes and their
+prior validation identities remain authoritative for their own artifacts. The final
+K11 task/run choice and estimator remain deferred to K11-E.
 
-It contains exactly eight Advisory, `task_type=none`, non-judged, non-production runs, copied unchanged from v1. Admission metadata is explicit and fail-closed: same-domain execution is required, world reset is forbidden, and missing/invalid metadata blocks admission. It forbids supplied stale EAC premanifest/revision values. Its top-level `observation_window` prospectively binds a 600-second fixed monotonic horizon for this development pilot. That value is not the final K11 horizon and does not freeze the draft protocol.
+Every per-run, development-smoke, and aggregate validation artifact records the canonical manifest digest and an explicit `cohort_mode` (`development_smoke` or `formal_p0`). The parent process rejects a worker validation artifact whose contract, manifest digest, or cohort mode differs from its invocation, so a detached smoke result cannot be accepted as a formal-cohort run artifact.
 
-A run may be structurally valid with zero qualifying in-window evidence. Such a zero-evidence run is retained and is not retried or replaced for that reason. The prospective measurement snapshot, structural validation, censoring, and analysis cuts are recorded separately. Contamination is excluded rather than repaired. An active tool/native effect at H, any post-close tool/native entry, uncertainty, or uncertain/failed cleanup blocks the next row. A post-close completion of an effect already censored at H remains cleanup metadata and does not rewrite measurement. The formal loop stops before that next row, with no retry or skip; counts and status counts report the completed prefix. Development smoke and other prior development artifacts are not eligible for retroactive promotion into the formal eight-run cohort.
+It contains exactly eight Advisory, `task_type=none`, non-judged, non-production runs, with descriptors/order/prompts/runtime configuration unchanged from v3. Admission metadata is explicit and fail-closed: same-domain execution is required, world reset is forbidden, state is accumulated, and each row requires a terminal predecessor before the next row. It forbids supplied stale EAC premanifest/revision values. Its top-level `observation_window` prospectively binds a 600-second fixed monotonic horizon for this development pilot. That value is not the final K11 horizon and does not freeze the draft protocol.
 
-The controller shutdown verdict remains the immutable verdict at its bounded grace deadline. A failed deadline verdict may be followed by a separate append-only `qualified_late` cleanup result only when identity-bound evidence affirmatively establishes natural worker exit, absent process group and descendants, terminal provider/tool/native/movement state, complete bridge cleanup, and complete non-truncated evidence. Direct Future reconciliation remains reported independently and may be `unknown` when process containment already proves that execution capability ended. Missing, truncated, collection-error, parent-forced-termination, or surviving-process evidence remains `unknown` or `not_qualified`; it never rewrites the controller verdict or measurement cut.
+A run may be structurally valid with zero qualifying in-window evidence. Such a zero-evidence run is retained and is not retried or replaced for that reason. The prospective measurement snapshot, structural validation, censoring, and analysis cuts are recorded separately. Contamination is excluded rather than repaired. An effect active at H remains right-censored for that row, but does not by itself block the next row under `/4`: every such pre-H identity must have exactly one matching, known post-H terminal outcome and all execution/infrastructure authorities must be affirmatively terminal before admission. Any new post-close tool/native entry, unresolved or mismatched H-active identity, uncertainty, or uncertain/failed cleanup blocks the next row. The completion remains append-only cleanup/admission metadata and never rewrites measurement. The formal loop stops before a blocked next row, with no retry or skip; counts and status counts report the completed prefix. Development smoke and other prior development artifacts are not eligible for retroactive promotion into the formal eight-run cohort.
+
+The `[open,H)` measurement cut and controller shutdown verdict remain immutable at their respective boundaries. A failed deadline verdict may be followed by a separate append-only `qualified_late` cleanup result only when identity-bound evidence affirmatively establishes natural worker exit, absent process group and descendants, terminal provider/tool/native/movement state, complete bridge cleanup, and complete non-truncated evidence. Direct Future reconciliation remains reported independently and may be `unknown` when process containment already proves that execution capability ended. Missing, truncated, collection-error, parent-forced-termination, or surviving-process evidence remains `unknown` or `not_qualified`; it never rewrites the controller verdict, measurement cut, or scientific analysis. No new tool/native entry at or after H is admitted to the measurement.
+
+The strongest currently available non-intrusive same-domain identity is the checked-in Minecraft target endpoint (`host`, `port`) together with the declarations `world_initialization=null`, `same_domain=true`, and `no_world_reset=true`. It does not prove a server/world-instance fingerprint against an external administrative reset. Operators must not reset or replace that target during the cohort; a stronger world/session identity, if later required, must be added prospectively rather than inferred from these fields.
 
 At pilot start the runner:
 
@@ -110,6 +116,12 @@ P0 output must be outside the repository. Recommended sibling path:
 
 The runner rejects an output root inside the source repository.
 
+The output root must be an operator-owned real directory, not a symlink, and must
+not be group/other writable. No other process or user may replace files in it while
+the cohort is running. The runner rejects unsafe initial path state and recomputes
+scientific artifacts in the parent, but it is not a sandbox against a hostile process
+running concurrently as the same operating-system user.
+
 Do not reuse a non-empty run directory.
 
 ## 6. Run one development smoke
@@ -118,7 +130,7 @@ After committing the remediation and establishing a new clean execution revision
 
 ```bash
 python -m benchmarks.minecraft.k11_pilot \
-  --manifest configs/minecraft/k11-p0-natural-manifest-v2.json \
+  --manifest configs/minecraft/k11-p0-natural-manifest-v4.json \
   --output-root ../VillagerAgent-k11-p0-dev-smoke-01 \
   --development-smoke-run-id K11-P0-01
 ```
@@ -135,7 +147,7 @@ For a bounded replacement development smoke, 600 seconds captures substantial re
 
 ```bash
 python -m benchmarks.minecraft.k11_pilot \
-  --manifest configs/minecraft/k11-p0-natural-manifest-v2.json \
+  --manifest configs/minecraft/k11-p0-natural-manifest-v4.json \
   --output-root ../VillagerAgent-k11-p0-results \
   --formal-p0
 ```
@@ -148,6 +160,7 @@ At the output root:
 
 ```text
 K11_P0_EAC_PREMANIFEST.json
+GENESIS_ADMISSION_EVIDENCE.json
 P0_CALIBRATION.json
 P0_VALIDATION.json
 K11-P0-01/
@@ -161,6 +174,9 @@ Each run directory contains at minimum:
 k11_trace.json
 k11_analysis.json
 p0_validation.json
+prelaunch_admission_binding.json
+late_cleanup_evidence.json
+admission_evidence.json
 process_supervision.json
 runtime_result.json        # when runtime collection reaches that path
 runtime_events.jsonl       # existing baseline runtime journal
@@ -182,6 +198,15 @@ offline_analysis_valid_count = 8
 coverage_sufficient = true
 calibration_error = null
 ```
+
+Under `/4`, each row validation also exposes
+`measurement_prefix_immutable`, `execution_overlap_excluded`,
+`post_window_predecessor_mutation_observed`,
+`post_window_predecessor_mutation_resolved`, `new_post_close_effect_absent`,
+`accumulated_no_reset_state`, `predecessor_state_chain_valid`, and
+`next_run_admission_allowed`. The legacy-compatible
+`cross_run_contamination_excluded` field is true only when that full transition
+gate is true; it is not an assertion of a reset, equal baseline, or independent row.
 
 Coverage additionally requires observation of:
 

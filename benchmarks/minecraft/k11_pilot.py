@@ -10,8 +10,10 @@ import argparse
 import hashlib
 import json
 import math
+import stat
 import subprocess
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Mapping
@@ -28,6 +30,7 @@ from benchmarks.minecraft.k11_process import cleanup_process_group_descendants, 
 from benchmarks.minecraft.k11_trace import (
     PRIMARY_EFFECT_ACTIONS,
     K11TraceRecorder,
+    exact_request_digest,
     event_in_observation_window,
     observation_window_bounds,
     valid_evidence_ingestion,
@@ -53,6 +56,16 @@ LATE_CLEANUP_VALIDATION_CONTRACT = "minecraft-k11-p0-validation-contract/3"
 LATE_CLEANUP_VALIDATION_ARTIFACT_VERSION = 4
 LATE_CLEANUP_EVIDENCE_SCHEMA = "minecraft-k11-late-cleanup-evidence/1"
 LATE_CLEANUP_EVIDENCE_FILENAME = "late_cleanup_evidence.json"
+RECONCILIATION_MANIFEST_VERSION = 5
+RECONCILIATION_VALIDATION_CONTRACT = "minecraft-k11-p0-validation-contract/4"
+RECONCILIATION_VALIDATION_ARTIFACT_VERSION = 5
+RECONCILIATION_EVIDENCE_SCHEMA = "minecraft-k11-late-cleanup-evidence/2"
+RECONCILIATION_EVIDENCE_FILENAME = "late_cleanup_evidence.json"
+# Public protocol names retained alongside the descriptive implementation names.
+V5_MANIFEST_VERSION = RECONCILIATION_MANIFEST_VERSION
+V5_VALIDATION_CONTRACT = RECONCILIATION_VALIDATION_CONTRACT
+V5_VALIDATION_ARTIFACT_VERSION = RECONCILIATION_VALIDATION_ARTIFACT_VERSION
+V5_EVIDENCE_SCHEMA = RECONCILIATION_EVIDENCE_SCHEMA
 DEVELOPMENT_SMOKE_ARTIFACT_VERSION = 2
 P0_EXPECTED_RUNS = 8
 K11_P0_ACTOR_ROSTER = ("Alice", "Bob")
@@ -91,6 +104,195 @@ def _manifest_digest(manifest: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _secure_output_root(path: str | Path, *, create: bool) -> Path:
+    requested = Path(path).expanduser()
+    if requested.is_symlink():
+        raise K11PilotContractError("K11 P0 output root must not be a symlink")
+    if create:
+        requested.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root = requested.resolve(strict=True)
+    if stat.S_IMODE(root.stat().st_mode) & 0o022:
+        raise K11PilotContractError(
+            "K11 P0 output root must not be group/other writable"
+        )
+    return root
+
+
+def _v5_domain_identity(row: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return the non-intrusive runtime domain binding used by contract/4."""
+    runtime = row.get("runtime") if isinstance(row, Mapping) else None
+    if not isinstance(runtime, Mapping):
+        return None
+    host, port = runtime.get("host"), runtime.get("port")
+    if (not isinstance(host, str) or not host or type(port) is not int
+            or isinstance(runtime.get("world_initialization"), bool)
+            or runtime.get("world_initialization") is not None):
+        return None
+    return {"host": host, "port": port, "world_initialization": None,
+            "same_domain": True, "no_world_reset": True}
+
+
+def _v5_identity_key(kind: str, event: Mapping[str, Any]) -> str | None:
+    payload = event.get("payload")
+    if kind == "tool":
+        value = event.get("tool_call_id")
+    else:
+        request = payload.get("exact_request") if isinstance(payload, Mapping) else None
+        value = request.get("candidate_id") if isinstance(request, Mapping) else None
+    if not isinstance(value, str) or not value:
+        return None
+    scope = {key: event.get(key) for key in
+             ("task_id", "actor_id", "agent_step_id", "tool_call_id")}
+    request = payload.get("exact_request") if isinstance(payload, Mapping) else None
+    return _canonical_artifact_digest({"kind": kind, "id": value, "scope": scope,
+                                       "exact_request": request if kind == "native" else None})
+
+
+def _v5_reconcile_tool_native(trace: Any) -> dict[str, Any]:
+    """Reconcile every H-open tool/native lifecycle, without accepting new work."""
+    result = {"valid": False, "active_count": 0, "resolved_count": 0,
+              "new_post_close_effect_absent": False, "errors": [],
+              "items": [], "retention": None}
+    if not isinstance(trace, Mapping) or not isinstance(trace.get("events"), list):
+        result["errors"].append("trace_missing"); return result
+    cut = trace.get("measurement_cut")
+    if not isinstance(cut, Mapping):
+        result["errors"].append("measurement_cut_missing"); return result
+    high = cut.get("event_prefix_high_water_sequence")
+    close_ns = cut.get("window_close_monotonic_ns")
+    if type(high) is not int or type(close_ns) is not int:
+        result["errors"].append("cut_boundary_missing"); return result
+    starts, terminals = {"tool": {}, "native": {}}, {"tool": {}, "native": {}}
+    start_types = {"k11.tool_call_entered": "tool", "k11.eac_native_effect_entered": "native"}
+    terminal_types = {"k11.tool_call_exited": "tool", "k11.eac_native_effect_completed": "native"}
+    for event in trace["events"]:
+        if not isinstance(event, Mapping) or type(event.get("seq")) is not int:
+            result["errors"].append("event_malformed"); return result
+        kind = start_types.get(event.get("event_type")) or terminal_types.get(event.get("event_type"))
+        if kind is None: continue
+        key = _v5_identity_key(kind, event)
+        if key is None: result["errors"].append("identity_missing"); return result
+        table = starts if event.get("event_type") in start_types else terminals
+        table[kind].setdefault(key, []).append(event)
+    open_inventory = cut.get("open_lifecycles")
+    active = open_inventory.get("items") if isinstance(open_inventory, Mapping) else None
+    active_keys = set()
+    if (not isinstance(active, list) or not isinstance(open_inventory, Mapping)
+            or not isinstance(open_inventory.get("retention"), Mapping)
+            or open_inventory["retention"].get("truncated") is not False
+            or open_inventory["retention"].get("dropped_count") != 0
+            or open_inventory["retention"].get("retained") != len(active)):
+        result["errors"].append("open_inventory_missing_or_truncated"); return result
+    result["retention"] = dict(open_inventory["retention"])
+    for item in active:
+        if not isinstance(item, Mapping): result["errors"].append("active_item_malformed"); return result
+        kind = item.get("kind", item.get("lifecycle_kind"))
+        if kind in {"tool_call_id", "tool"}: kind = "tool"
+        elif kind == "native": kind = "native"
+        else: continue
+        # The inventory is authoritative, but its identity must be represented by a prefix entry.
+        candidates = [key for key, rows in starts[kind].items()
+                      if rows[0].get("seq", high + 1) <= high
+                      and ((kind == "tool" and rows[0].get("tool_call_id") == item.get("tool_call_id", item.get("id")))
+                           or (kind == "native" and isinstance(rows[0].get("payload"), Mapping)
+                               and isinstance(rows[0]["payload"].get("exact_request"), Mapping)
+                               and rows[0]["payload"]["exact_request"].get("candidate_id") == item.get("candidate_id", item.get("id"))))]
+        if len(candidates) != 1: result["errors"].append("pre_h_identity_missing_or_ambiguous"); return result
+        start = starts[kind][candidates[0]][0]
+        scope = item.get("scope")
+        if (not isinstance(scope, Mapping)
+                or any(item.get(key) is not None and item.get(key) != start.get(key)
+                       for key in ("task_id", "actor_id", "agent_step_id", "tool_call_id"))
+                or item.get("start_sequence") != start.get("seq")
+                or type(item.get("start_monotonic_ns")) is not int
+                or item.get("start_monotonic_ns") != start.get("monotonic_ns")
+                or any(scope.get(key) != start.get(key) for key in
+                       ("task_id", "actor_id", "agent_step_id", "tool_call_id"))):
+            result["errors"].append("prefix_start_scope_or_time_mismatch"); return result
+        if kind == "native":
+            request = start.get("payload", {}).get("exact_request") if isinstance(start.get("payload"), Mapping) else None
+            action = request.get("action") if isinstance(request, Mapping) else None
+            if (not isinstance(request, Mapping)
+                    or item.get("id") != request.get("candidate_id")
+                    or item.get("action") != (
+                        action.get("identity") if isinstance(action, Mapping) else None
+                    )
+                    or start.get("payload", {}).get("exact_request_digest")
+                    != exact_request_digest(request)):
+                result["errors"].append("native_exact_request_mismatch"); return result
+        elif item.get("action") != start.get("payload", {}).get("tool_name"):
+            result["errors"].append("tool_action_mismatch"); return result
+        active_keys.add((kind, candidates[0])); result["active_count"] += 1
+    for kind in terminals:
+        if any(key not in starts[kind] for key in terminals[kind]):
+            result["errors"].append("unknown_terminal"); return result
+    for kind, key in active_keys:
+        if len(starts[kind][key]) != 1 or len(terminals[kind].get(key, [])) != 1:
+            result["errors"].append("missing_duplicate_or_unknown_terminal"); return result
+        start = starts[kind][key][0]
+        request_identities = []
+        candidate_events = [start] if kind == "native" else [
+            event for event in trace["events"]
+            if event.get("seq") <= high
+            and event.get("tool_call_id") == start.get("tool_call_id")
+            and event.get("event_type") in {
+                "k11.eac_action_prepared", "k11.eac_native_effect_entered",
+            }
+        ]
+        for candidate_event in candidate_events:
+            payload = candidate_event.get("payload")
+            request = payload.get("exact_request") if isinstance(payload, Mapping) else None
+            if not isinstance(request, Mapping):
+                continue
+            digest = exact_request_digest(request)
+            if payload.get("exact_request_digest") != digest:
+                result["errors"].append("exact_request_digest_mismatch"); return result
+            binding = {
+                "candidate_id": request.get("candidate_id"),
+                "attempt_id": request.get("attempt_id"),
+                "exact_request_digest": digest,
+            }
+            if (not isinstance(binding["candidate_id"], str)
+                    or not binding["candidate_id"]
+                    or not isinstance(binding["attempt_id"], str)
+                    or not binding["attempt_id"]):
+                result["errors"].append("exact_request_identity_incomplete"); return result
+            if binding not in request_identities:
+                request_identities.append(binding)
+        if len(request_identities) != 1:
+            result["errors"].append("exact_request_missing_or_ambiguous"); return result
+        terminal = terminals[kind][key][0]
+        outcome = terminal.get("outcome")
+        if outcome is None and isinstance(terminal.get("payload"), Mapping):
+            outcome = terminal["payload"].get("outcome")
+        known = {"returned", "raised"} if kind == "tool" else {"succeeded", "effect_failed"}
+        if (terminal.get("seq") <= high
+                or type(terminal.get("monotonic_ns")) is not int
+                or terminal.get("monotonic_ns") <= close_ns
+                or outcome not in known):
+            result["errors"].append("terminal_unknown_or_not_post_h"); return result
+        if (kind == "tool"
+                and terminal.get("payload", {}).get("tool_name")
+                != start.get("payload", {}).get("tool_name")):
+            result["errors"].append("tool_terminal_action_mismatch"); return result
+        result["resolved_count"] += 1
+        result["items"].append({"kind": kind, "identity": key,
+                                "prefix_start_seq": start["seq"],
+                                "exact_request_identity": (
+                                    request_identities[0] if request_identities else None
+                                ),
+                                "terminal_seq": terminal["seq"],
+                                "terminal_monotonic_ns": terminal["monotonic_ns"],
+                                "outcome": outcome})
+    # Any post-H open is new work, including a balanced new lifecycle.
+    for kind in starts:
+        for key, rows in starts[kind].items():
+            if any(row.get("seq") > high for row in rows):
+                result["errors"].append("new_post_close_effect"); return result
+    result.update(valid=True, new_post_close_effect_absent=True)
+    return result
+
+
 def _primary_terminal_count(trace_artifact: Mapping[str, Any]) -> int:
     events = trace_artifact.get("events", [])
     primary_candidate_ids = {
@@ -120,15 +322,17 @@ def load_p0_manifest(path: str | Path) -> dict[str, Any]:
     version = document.get("artifact_version")
     if document.get("artifact_id") != P0_MANIFEST_ID or version not in {
             P0_MANIFEST_VERSION, PROSPECTIVE_MANIFEST_VERSION,
-            LATE_CLEANUP_MANIFEST_VERSION}:
+            LATE_CLEANUP_MANIFEST_VERSION, RECONCILIATION_MANIFEST_VERSION}:
         raise K11PilotContractError("K11 P0 manifest identity mismatch")
     prospective = version in {
         PROSPECTIVE_MANIFEST_VERSION, LATE_CLEANUP_MANIFEST_VERSION,
+        RECONCILIATION_MANIFEST_VERSION,
     }
     expected_contract = {
         P0_MANIFEST_VERSION: P0_VALIDATION_CONTRACT,
         PROSPECTIVE_MANIFEST_VERSION: PROSPECTIVE_VALIDATION_CONTRACT,
         LATE_CLEANUP_MANIFEST_VERSION: LATE_CLEANUP_VALIDATION_CONTRACT,
+        RECONCILIATION_MANIFEST_VERSION: RECONCILIATION_VALIDATION_CONTRACT,
     }[version]
     if document.get("validation_contract") != expected_contract:
         raise K11PilotContractError("K11 P0 validation contract identity mismatch")
@@ -138,20 +342,38 @@ def load_p0_manifest(path: str | Path) -> dict[str, Any]:
             and document.get("late_cleanup_evidence_contract")
             != LATE_CLEANUP_EVIDENCE_SCHEMA):
         raise K11PilotContractError("K11 P0 late cleanup evidence identity mismatch")
+    admission = document.get("admission")
+    if version == RECONCILIATION_MANIFEST_VERSION:
+        if document.get("late_cleanup_evidence_contract") != RECONCILIATION_EVIDENCE_SCHEMA:
+            raise K11PilotContractError("K11 P0 reconciliation evidence identity mismatch")
+        expected_v5 = {"same_domain", "no_world_reset", "world_reset", "fail_closed",
+                       "terminal_before_next_row", "accumulated_state", "predecessor_chain",
+                       "state_model", "predecessor_model"}
+        if (not isinstance(admission, Mapping) or set(admission) != expected_v5
+                or admission.get("same_domain") is not True
+                or admission.get("no_world_reset") is not True
+                or admission.get("world_reset") is not False
+                or admission.get("fail_closed") is not True
+                or admission.get("terminal_before_next_row") is not True
+                or admission.get("accumulated_state") is not True
+                or admission.get("predecessor_chain") is not True
+                or admission.get("state_model") != "append_only_accumulated_state"
+                or admission.get("predecessor_model") != "each_row_requires_terminal_predecessor"):
+            raise K11PilotContractError("K11 P0 v5 admission T metadata is invalid")
     if document.get("study_phase") != "K11-P0-instrumentation-validation":
         raise K11PilotContractError("K11 P0 study phase mismatch")
     if document.get("prevalence_inference_allowed") is not False:
         raise K11PilotContractError("P0 must explicitly forbid prevalence inference")
     if document.get("eac_identity_source") != EAC_IDENTITY_SOURCE:
         raise K11PilotContractError("K11 P0 must bind EAC identity to the current immutable checkout")
-    admission = document.get("admission")
-    if (prospective and (not isinstance(admission, Mapping)
-            or set(admission) != {
-                "same_domain", "no_world_reset", "world_reset", "fail_closed",
-                "active_effect_at_horizon_blocks_next_run",
-                "post_close_effect_blocks_next_run",
-                "uncertainty_blocks_next_run",
-            }
+    required_admission = {
+        "same_domain", "no_world_reset", "world_reset", "fail_closed",
+        "active_effect_at_horizon_blocks_next_run",
+        "post_close_effect_blocks_next_run", "uncertainty_blocks_next_run",
+    }
+    if (prospective and version != RECONCILIATION_MANIFEST_VERSION and (not isinstance(admission, Mapping)
+            or (version != RECONCILIATION_MANIFEST_VERSION and set(admission) != required_admission)
+            or (version == RECONCILIATION_MANIFEST_VERSION and not required_admission.issubset(admission))
             or admission.get("same_domain") is not True
             or admission.get("no_world_reset") is not True
             or admission.get("world_reset") is not False
@@ -192,8 +414,15 @@ def load_p0_manifest(path: str | Path) -> dict[str, Any]:
         not isinstance(value, str) or not value for value in run_ids
     ):
         raise K11PilotContractError("K11 P0 run IDs must be unique non-empty strings")
+    if any(Path(value).is_absolute() or len(Path(value).parts) != 1 or value in {".", ".."}
+           for value in run_ids):
+        raise K11PilotContractError("K11 P0 run IDs must be safe path components")
     for row in runs:
         _validate_run(row)
+    if version == RECONCILIATION_MANIFEST_VERSION:
+        domains = [_v5_domain_identity(row) for row in runs]
+        if any(domain is None for domain in domains) or any(domain != domains[0] for domain in domains[1:]):
+            raise K11PilotContractError("K11 P0 v5 rows must bind one checked-in runtime domain")
     return document
 
 
@@ -201,7 +430,11 @@ def _manifest_contract(document: Mapping[str, Any]) -> tuple[str, str, int, bool
     version = document.get("artifact_version")
     prospective = version in {
         PROSPECTIVE_MANIFEST_VERSION, LATE_CLEANUP_MANIFEST_VERSION,
+        RECONCILIATION_MANIFEST_VERSION,
     }
+    if version == RECONCILIATION_MANIFEST_VERSION:
+        return (RECONCILIATION_VALIDATION_CONTRACT, PROSPECTIVE_TRACE_SCHEMA,
+                RECONCILIATION_VALIDATION_ARTIFACT_VERSION, True)
     if version == LATE_CLEANUP_MANIFEST_VERSION:
         return (
             LATE_CLEANUP_VALIDATION_CONTRACT,
@@ -583,7 +816,10 @@ def _run_single_row(
             trace, observation_horizon_seconds=observation_horizon_seconds,
             late_cleanup_identity=(
                 measurement_identity
-                if validation_contract == LATE_CLEANUP_VALIDATION_CONTRACT
+                if validation_contract in {
+                    LATE_CLEANUP_VALIDATION_CONTRACT,
+                    RECONCILIATION_VALIDATION_CONTRACT,
+                }
                 else None
             ),
         ):
@@ -594,7 +830,10 @@ def _run_single_row(
                 execution_revision=execution_revision,
                 premanifest_path=premanifest_path,
             )
-            if validation_contract == LATE_CLEANUP_VALIDATION_CONTRACT:
+            if validation_contract in {
+                LATE_CLEANUP_VALIDATION_CONTRACT,
+                RECONCILIATION_VALIDATION_CONTRACT,
+            }:
                 runtime_kwargs["k11_late_cleanup_identity"] = dict(
                     measurement_identity,
                 )
@@ -651,10 +890,11 @@ def _run_single_row(
         "artifact_id": "minecraft-k11-p0-run-validation",
         "artifact_version": validation_artifact_version,
         **({"trace_schema_version": trace_schema}
-           if validation_contract in {
-               PROSPECTIVE_VALIDATION_CONTRACT,
-               LATE_CLEANUP_VALIDATION_CONTRACT,
-           } else {}),
+            if validation_contract in {
+                PROSPECTIVE_VALIDATION_CONTRACT,
+                LATE_CLEANUP_VALIDATION_CONTRACT,
+                RECONCILIATION_VALIDATION_CONTRACT,
+            } else {}),
         "validation_contract": validation_contract,
         "manifest_digest": manifest_digest,
         "cohort_mode": cohort_mode,
@@ -706,6 +946,17 @@ def _run_single_row(
         summary["measurement_identity"] = trace_artifact.get(
             "measurement_cut", {}
         ).get("identity")
+    if validation_contract == RECONCILIATION_VALIDATION_CONTRACT:
+        summary.update({key: False for key in _V5_SPLIT_FIELDS})
+        cut = trace_artifact.get("measurement_cut") if isinstance(trace_artifact, Mapping) else None
+        snapshot = summary.get("measurement_snapshot")
+        if isinstance(cut, Mapping) and isinstance(snapshot, Mapping):
+            snapshot.update({
+                "digest": _canonical_artifact_digest(cut),
+                "event_prefix_high_water_sequence": cut.get("event_prefix_high_water_sequence"),
+                "integrity": {"measurement_cut_mutated": False,
+                               "snapshot_valid": cut.get("snapshot_valid") is True},
+            })
     if not prospective:
         for key in (
             "trace_schema_version", "measurement_snapshot", "censoring",
@@ -734,8 +985,9 @@ def _worker_command(
     validation_contract: str = P0_VALIDATION_CONTRACT,
     trace_schema: str = "minecraft-k11-trace/2",
     validation_artifact_version: int = P0_VALIDATION_ARTIFACT_VERSION,
+    prelaunch_binding_digest: str | None = None,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         "-m",
         "benchmarks.minecraft.k11_pilot",
@@ -750,6 +1002,9 @@ def _worker_command(
         "--trace-schema", trace_schema,
         "--validation-artifact-version", str(validation_artifact_version),
     ]
+    if prelaunch_binding_digest is not None:
+        command.extend(["--prelaunch-binding-digest", prelaunch_binding_digest])
+    return command
 
 
 def _failed_process_summary(
@@ -766,6 +1021,7 @@ def _failed_process_summary(
            if validation_contract in {
                PROSPECTIVE_VALIDATION_CONTRACT,
                LATE_CLEANUP_VALIDATION_CONTRACT,
+               RECONCILIATION_VALIDATION_CONTRACT,
            } else {}),
         "validation_contract": validation_contract,
         "manifest_digest": manifest_digest,
@@ -1175,6 +1431,7 @@ def _complete_inventory(value: Any) -> list[Any] | None:
 def _build_late_cleanup_evidence(
     *, run_id: str, manifest_digest: str, runtime_result: Any,
     trace_artifact: Any, supervision: Mapping[str, Any], shutdown: Any,
+    domain_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Bind post-verdict authorities without modifying the scientific cut."""
     controller = runtime_result.get("controller") if isinstance(runtime_result, Mapping) else None
@@ -1198,9 +1455,10 @@ def _build_late_cleanup_evidence(
     execution_ledger = controller.get("execution_ledger") if isinstance(controller, Mapping) else None
     provider_ledger = controller.get("provider_ledger") if isinstance(controller, Mapping) else None
     lifecycle_ledger = controller.get("late_lifecycle_ledger") if isinstance(controller, Mapping) else None
-    return {
-        "artifact_id": LATE_CLEANUP_EVIDENCE_SCHEMA,
-        "artifact_version": 1,
+    v5 = isinstance(identity, Mapping) and identity.get("validation_contract") == RECONCILIATION_VALIDATION_CONTRACT
+    evidence = {
+        "artifact_id": RECONCILIATION_EVIDENCE_SCHEMA if v5 else LATE_CLEANUP_EVIDENCE_SCHEMA,
+        "artifact_version": 2 if v5 else 1,
         "identity": {
             "run_id": run_id,
             "manifest_digest": manifest_digest,
@@ -1241,11 +1499,16 @@ def _build_late_cleanup_evidence(
             "collection_errors": errors,
         },
     }
+    if v5:
+        evidence["reconciliation"] = _v5_reconcile_tool_native(trace_artifact)
+        evidence["domain"] = dict(domain_identity or {})
+    return evidence
 
 
 def _late_cleanup_evidence_projection(
     evidence: Any, *, runtime_result: Any, trace_artifact: Any,
     expected_identity: Mapping[str, Any], expected_actors: tuple[str, ...],
+    expected_domain: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fail-closed contract/3 projection from direct late authorities."""
     projection = {
@@ -1261,9 +1524,10 @@ def _late_cleanup_evidence_projection(
         "late_process_group_terminal": None,
         "post_window_cleanup_status": "unknown",
     }
+    v5 = expected_identity.get("validation_contract") == RECONCILIATION_VALIDATION_CONTRACT
     if (not isinstance(evidence, Mapping)
-            or evidence.get("artifact_id") != LATE_CLEANUP_EVIDENCE_SCHEMA
-            or evidence.get("artifact_version") != 1
+            or evidence.get("artifact_id") != (RECONCILIATION_EVIDENCE_SCHEMA if v5 else LATE_CLEANUP_EVIDENCE_SCHEMA)
+            or evidence.get("artifact_version") != (2 if v5 else 1)
             or evidence.get("identity") != dict(expected_identity)):
         return projection
     integrity = evidence.get("integrity")
@@ -1298,6 +1562,7 @@ def _late_cleanup_evidence_projection(
     verdict_time = verdict.get("verdict_frozen_at_monotonic_ns")
     if type(verdict_time) is not int:
         return projection
+    authority_times = [verdict_time]
 
     active_items = _complete_inventory(evidence.get("h_active_executions"))
     cut_active_items = _complete_inventory(cut.get("active_executions"))
@@ -1322,6 +1587,7 @@ def _late_cleanup_evidence_projection(
     groups = _complete_inventory(execution_ledger.get("groups"))
     if groups is None:
         return projection
+    authority_times.append(execution_ledger["captured_at_monotonic_ns"])
     executions_by_id = {}
     for group in groups:
         if not isinstance(group, Mapping):
@@ -1399,6 +1665,9 @@ def _late_cleanup_evidence_projection(
                     or acknowledged_ns < requested_ns))
                 or (acknowledged is False and acknowledged_ns is not None)):
             return projection
+        authority_times.extend([started["monotonic_ns"], completed["monotonic_ns"]])
+        authority_times.extend(value for value in (requested_ns, acknowledged_ns)
+                               if type(value) is int)
     projection["late_future_reconciliation_state"] = "terminal"
     projection["late_execution_capability_terminal"] = True
 
@@ -1413,6 +1682,7 @@ def _late_cleanup_evidence_projection(
     unresolved = _complete_inventory(provider.get("unresolved"))
     if operations is None or unresolved != []:
         return projection
+    authority_times.append(provider["captured_at_monotonic_ns"])
     seen_operations = set()
     operations_by_execution = {execution_id: [] for execution_id in active_by_id}
     provider_model_ids_by_execution = {
@@ -1431,6 +1701,7 @@ def _late_cleanup_evidence_projection(
                 or type(terminal) is not int or terminal < start
                 or operation.get("outcome") not in {"completed", "failed"}):
             return projection
+        authority_times.extend([start, terminal])
         execution_id = operation.get("execution_id")
         if (not isinstance(execution_id, str) or not execution_id
                 or not isinstance(operation.get("task_id"), str)
@@ -1465,13 +1736,19 @@ def _late_cleanup_evidence_projection(
     post_cut_events = _complete_inventory(lifecycle.get("post_cut_events"))
     if post_cut_events is None:
         return projection
+    authority_times.append(lifecycle["captured_at_monotonic_ns"])
     high_water = cut.get("event_prefix_high_water_sequence")
     if type(high_water) is not int:
         return projection
     if any(not isinstance(event, Mapping)
            or type(event.get("seq")) is not int or event["seq"] <= high_water
+           or (v5 and type(event.get("monotonic_ns")) is not int)
            for event in post_cut_events):
         return projection
+    authority_times.extend(
+        event["monotonic_ns"] for event in post_cut_events
+        if type(event.get("monotonic_ns")) is int
+    )
     prefix_events = [
         event for event in trace_artifact.get("events", [])
         if isinstance(event, Mapping) and type(event.get("seq")) is int
@@ -1511,11 +1788,24 @@ def _late_cleanup_evidence_projection(
         and event["monotonic_ns"] >= close_ns
         for event in post_cut_events
     )
+    if v5:
+        reconciliation = _v5_reconcile_tool_native(combined_trace)
+        if evidence.get("reconciliation") != reconciliation:
+            return projection
+        if (not isinstance(evidence.get("domain"), Mapping)
+                or (expected_domain is not None and evidence.get("domain") != dict(expected_domain))):
+            return projection
+        projection["reconciliation"] = reconciliation
+        projection["late_post_close_effect"] = False
+        projection["late_tool_native_terminal"] = (
+            True if reconciliation.get("valid") else None
+        )
     if projection["late_post_close_effect"]:
         projection["post_window_cleanup_status"] = "not_qualified"
         return projection
     trace_evidence = _late_trace_cleanup_evidence(combined_trace)
-    projection["late_tool_native_terminal"] = trace_evidence["tool_native"]
+    if not v5:
+        projection["late_tool_native_terminal"] = trace_evidence["tool_native"]
     projection["late_agent_lifecycle_terminal"] = trace_evidence["agent"]
     authorities = evidence.get("authorities")
     if not isinstance(authorities, Mapping):
@@ -1526,6 +1816,7 @@ def _late_cleanup_evidence_projection(
             or movement_snapshot["captured_at_monotonic_ns"] < verdict_time):
         return projection
     movement = movement_snapshot.get("result")
+    authority_times.append(movement_snapshot["captured_at_monotonic_ns"])
     bridge = authorities.get("bridge")
     descendants = authorities.get("worker_descendants")
     process = authorities.get("worker_process_and_group")
@@ -1570,6 +1861,8 @@ def _late_cleanup_evidence_projection(
     projection["late_process_group_terminal"] = (
         process["process_group_alive_after_cleanup"] is False
     )
+    if v5:
+        projection["authority_terminal_monotonic_ns"] = max(authority_times)
     affirmative_failure = bool(
         remaining or process["process_group_alive_after_cleanup"]
         or process["term_sent"] or process["kill_sent"]
@@ -1614,6 +1907,192 @@ def _prospective_contamination_excluded(
         and censoring.get("uncertainty") is False
         and late_post_close_effect is False
     )
+
+
+_V5_SPLIT_FIELDS = (
+    "measurement_prefix_immutable", "execution_overlap_excluded",
+    "post_window_predecessor_mutation_observed",
+    "post_window_predecessor_mutation_resolved", "new_post_close_effect_absent",
+    "accumulated_no_reset_state", "predecessor_state_chain_valid",
+    "next_run_admission_allowed",
+)
+
+
+def _write_v5_genesis(*, root: Path, manifest_digest: str, execution_revision: str,
+                      domain: Mapping[str, Any]) -> str:
+    artifact = {
+        "artifact_id": "minecraft-k11-p0-genesis-admission-evidence",
+        "artifact_version": 1,
+        "body": {
+            "type": "genesis", "manifest_digest": manifest_digest,
+            "execution_revision": execution_revision, "domain": dict(domain),
+            "no_predecessor": True, "no_reset_no_rollback": True,
+        },
+    }
+    artifact["digest"] = _canonical_artifact_digest(artifact)
+    path = root / "GENESIS_ADMISSION_EVIDENCE.json"
+    path.write_text(
+        json.dumps(artifact, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    persisted = _load_json(path)
+    persisted_body = dict(persisted)
+    observed = persisted_body.pop("digest", None)
+    if observed != artifact["digest"] or observed != _canonical_artifact_digest(persisted_body):
+        raise K11PilotContractError("K11 P0 v5 genesis admission evidence is invalid")
+    return artifact["digest"]
+
+
+def _validate_v5_predecessor_artifact(
+    path: Path, *, expected_digest: str, domain: Mapping[str, Any],
+    expected_artifact: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        artifact = _load_json(path)
+    except (OSError, ValueError, K11PilotContractError) as exc:
+        raise K11PilotContractError("K11 P0 v5 predecessor artifact is missing") from exc
+    body_for_digest = dict(artifact)
+    observed_digest = body_for_digest.pop("digest", None)
+    expected_recomputed = (
+        _canonical_artifact_digest(body_for_digest)
+        if expected_artifact is None
+        else _canonical_artifact_digest(artifact.get("body"))
+    )
+    if (observed_digest != expected_digest
+            or observed_digest != expected_recomputed
+            or (expected_artifact is not None and artifact != dict(expected_artifact))):
+        raise K11PilotContractError("K11 P0 v5 predecessor artifact digest is invalid")
+    if expected_artifact is None:
+        body = artifact.get("body")
+        if (artifact.get("artifact_id")
+                != "minecraft-k11-p0-genesis-admission-evidence"
+                or artifact.get("artifact_version") != 1
+                or not isinstance(body, Mapping)
+                or body.get("type") != "genesis"
+                or body.get("domain") != dict(domain)
+                or body.get("no_predecessor") is not True
+                or body.get("no_reset_no_rollback") is not True):
+            raise K11PilotContractError("K11 P0 v5 genesis predecessor is invalid")
+    else:
+        body = artifact.get("body")
+        split = body.get("split_decisions") if isinstance(body, Mapping) else None
+        if (not isinstance(split, Mapping)
+                or split.get("next_run_admission_allowed") is not True):
+            raise K11PilotContractError("K11 P0 v5 predecessor did not admit the next row")
+    return artifact
+
+
+def _v5_chain_evidence(*, predecessor_digest: str, domain: Mapping[str, Any],
+                       summary: Mapping[str, Any], decision_ns: int | None) -> dict[str, Any]:
+    cut = summary.get("measurement_snapshot")
+    late = summary.get("late_cleanup_evidence", {})
+    body = {
+        "run_id": summary.get("run_id"),
+        "manifest_digest": summary.get("manifest_digest"),
+        "validation_contract": summary.get("validation_contract"),
+        "predecessor_admission_evidence_digest": predecessor_digest,
+        "domain": dict(domain),
+        "measurement_cut_digest": cut.get("digest") if isinstance(cut, Mapping) else None,
+        "event_prefix_high_water_sequence": cut.get("event_prefix_high_water_sequence") if isinstance(cut, Mapping) else None,
+        "late_evidence_digest": late.get("digest") if isinstance(late, Mapping) else None,
+        "reconciled_effects": summary.get("late_cleanup", {}).get("reconciliation", {}),
+        "split_decisions": {key: summary.get(key) for key in _V5_SPLIT_FIELDS},
+        "decision_monotonic_ns": decision_ns,
+        "no_reset_no_rollback": True,
+    }
+    return {"body": body, "digest": _canonical_artifact_digest(body)}
+
+
+def _apply_v5_reconciliation(summary: dict[str, Any], *, predecessor_digest: str,
+                             domain: Mapping[str, Any], decision_ns: int | None) -> dict[str, Any]:
+    late = summary.get("late_cleanup", {})
+    reconciliation = late.get("reconciliation", {}) if isinstance(late, Mapping) else {}
+    clean = summary.get("cleanup_status") in {"qualified_within_budget", "qualified_late"}
+    snapshot = summary.get("measurement_snapshot")
+    prefix = (isinstance(snapshot, Mapping)
+              and isinstance(snapshot.get("digest"), str)
+              and type(snapshot.get("event_prefix_high_water_sequence")) is int
+              and snapshot.get("integrity") == {
+                  "measurement_cut_mutated": False, "snapshot_valid": True})
+    authority_fields = ("late_execution_capability_terminal", "late_provider_terminal",
+                        "late_tool_native_terminal", "late_agent_lifecycle_terminal",
+                        "late_movement_terminal", "late_bridge_terminal",
+                        "late_descendant_terminal", "late_process_group_terminal")
+    overlap = bool(clean and isinstance(late, Mapping)
+                   and all(late.get(field) is True for field in authority_fields)
+                   and isinstance(summary.get("censoring"), Mapping)
+                   and summary["censoring"].get("uncertainty") is False)
+    observed = reconciliation.get("active_count", 0) > 0
+    reconciled_items = reconciliation.get("items")
+    terminal_before_decision = (
+        type(decision_ns) is int
+        and isinstance(reconciled_items, list)
+        and all(isinstance(item, Mapping)
+                and type(item.get("terminal_monotonic_ns")) is int
+                and item["terminal_monotonic_ns"] <= decision_ns
+                for item in reconciled_items)
+        and type(late.get("authority_terminal_monotonic_ns")) is int
+        and late["authority_terminal_monotonic_ns"] <= decision_ns
+    )
+    resolved = reconciliation.get("valid") is True and terminal_before_decision
+    no_new = reconciliation.get("new_post_close_effect_absent") is True
+    chain = isinstance(predecessor_digest, str) and len(predecessor_digest) == 71 and predecessor_digest.startswith("sha256:")
+    decisions = {
+        "measurement_prefix_immutable": prefix,
+        "execution_overlap_excluded": overlap,
+        "post_window_predecessor_mutation_observed": observed,
+        "post_window_predecessor_mutation_resolved": resolved,
+        "new_post_close_effect_absent": no_new,
+        "accumulated_no_reset_state": True,
+        "predecessor_state_chain_valid": chain,
+    }
+    summary.update(decisions)
+    # /4 contamination is the complete transition/overlap/chain gate.
+    required_decisions = (
+        "measurement_prefix_immutable", "execution_overlap_excluded",
+        "post_window_predecessor_mutation_resolved", "new_post_close_effect_absent",
+        "accumulated_no_reset_state", "predecessor_state_chain_valid",
+    )
+    allowed = bool(clean and all(decisions[key] for key in required_decisions)
+                   and summary.get("runtime_error") is None)
+    summary["cross_run_contamination_excluded"] = allowed
+    summary["contamination_excluded"] = allowed
+    summary["next_run_admission_allowed"] = allowed
+    summary["next_run_admission"] = allowed
+    summary["admission_chain"] = _v5_chain_evidence(
+        predecessor_digest=predecessor_digest, domain=domain,
+        summary=summary, decision_ns=decision_ns,
+    )
+    return summary
+
+
+def _validate_v5_chain_row(summary: Any, *, predecessor_digest: str,
+                           domain: Mapping[str, Any]) -> None:
+    """Validate the completed row's append-only admission evidence."""
+    if not isinstance(summary, Mapping):
+        raise K11PilotContractError("K11 P0 v5 row admission evidence is missing")
+    chain = summary.get("admission_chain")
+    body = chain.get("body") if isinstance(chain, Mapping) else None
+    if (not isinstance(chain, Mapping) or not isinstance(body, Mapping)
+            or chain.get("digest") != _canonical_artifact_digest(body)
+            or body.get("run_id") != summary.get("run_id")
+            or body.get("manifest_digest") != summary.get("manifest_digest")
+            or body.get("validation_contract") != RECONCILIATION_VALIDATION_CONTRACT
+            or body.get("predecessor_admission_evidence_digest") != predecessor_digest
+            or body.get("domain") != dict(domain)
+            or body.get("measurement_cut_digest")
+            != summary.get("measurement_snapshot", {}).get("digest")
+            or body.get("event_prefix_high_water_sequence")
+            != summary.get("measurement_snapshot", {}).get("event_prefix_high_water_sequence")
+            or body.get("late_evidence_digest")
+            != summary.get("late_cleanup_evidence", {}).get("digest")
+            or body.get("reconciled_effects")
+            != summary.get("late_cleanup", {}).get("reconciliation")
+            or body.get("split_decisions")
+            != {key: summary.get(key) for key in _V5_SPLIT_FIELDS}
+            or type(body.get("decision_monotonic_ns")) is not int
+            or body.get("no_reset_no_rollback") is not True):
+        raise K11PilotContractError("K11 P0 v5 predecessor admission evidence is corrupt or mismatched")
 
 
 def _apply_prospective_cleanup_projection(
@@ -1661,6 +2140,7 @@ def _validate_worker_summary_identity(
             or (validation_contract in {
                     PROSPECTIVE_VALIDATION_CONTRACT,
                     LATE_CLEANUP_VALIDATION_CONTRACT,
+                    RECONCILIATION_VALIDATION_CONTRACT,
                 }
                 and summary.get("trace_schema_version") != trace_schema)
             or summary.get("manifest_digest") != manifest_digest
@@ -1683,12 +2163,39 @@ def _run_isolated_row(
     trace_schema: str = "minecraft-k11-trace/2",
     validation_artifact_version: int = P0_VALIDATION_ARTIFACT_VERSION,
     prospective: bool = False,
+    predecessor_digest: str | None = None,
+    domain_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     run_id = row["run_id"]
-    run_dir = output_root / run_id
-    if run_dir.exists() and any(run_dir.iterdir()):
-        raise K11PilotContractError(f"K11 P0 run directory already contains data: {run_dir}")
-    run_dir.mkdir(parents=True, exist_ok=True)
+    safe_root = output_root.resolve()
+    run_dir = safe_root / run_id
+    if run_dir.is_symlink():
+        raise K11PilotContractError(f"K11 P0 run directory must not be a symlink: {run_dir}")
+    if run_dir.exists():
+        if any(run_dir.iterdir()):
+            raise K11PilotContractError(f"K11 P0 run directory already contains data: {run_dir}")
+    else:
+        run_dir.mkdir(parents=True, mode=0o700)
+    if run_dir.resolve().parent != safe_root:
+        raise K11PilotContractError("K11 P0 run directory escapes the output root")
+    prelaunch_binding_digest = None
+    if validation_contract == RECONCILIATION_VALIDATION_CONTRACT:
+        if (not isinstance(predecessor_digest, str) or not predecessor_digest
+                or not isinstance(domain_identity, Mapping)):
+            raise K11PilotContractError("K11 P0 v5 prelaunch predecessor binding is missing")
+        binding = {
+            "artifact_id": "minecraft-k11-p0-prelaunch-admission-binding",
+            "artifact_version": 1, "run_id": run_id,
+            "manifest_digest": manifest_digest,
+            "predecessor_admission_evidence_digest": predecessor_digest,
+            "domain": dict(domain_identity),
+        }
+        binding["digest"] = _canonical_artifact_digest(binding)
+        prelaunch_binding_digest = binding["digest"]
+        (run_dir / "prelaunch_admission_binding.json").write_text(
+            json.dumps(binding, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     validation_path = run_dir / "p0_validation.json"
     supervision = supervise_process(
         _worker_command(
@@ -1702,6 +2209,7 @@ def _run_isolated_row(
             validation_contract=validation_contract,
             trace_schema=trace_schema,
             validation_artifact_version=validation_artifact_version,
+            prelaunch_binding_digest=prelaunch_binding_digest,
         ),
         cwd=ROOT,
         timeout_seconds=RUN_PROCESS_TIMEOUT_SECONDS,
@@ -1748,6 +2256,35 @@ def _run_isolated_row(
                 raise K11PilotContractError(
                     "prospective measurement identity differs from parent authority"
                 )
+            parent_generic_validation = validate_trace(persisted_trace)
+            parent_trace_validation = validate_p0_trace(persisted_trace)
+            try:
+                parent_analysis = analyze_trace(persisted_trace)
+            except Exception as exc:
+                parent_analysis = {
+                    "artifact_id": "minecraft-k11-trace-analysis-draft",
+                    "artifact_version": 1,
+                    "prevalence_inference_allowed": False,
+                    "run_id": run_id,
+                    "analysis_error": str(exc),
+                    "analysis_error_type": type(exc).__name__,
+                }
+            parent_analysis_validation = validate_p0_analysis(
+                parent_analysis, persisted_trace,
+            )
+            try:
+                persisted_analysis = _load_json(run_dir / "k11_analysis.json")
+            except (OSError, ValueError) as exc:
+                raise K11PilotContractError(
+                    "prospective worker analysis artifact is missing or malformed"
+                ) from exc
+            if (summary.get("generic_trace_validation") != parent_generic_validation
+                    or summary.get("trace_validation") != parent_trace_validation
+                    or persisted_analysis != parent_analysis
+                    or summary.get("analysis_validation") != parent_analysis_validation):
+                raise K11PilotContractError(
+                    "prospective worker scientific artifacts differ from parent validation"
+                )
     else:
         summary = _failed_process_summary(
             run_id, supervision, manifest_digest=manifest_digest, cohort_mode=cohort_mode,
@@ -1775,7 +2312,10 @@ def _run_isolated_row(
                 runtime_result = json.loads(result_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 runtime_result = None
-        if validation_contract == LATE_CLEANUP_VALIDATION_CONTRACT:
+        if validation_contract in {
+            LATE_CLEANUP_VALIDATION_CONTRACT,
+            RECONCILIATION_VALIDATION_CONTRACT,
+        }:
             late_premanifest = _load_json(premanifest_path)
             expected_runtime_identity = {
                 "run_id": run_id,
@@ -1786,7 +2326,10 @@ def _run_isolated_row(
                 "validation_contract": validation_contract,
                 "trace_schema": trace_schema,
             }
-        if (validation_contract == LATE_CLEANUP_VALIDATION_CONTRACT
+        if (validation_contract in {
+                LATE_CLEANUP_VALIDATION_CONTRACT,
+                RECONCILIATION_VALIDATION_CONTRACT,
+                }
                 and isinstance(runtime_result, dict)):
             late_runtime = None
             late_runtime_path = run_dir / "k11_late_runtime_diagnostics.json"
@@ -1816,11 +2359,15 @@ def _run_isolated_row(
                                      or candidate_time >= current_time)):
                             controller_result[key] = candidate
         summary["process_supervision"] = dict(supervision)
-        if validation_contract == LATE_CLEANUP_VALIDATION_CONTRACT:
+        if validation_contract in {
+            LATE_CLEANUP_VALIDATION_CONTRACT,
+            RECONCILIATION_VALIDATION_CONTRACT,
+        }:
             late_evidence = _build_late_cleanup_evidence(
                 run_id=run_id, manifest_digest=manifest_digest,
                 runtime_result=runtime_result, trace_artifact=persisted_trace,
                 supervision=supervision, shutdown=shutdown,
+                domain_identity=domain_identity if validation_contract == RECONCILIATION_VALIDATION_CONTRACT else None,
             )
             (run_dir / LATE_CLEANUP_EVIDENCE_FILENAME).write_text(
                 json.dumps(late_evidence, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
@@ -1831,12 +2378,17 @@ def _run_isolated_row(
                 trace_artifact=persisted_trace,
                 expected_identity=expected_runtime_identity,
                 expected_actors=_expected_actor_roster(row),
+                expected_domain=domain_identity if validation_contract == RECONCILIATION_VALIDATION_CONTRACT else None,
             )
             summary["late_cleanup_evidence"] = {
                 "artifact": LATE_CLEANUP_EVIDENCE_FILENAME,
-                "artifact_id": LATE_CLEANUP_EVIDENCE_SCHEMA,
+                "artifact_id": (RECONCILIATION_EVIDENCE_SCHEMA
+                                if validation_contract == RECONCILIATION_VALIDATION_CONTRACT
+                                else LATE_CLEANUP_EVIDENCE_SCHEMA),
                 "measurement_cut_digest": late_evidence["measurement_cut"]["digest"],
             }
+            if validation_contract == RECONCILIATION_VALIDATION_CONTRACT:
+                summary["late_cleanup_evidence"]["digest"] = _canonical_artifact_digest(late_evidence)
         else:
             cleanup_projection = _prospective_cleanup_projection(
                 supervision, shutdown, runtime_result,
@@ -1844,12 +2396,34 @@ def _run_isolated_row(
                 expected_actors=_expected_actor_roster(row),
             )
         _apply_prospective_cleanup_projection(summary, cleanup_projection)
+        if validation_contract == RECONCILIATION_VALIDATION_CONTRACT:
+            _apply_v5_reconciliation(
+                summary,
+                predecessor_digest=predecessor_digest or "",
+                domain=domain_identity or {},
+                decision_ns=time.monotonic_ns(),
+            )
     else:
         summary = _apply_process_outcome(summary, supervision)
     validation_path.write_text(
         json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    if validation_contract == RECONCILIATION_VALIDATION_CONTRACT:
+        admission_evidence = summary.get("admission_chain")
+        if not isinstance(admission_evidence, Mapping):
+            raise K11PilotContractError("K11 P0 v5 post-row admission evidence is missing")
+        (run_dir / "admission_evidence.json").write_text(
+            json.dumps(admission_evidence, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        persisted_admission = _load_json(run_dir / "admission_evidence.json")
+        if persisted_admission != dict(admission_evidence):
+            raise K11PilotContractError("K11 P0 v5 persisted admission evidence differs")
+        _validate_v5_chain_row(
+            summary, predecessor_digest=predecessor_digest or "",
+            domain=domain_identity or {},
+        )
     return summary
 
 
@@ -1861,10 +2435,18 @@ def run_development_smoke(
     matching_rows = [row for row in manifest["runs"] if row["run_id"] == run_id]
     if len(matching_rows) != 1:
         raise K11PilotContractError(f"development smoke run_id is not unique: {run_id}")
-    root = Path(output_root).resolve()
-    root.mkdir(parents=True, exist_ok=True)
+    root = _secure_output_root(output_root, create=True)
     _, revision, premanifest_path, identity = _prepare_execution_identity(root)
     manifest_digest = _manifest_digest(manifest)
+    domain = (_v5_domain_identity(matching_rows[0])
+              if contract == RECONCILIATION_VALIDATION_CONTRACT else None)
+    predecessor_digest = (
+        _write_v5_genesis(
+            root=root, manifest_digest=manifest_digest,
+            execution_revision=revision, domain=domain or {},
+        )
+        if contract == RECONCILIATION_VALIDATION_CONTRACT else None
+    )
     summary = _run_isolated_row(
         matching_rows[0],
         manifest_path=manifest_path,
@@ -1877,6 +2459,8 @@ def run_development_smoke(
         trace_schema=trace_schema,
         validation_artifact_version=artifact_version,
         prospective=prospective,
+        predecessor_digest=predecessor_digest,
+        domain_identity=domain,
     )
     counts = summary.get("event_type_counts", {})
     structural_validation_passed = (
@@ -1938,15 +2522,35 @@ def run_development_smoke(
 def run_p0_manifest(manifest_path: str | Path, *, output_root: str | Path) -> dict[str, Any]:
     manifest = load_p0_manifest(manifest_path)
     contract, trace_schema, artifact_version, prospective = _manifest_contract(manifest)
-    root = Path(output_root).resolve()
-    root.mkdir(parents=True, exist_ok=True)
+    root = _secure_output_root(output_root, create=True)
     _, revision, premanifest_path, identity = _prepare_execution_identity(root)
     summaries = []
     manifest_digest = _manifest_digest(manifest)
+    predecessor_digest = None
+    if contract == RECONCILIATION_VALIDATION_CONTRACT:
+        domain = _v5_domain_identity(manifest["runs"][0])
+        if domain is None:
+            raise K11PilotContractError("K11 P0 v5 runtime domain identity is invalid")
+        predecessor_digest = _write_v5_genesis(
+            root=root, manifest_digest=manifest_digest,
+            execution_revision=revision, domain=domain,
+        )
 
     stopped_before_run = None
     blocked_next_run_id = None
     for index, row in enumerate(manifest["runs"]):
+        if contract == RECONCILIATION_VALIDATION_CONTRACT:
+            predecessor_path = (
+                root / "GENESIS_ADMISSION_EVIDENCE.json"
+                if index == 0
+                else root / manifest["runs"][index - 1]["run_id"] / "admission_evidence.json"
+            )
+            _validate_v5_predecessor_artifact(
+                predecessor_path, expected_digest=predecessor_digest or "",
+                domain=domain,
+                expected_artifact=(summaries[-1].get("admission_chain")
+                                   if index > 0 else None),
+            )
         summary = _run_isolated_row(
             row,
             manifest_path=manifest_path,
@@ -1959,10 +2563,19 @@ def run_p0_manifest(manifest_path: str | Path, *, output_root: str | Path) -> di
             trace_schema=trace_schema,
             validation_artifact_version=artifact_version,
             prospective=prospective,
+            predecessor_digest=predecessor_digest,
+            domain_identity=_v5_domain_identity(row),
         )
         summaries.append(summary)
-        # A cut with an active effect, post-close effect, or uncertainty is a
-        # hard admission stop. There is deliberately no retry or skip path.
+        if contract == RECONCILIATION_VALIDATION_CONTRACT:
+            row_domain = _v5_domain_identity(row)
+            if row_domain is None or row_domain != domain:
+                raise K11PilotContractError("K11 P0 v5 row domain differs from the admitted domain")
+            _validate_v5_chain_row(summary, predecessor_digest=predecessor_digest or "",
+                                   domain=domain)
+            predecessor_digest = summary["admission_chain"]["digest"]
+        # An unresolved H-active effect, any new post-close effect, or uncertainty
+        # is a hard admission stop. There is deliberately no retry or skip path.
         if prospective and not summary.get("next_run_admission_allowed", False):
             if index + 1 < len(manifest["runs"]):
                 stopped_before_run = row["run_id"]
@@ -2095,6 +2708,7 @@ def main(argv=None) -> int:
     parser.add_argument("--validation-contract")
     parser.add_argument("--trace-schema")
     parser.add_argument("--validation-artifact-version", type=int)
+    parser.add_argument("--prelaunch-binding-digest")
     args = parser.parse_args(argv)
     if args.worker_run_id:
         if (not args.execution_revision or not args.premanifest or not args.manifest_digest
@@ -2123,7 +2737,29 @@ def main(argv=None) -> int:
             execution=execution,
             execution_revision=args.execution_revision,
         )
-        run_dir = Path(args.output_root).resolve() / args.worker_run_id
+        worker_root = _secure_output_root(args.output_root, create=False)
+        run_dir = worker_root / args.worker_run_id
+        if run_dir.is_symlink() or run_dir.resolve().parent != worker_root:
+            raise K11PilotContractError("K11 P0 worker run directory is unsafe")
+        if contract == RECONCILIATION_VALIDATION_CONTRACT:
+            binding = _load_json(run_dir / "prelaunch_admission_binding.json")
+            binding_body = dict(binding)
+            observed_digest = binding_body.pop("digest", None)
+            if (not isinstance(args.prelaunch_binding_digest, str)
+                    or observed_digest != args.prelaunch_binding_digest
+                    or observed_digest != _canonical_artifact_digest(binding_body)
+                    or binding.get("artifact_id")
+                    != "minecraft-k11-p0-prelaunch-admission-binding"
+                    or binding.get("artifact_version") != 1
+                    or binding.get("run_id") != args.worker_run_id
+                    or binding.get("manifest_digest") != args.manifest_digest
+                    or binding.get("domain") != _v5_domain_identity(matching_rows[0])
+                    or not isinstance(
+                        binding.get("predecessor_admission_evidence_digest"), str
+                    )):
+                raise K11PilotContractError(
+                    "K11 P0 v5 worker prelaunch predecessor binding is invalid"
+                )
         try:
             _run_single_row(
                 matching_rows[0],

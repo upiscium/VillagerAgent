@@ -498,7 +498,7 @@ def test_k11_p0_analysis_rejects_malformed_validation_structures() -> None:
     assert result["valid"] is False
 
 
-def _prospective(artifact):
+def _prospective(artifact, *, validation_contract=None):
     value = deepcopy(artifact)
     value["schema_version"] = "minecraft-k11-trace/3"
     events = value["events"]
@@ -516,23 +516,20 @@ def _prospective(artifact):
         "snapshot_valid": True, "snapshot_errors": [],
         "censoring_inventory": {"items": [], "retention": {"capacity": 256}},
     }
+    if validation_contract is not None:
+        value["measurement_cut"]["identity"] = {
+            "run_id": value["run_id"],
+            "manifest_digest": "a" * 64,
+            "execution_revision": "b" * 40,
+            "runtime_digest": "sha256:" + "c" * 64,
+            "premanifest_identity": "d" * 64,
+            "validation_contract": validation_contract,
+            "trace_schema": value["schema_version"],
+        }
     return value
 
 
-def test_k11_prospective_identity_and_v1_classification_compatibility() -> None:
-    runtime, trace = _runtime("k11-prospective-compatibility")
-    runtime.ingest_target_observation("Alice", "MineBlock", {"x": 1, "y": 2, "z": 3})
-    runtime.execute_prepared(_prepare(runtime))
-    legacy = analyze_trace(trace.artifact())
-    prospective = analyze_prospective_trace(_prospective(trace.artifact()))
-    assert prospective["artifact_id"] == "minecraft-k11-prospective-analysis"
-    assert prospective["artifact_version"] == 1
-    assert prospective["taxonomy"] == legacy["taxonomy"]
-    assert prospective["denominators"] == legacy["denominators"]
-
-
-def test_k11_recorder_generated_prospective_analysis_is_eligible() -> None:
-    run_id = "k11-prospective-recorder-analysis"
+def _recorded_prospective(run_id, *, validation_contract):
     trace = K11TraceRecorder(
         run_id, schema_version=PROSPECTIVE_TRACE_SCHEMA_VERSION,
         measurement_identity={
@@ -540,7 +537,7 @@ def test_k11_recorder_generated_prospective_analysis_is_eligible() -> None:
             "execution_revision": "b" * 40,
             "runtime_digest": "sha256:" + "c" * 64,
             "premanifest_identity": "d" * 64,
-            "validation_contract": "minecraft-k11-p0-validation-contract/2",
+            "validation_contract": validation_contract,
             "trace_schema": PROSPECTIVE_TRACE_SCHEMA_VERSION,
         },
     )
@@ -588,7 +585,85 @@ def test_k11_recorder_generated_prospective_analysis_is_eligible() -> None:
             },
         },
     )
-    artifact = trace.artifact()
+    return trace.artifact()
+
+
+def _with_validation_contract(artifact, validation_contract):
+    value = deepcopy(artifact)
+    cut = value["measurement_cut"]
+    cut["identity"]["validation_contract"] = validation_contract
+    snapshot = {
+        name: cut[name] for name in (
+            "active_executions", "open_lifecycles", "prepared_requests",
+            "evidence_high_water", "censoring_inventory",
+        )
+    }
+    snapshot["identity"] = cut["identity"]
+    cut["snapshot_state_digest"] = (
+        "sha256:" + hashlib.sha256(canonical_trace_bytes(snapshot)).hexdigest()
+    )
+    return value
+
+
+def test_k11_prospective_identity_and_v1_classification_compatibility() -> None:
+    runtime, trace = _runtime("k11-prospective-compatibility")
+    runtime.ingest_target_observation("Alice", "MineBlock", {"x": 1, "y": 2, "z": 3})
+    runtime.execute_prepared(_prepare(runtime))
+    legacy = analyze_trace(trace.artifact())
+    prospective = analyze_prospective_trace(_prospective(trace.artifact()))
+    assert prospective["artifact_id"] == "minecraft-k11-prospective-analysis"
+    assert prospective["artifact_version"] == 1
+    assert prospective["taxonomy"] == legacy["taxonomy"]
+    assert prospective["denominators"] == legacy["denominators"]
+
+
+def test_k11_versioned_declaration_routing_preserves_scientific_cut_and_outputs() -> None:
+    contract_v2 = _recorded_prospective(
+        "k11-versioned-declaration-routing",
+        validation_contract="minecraft-k11-p0-validation-contract/2",
+    )
+    contract_v3 = _with_validation_contract(
+        contract_v2, "minecraft-k11-p0-validation-contract/3"
+    )
+    contract_v4 = _with_validation_contract(
+        contract_v2, "minecraft-k11-p0-validation-contract/4"
+    )
+
+    analysis_v2 = analyze_trace(contract_v2)
+    analysis_v3 = analyze_trace(contract_v3)
+    analysis_v4 = analyze_trace(contract_v4)
+
+    assert analysis_v2["analysis_identity"]["schema_version"] == "minecraft-k11-prospective-analysis/1"
+    assert analysis_v3["analysis_identity"]["schema_version"] == "minecraft-k11-prospective-analysis/1"
+    assert analysis_v4["analysis_identity"]["schema_version"] == "minecraft-k11-prospective-analysis/2"
+    assert analysis_v4["measurement_cut"] == contract_v4["measurement_cut"]
+    for key in contract_v2["measurement_cut"]:
+        if key not in {"identity", "snapshot_state_digest"}:
+            assert contract_v4["measurement_cut"][key] == contract_v2["measurement_cut"][key]
+    for result in (analysis_v2, analysis_v3, analysis_v4):
+        assert result["denominators"] == analysis_v2["denominators"]
+        assert result["taxonomy"] == analysis_v2["taxonomy"]
+        assert result["actions"] == analysis_v2["actions"]
+
+    assert validate_p0_analysis(analysis_v4, contract_v4)["valid"] is True
+    stale = deepcopy(analysis_v4)
+    stale["artifact_version"] = 1
+    stale["analysis_identity"] = {
+        "schema_version": "minecraft-k11-prospective-analysis/1"
+    }
+    assert validate_p0_analysis(stale, contract_v4)["valid"] is False
+    wrong_identity = deepcopy(analysis_v4)
+    wrong_identity["analysis_identity"] = {
+        "schema_version": "minecraft-k11-prospective-analysis/1"
+    }
+    assert validate_p0_analysis(wrong_identity, contract_v4)["valid"] is False
+
+
+def test_k11_recorder_generated_prospective_analysis_is_eligible() -> None:
+    artifact = _recorded_prospective(
+        "k11-prospective-recorder-analysis",
+        validation_contract="minecraft-k11-p0-validation-contract/2",
+    )
     analysis = analyze_trace(artifact)
     assert analysis["measurement_analysis_eligible"] is True
     assert validate_p0_analysis(analysis, artifact)["valid"] is True
