@@ -37,6 +37,7 @@ def make_ollama_llm_config(
     api_model: str | None = None,
     api_base: str | None = None,
     api_key: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict:
     selected_api_key = api_key or OLLAMA_API_KEY
     return {
@@ -45,6 +46,7 @@ def make_ollama_llm_config(
         "api_base": normalize_ollama_api_base(api_base or OLLAMA_API_BASE),
         "api_model": api_model or OLLAMA_MODEL,
         "api_key_list": [selected_api_key],
+        "reasoning_effort": reasoning_effort,
     }
 
 

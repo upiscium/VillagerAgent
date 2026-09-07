@@ -5,12 +5,17 @@ from pipeline.task_prompt import *
 from pipeline.data_manager import DataManager
 from pipeline.retriever import Retriever
 from pipeline.runtime_events import NoOpRuntimeEventSink, safe_emit_runtime_event
-from model.openai_models import OpenAILanguageModel
+from model.openai_models import (
+    OpenAILanguageModel,
+    ProviderCallCancellationError,
+    ProviderCallTerminationError,
+)
 from pipeline.utils import *
 from typing import Union
 import json
 import time
 import logging
+from contextlib import nullcontext
 from functools import wraps
 from pathlib import Path
 
@@ -18,6 +23,30 @@ from env.runtime_paths import RuntimePaths, atomic_write_json
 
 TASK_MANAGER_WAIT_TIME = 1
 PARTIAL_GRAPH_TASK_NUM = 5
+
+
+class TaskManagerFeedbackInterruptedError(InterruptedError):
+    """Adaptive task feedback stopped at the controller shutdown boundary."""
+
+    def __init__(self, message, *, provider_termination_confirmed, diagnostics=None):
+        super().__init__(message)
+        self.provider_termination_confirmed = bool(provider_termination_confirmed)
+        self.diagnostics = diagnostics or {}
+
+
+class TaskManagerFeedbackOutcome:
+    """Evidence that TaskManager feedback reached its mutation commit."""
+
+    committed = True
+
+    def __init__(self, *, ancillary_complete: bool = True):
+        self.ancillary_complete = bool(ancillary_complete)
+
+
+class TaskManagerFeedbackCommitError(RuntimeError):
+    """Canonical feedback committed, but ancillary persistence failed."""
+
+    committed = True
 
 
 def _reset_status_after_task_management(method):
@@ -46,6 +75,107 @@ class TaskManager:
 
     update_task: str = "update"
     merge_task: str = "merge"
+
+    @staticmethod
+    def _feedback_cancelled(cancellation_token) -> bool:
+        if cancellation_token is None:
+            return False
+        if callable(cancellation_token):
+            return bool(cancellation_token())
+        is_set = getattr(cancellation_token, "is_set", None)
+        if not callable(is_set):
+            raise TypeError("cancellation_token must be callable or expose is_set()")
+        return bool(is_set())
+
+    @classmethod
+    def _require_feedback_admission(cls, cancellation_token, *, phase: str) -> None:
+        if cls._feedback_cancelled(cancellation_token):
+            raise TaskManagerFeedbackInterruptedError(
+                "TaskManager feedback was interrupted by controller shutdown",
+                provider_termination_confirmed=True,
+                diagnostics={"phase": phase},
+            )
+
+    def _feedback_model_call(
+        self,
+        *args,
+        cancellation_token=None,
+        model_admission_lock=None,
+        **kwargs,
+    ):
+        self._require_feedback_admission(
+            cancellation_token, phase="before_model_call",
+        )
+        if cancellation_token is not None and isinstance(
+            self.llm, OpenAILanguageModel
+        ):
+            kwargs["cancellation_event"] = cancellation_token
+            kwargs["model_admission_lock"] = model_admission_lock
+        try:
+            response = self.llm.few_shot_generate_thoughts(*args, **kwargs)
+        except ProviderCallCancellationError as exc:
+            raise TaskManagerFeedbackInterruptedError(
+                "TaskManager model call was interrupted by controller shutdown",
+                provider_termination_confirmed=exc.provider_termination_confirmed,
+                diagnostics=exc.close_failure_diagnostics,
+            ) from exc
+        except ProviderCallTerminationError as exc:
+            raise TaskManagerFeedbackInterruptedError(
+                "TaskManager provider termination was not confirmed",
+                provider_termination_confirmed=False,
+                diagnostics={
+                    "phase": "provider_timeout",
+                    "error_type": type(exc).__name__,
+                },
+            ) from exc
+        self._require_feedback_admission(
+            cancellation_token, phase="after_model_call",
+        )
+        return response
+
+    @staticmethod
+    def _feedback_commit_context(commit_lock):
+        return nullcontext() if commit_lock is None else commit_lock
+
+    def _persist_feedback_artifacts(
+        self,
+        *,
+        history,
+        snapshot_source: str,
+        cancellation_token=None,
+        persistence_gate=None,
+    ):
+        def run(operation) -> bool:
+            if persistence_gate is not None:
+                return bool(persistence_gate(operation, cancellation_token))
+            if self._feedback_cancelled(cancellation_token):
+                return False
+            operation()
+            return True
+
+        try:
+            if history is not None and not run(
+                lambda: self.update_history(*history)
+            ):
+                return TaskManagerFeedbackOutcome(ancillary_complete=False)
+            if not run(
+                lambda: self.checkpoint_runtime_state(raise_on_error=True)
+            ):
+                return TaskManagerFeedbackOutcome(ancillary_complete=False)
+            if not run(lambda: self.emit_task_graph_snapshot(snapshot_source)):
+                return TaskManagerFeedbackOutcome(ancillary_complete=False)
+            time_str = time.strftime("%Y_%m_%d_%H_%M_%S_graph", time.localtime())
+            if not run(
+                lambda: self.graph.write_graph_to_md("img/" + time_str + ".md")
+            ):
+                return TaskManagerFeedbackOutcome(ancillary_complete=False)
+            if not run(lambda: self.graph.write_graph_to_json("logs/")):
+                return TaskManagerFeedbackOutcome(ancillary_complete=False)
+        except BaseException as exc:
+            raise TaskManagerFeedbackCommitError(
+                "TaskManager feedback committed but artifact persistence failed"
+            ) from exc
+        return TaskManagerFeedbackOutcome()
 
     def __init__(self, silent:bool = False, method:str = "update", cache_enabled:bool = False, event_sink=None, history_output_dir: str | os.PathLike | None = None):
         if method not in ("update", "merge"):
@@ -329,7 +459,14 @@ class TaskManager:
         return task_list
 
 
-    def get_graph_strategy(self, task:Task) -> {str: Union[str, int, list]}:
+    def get_graph_strategy(
+        self,
+        task: Task,
+        *,
+        cancellation_token=None,
+        model_admission_lock=None,
+        defer_history: bool = False,
+    ) -> {str: Union[str, int, list]}:
         '''
         This function is used to get the strategy of the task in merge method
 
@@ -353,13 +490,17 @@ class TaskManager:
         # self.logger.warning("TM STRATEGY DEBUG:")
         # self.logger.warning(strategy_system_prompt)
         # self.logger.warning(strategy_user_prompt)
-        response = self.llm.few_shot_generate_thoughts(strategy_system_prompt, strategy_user_prompt, cache_enabled=self.cache_enabled, json_check=True
+        response = self._feedback_model_call(strategy_system_prompt, strategy_user_prompt, cache_enabled=self.cache_enabled, json_check=True,
+                                                       cancellation_token=cancellation_token,
+                                                       model_admission_lock=model_admission_lock,
                                                     #    api_model="gpt-4-1106-preview",
                                                     #    check_tags=["reasoning", "strategy", "info"]
                                                        
                                                        )
-        self.update_history(strategy_system_prompt, strategy_user_prompt, response)
         result = extract_info(response)[0]
+        if defer_history:
+            return result, (strategy_system_prompt, strategy_user_prompt, response)
+        self.update_history(strategy_system_prompt, strategy_user_prompt, response)
         
         # self.logger.warning(strategy_user_prompt)
         self.logger.warning(response)
@@ -445,64 +586,91 @@ class TaskManager:
         return result
 
     
-    def feedback_task(self, task:Task):
+    def feedback_task(
+        self,
+        task: Task,
+        cancellation_token=None,
+        commit_lock=None,
+        persistence_gate=None,
+    ):
         # self.logger.debug("="*20 + " Task Manager Handle Feedback " + "="*20)
         # self.logger.warning("open task list:")
         # self.logger.warning("=" * 40)
         self.status = TaskManager.running
-
-        if type(task) != Task:
-            self.logger.error("Task type error.")
-            self.status = TaskManager.idle
-            return
-        
-        # update the task status
-        self.add_task_to_trace()
-
-        # update the task status according to the feedback
-        if self.runtime_task_store.terminal_state() == GraphState.RUNNING:
-            self.status = TaskManager.idle
-            return
-        
-        elif task.status == Task.unknown or task.status == Task.running:
-            self.logger.error("Should not feedback unknown or running task.")
-            self.status = TaskManager.idle
-            return
-        
-        if self.manage_method == "update":
-            self.update_task(task)
-        elif self.manage_method == "merge":
-            self.merge_task(task)
-        else:
-            self.logger.error("Task Manager Method Error.")
-            raise ValueError(
-                f"Unsupported task manager method {self.manage_method!r}; expected one of: update, merge"
+        try:
+            self._require_feedback_admission(
+                cancellation_token, phase="feedback_start",
             )
-        self.status = TaskManager.idle
+            if type(task) != Task:
+                self.logger.error("Task type error.")
+                return TaskManagerFeedbackOutcome()
 
-    def merge_task(self, task:Task):
+            with self._feedback_commit_context(commit_lock):
+                self._require_feedback_admission(
+                    cancellation_token, phase="trace_commit",
+                )
+                self.add_task_to_trace()
 
-        result = self.get_graph_strategy(task)
+            if self.runtime_task_store.terminal_state() == GraphState.RUNNING:
+                return TaskManagerFeedbackOutcome()
+
+            if task.status == Task.unknown or task.status == Task.running:
+                self.logger.error("Should not feedback unknown or running task.")
+                return TaskManagerFeedbackOutcome()
+
+            if self.manage_method == "update":
+                return self.update_task(
+                    task,
+                    cancellation_token=cancellation_token,
+                    commit_lock=commit_lock,
+                    persistence_gate=persistence_gate,
+                )
+            elif self.manage_method == "merge":
+                return self.merge_task(
+                    task,
+                    cancellation_token=cancellation_token,
+                    commit_lock=commit_lock,
+                    persistence_gate=persistence_gate,
+                )
+            else:
+                self.logger.error("Task Manager Method Error.")
+                raise ValueError(
+                    f"Unsupported task manager method {self.manage_method!r}; expected one of: update, merge"
+                )
+        finally:
+            self.status = TaskManager.idle
+
+    def merge_task(
+        self,
+        task: Task,
+        cancellation_token=None,
+        commit_lock=None,
+        persistence_gate=None,
+    ):
+        if cancellation_token is None and commit_lock is None:
+            result = self.get_graph_strategy(task)
+            history = None
+        else:
+            result, history = self.get_graph_strategy(
+                task,
+                cancellation_token=cancellation_token,
+                model_admission_lock=commit_lock,
+                defer_history=True,
+            )
         strategy = result["strategy"]
-
-        if strategy == "replan":
-            # 1. replan task
-            origin_task_id = self.runtime_task_store.task_id_at(int(result["origin-id"]) - 1)
-            origin_task = self.runtime_task_store.get_task(origin_task_id)
-            replan_task = Task(name=result["description"], content=origin_task.content)
-            replan_task.milestones = result["milestones"]
-            self.runtime_task_store.replace_task(origin_task_id, replan_task)
-
-        elif strategy == "decompose":
-            # 2. decompose
-            origin_task_id = self.runtime_task_store.task_id_at(int(result["origin-id"]) - 1)
-            origin_task = self.runtime_task_store.get_task(origin_task_id)
-            subtasks = result["subtasks"]
-
-            subtask_list = []
-            for subtask_data in subtasks:
-                sub_content = self.get_relevant_content_by_path(origin_task.analyze_json(), subtask_data["retrieval paths"])
-                subtask = Task(name=subtask_data["description"], content=sub_content) 
+        prepared_subtasks = None
+        prepared_origin_task_id = None
+        if strategy == "decompose":
+            prepared_origin_task_id = self.runtime_task_store.task_id_at(
+                int(result["origin-id"]) - 1
+            )
+            origin_task = self.runtime_task_store.get_task(prepared_origin_task_id)
+            prepared_subtasks = []
+            for subtask_data in result["subtasks"]:
+                sub_content = self.get_relevant_content_by_path(
+                    origin_task.analyze_json(), subtask_data["retrieval paths"]
+                )
+                subtask = Task(name=subtask_data["description"], content=sub_content)
                 subtask.description = subtask_data["description"]
                 subtask.parent_task_list.append(origin_task)
                 subtask.goal = "omit"
@@ -512,39 +680,47 @@ class TaskManager:
                 subtask.number = int(subtask_data["minimum required agents"])
                 subtask._pre_idxs = list(subtask_data["required subtasks"])
                 subtask._pre_idxs_explicit = True
-                subtask_list.append(subtask)
-            self.runtime_task_store.replace_task_with_subgraph(origin_task_id, subtask_list)
+                prepared_subtasks.append(subtask)
 
-        elif strategy == "move":
-            # 3. move task to a new position
-            origin_task_id = self.runtime_task_store.task_id_at(int(result["origin-id"]) - 1)
-            predecessor_id = self.runtime_task_store.task_id_at(int(result["new-id"]) - 1)
-            self.runtime_task_store.move_task_after(origin_task_id, predecessor_id)
-        elif strategy == "insert":
-            # 4. insert a new task after a task
-            new_task = Task(name=result["description"], content=task.content)
-            new_task.milestones = result["milestones"]
-            predecessor_id = self.runtime_task_store.task_id_at(int(result["insert-id"]) - 1)
-            self.runtime_task_store.insert_task_after(predecessor_id, new_task)
-        elif strategy == "delete":
-            # 5. delete task
-            delete_task_id = self.runtime_task_store.task_id_at(int(result["delete-id"]) - 1)
-            self.runtime_task_store.remove_task(delete_task_id)
-        else:
-            self.logger.error("Task status error.")
-            return
+        with self._feedback_commit_context(commit_lock):
+            self._require_feedback_admission(
+                cancellation_token, phase="merge_commit",
+            )
+            if strategy == "replan":
+                origin_task_id = self.runtime_task_store.task_id_at(int(result["origin-id"]) - 1)
+                origin_task = self.runtime_task_store.get_task(origin_task_id)
+                replan_task = Task(name=result["description"], content=origin_task.content)
+                replan_task.milestones = result["milestones"]
+                self.runtime_task_store.replace_task(origin_task_id, replan_task)
+            elif strategy == "decompose":
+                self.runtime_task_store.replace_task_with_subgraph(
+                    prepared_origin_task_id, prepared_subtasks,
+                )
+            elif strategy == "move":
+                origin_task_id = self.runtime_task_store.task_id_at(int(result["origin-id"]) - 1)
+                predecessor_id = self.runtime_task_store.task_id_at(int(result["new-id"]) - 1)
+                self.runtime_task_store.move_task_after(origin_task_id, predecessor_id)
+            elif strategy == "insert":
+                new_task = Task(name=result["description"], content=task.content)
+                new_task.milestones = result["milestones"]
+                predecessor_id = self.runtime_task_store.task_id_at(int(result["insert-id"]) - 1)
+                self.runtime_task_store.insert_task_after(predecessor_id, new_task)
+            elif strategy == "delete":
+                delete_task_id = self.runtime_task_store.task_id_at(int(result["delete-id"]) - 1)
+                self.runtime_task_store.remove_task(delete_task_id)
+            else:
+                self.logger.error("Task status error.")
+                return TaskManagerFeedbackOutcome()
 
-        self.sync_graph_from_dual_dag()
-        self.checkpoint_runtime_state()
-        self.emit_task_graph_snapshot(f"TaskManager.merge_task.{strategy}")
-        
-        time_str = time.strftime("%Y_%m_%d_%H_%M_%S_graph", time.localtime())
-        
-        # self.graph.draw_graph("img/" + time_str + ".png")
-        self.graph.write_graph_to_md("img/" + time_str + ".md")
-
-        self.graph.write_graph_to_json("logs/")
-        self.status = TaskManager.idle
+            self.sync_graph_from_dual_dag()
+        if self._feedback_cancelled(cancellation_token):
+            return TaskManagerFeedbackOutcome(ancillary_complete=False)
+        return self._persist_feedback_artifacts(
+            history=history,
+            snapshot_source=f"TaskManager.merge_task.{strategy}",
+            cancellation_token=cancellation_token,
+            persistence_gate=persistence_gate,
+        )
 
     def trace_format(self, task:Task):
         # generate the trace format
@@ -580,7 +756,13 @@ class TaskManager:
 
 
     @_reset_status_after_task_management
-    def update_task(self, task:Task):
+    def update_task(
+        self,
+        task: Task,
+        cancellation_token=None,
+        commit_lock=None,
+        persistence_gate=None,
+    ):
         # task append
         # query state
         # query experience
@@ -613,9 +795,15 @@ class TaskManager:
         # self.logger.warning("TM DEBUG:")
         # self.logger.warning(system_prompt)
         self.logger.warning(user_prompt)
-        response = self.llm.few_shot_generate_thoughts(system_prompt, user_prompt, cache_enabled=False, json_check=True,
-                                                       check_tags=["description", "milestones", "assigned agents"])
-        self.update_history(system_prompt, user_prompt, response)
+        response = self._feedback_model_call(
+            system_prompt,
+            user_prompt,
+            cache_enabled=False,
+            json_check=True,
+            check_tags=["description", "milestones", "assigned agents"],
+            cancellation_token=cancellation_token,
+            model_admission_lock=commit_lock,
+        )
         result = extract_info(response, guard_keys=["description", "milestones"])
         omit_keys = [("assigned agents", "list"), ("required subtasks", "list"), ("retrieval paths", "list")]
         result = self.fill_keys_omit(
@@ -644,10 +832,17 @@ class TaskManager:
             subtask._pre_idxs_explicit = True
             subtask_list.append(subtask)
 
-        self.set_task_list_from_decomposition(subtask_list)
-
-        time_str = time.strftime("%Y_%m_%d_%H_%M_%S_graph", time.localtime())
-        
-        self.graph.write_graph_to_md("img/" + time_str + ".md")
-        # input("press any key to continue")
-        self.graph.write_graph_to_json("logs/")
+        with self._feedback_commit_context(commit_lock):
+            self._require_feedback_admission(
+                cancellation_token, phase="update_commit",
+            )
+            self.runtime_task_store.load_tasks_from_decomposition(subtask_list)
+            self.sync_graph_from_dual_dag()
+        if self._feedback_cancelled(cancellation_token):
+            return TaskManagerFeedbackOutcome(ancillary_complete=False)
+        return self._persist_feedback_artifacts(
+            history=(system_prompt, user_prompt, response),
+            snapshot_source="TaskManager.decomposition",
+            cancellation_token=cancellation_token,
+            persistence_gate=persistence_gate,
+        )

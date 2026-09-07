@@ -8,9 +8,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import copy
+import os
+import re
+import subprocess
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
 from benchmarks.common.eac import ActionRef, ExactRequest
@@ -31,12 +35,62 @@ PROTOCOL_DIGEST = "94b70d7d746863f7febb5d79169cf91b37bb78b79e73c7733fe58490ec814
 RESULT_SCHEMA_DIGEST = "6cd3a1919a3278aca80646a82233c54834c408f91bdb5a43aaf4f7587aa9c9b1"
 SELECTION_MANIFEST_DIGEST = "ce92e9426a10486b17dd0551a4dfce5a46cfcb4524fb67f3c2404b50df7f8480"
 SUBJECT_RUNTIME_REFERENCE = "ecb553323487bff69be2cfa375caea8dd02eada5"
+_COMMIT_ID = re.compile(r"[0-9a-f]{40}\Z")
 CONDITIONS = ("dual_dag_advisory", "dual_dag_authority")
 PRIMARY_FAMILIES = ("S1", "S2", "S3")
 CONTROL_FAMILIES = ("C1", "C2")
 ACTORS = ("Alice", "Bob")
-EXACT_FIELDS = k6.EXACT_FIELDS
-C2_EVALUATOR_FIELDS = k6.C2_EVALUATOR_FIELDS
+EXACT_FIELDS = (
+    "candidate_id", "attempt_id", "exact_request_digest", "action", "arguments", "target",
+)
+C2_EVALUATOR_FIELDS = (
+    "evaluator_truth_before", "evaluator_truth_after", "evaluator_truth_before_digest",
+    "evaluator_truth_after_digest", "evaluator_truth_changed",
+    "evaluator_truth_authority_input", "evaluator_truth_precondition_input",
+)
+_FROZEN_PHASE_KEYS = {
+    "r_p": {"candidate_id", "attempt_id", "exact_request_digest", "action", "arguments",
+            "target", "EAdm", "authority_epoch", "witness_root_ids", "dependency_ids"},
+    "r_d": {"current_EAdm", "authority_epoch", "reasons", "mutation_type",
+            "mutation_dependency_ids", "intersecting_dependency_ids",
+            "relevant_action_dependency_changed", "permit_or_shadow_fresh"},
+    "r_e": {"candidate_id", "attempt_id", "exact_request_digest", "action", "arguments",
+            "target", "current_EAdm", "authority_epoch_before_execution",
+            "exact_action_submitted", "permit_or_shadow_fresh", "EnvPre_oracle",
+            "SecPre_oracle", "execution_allowed", "rejection_reason", "native_callable_reached"},
+}
+_FROZEN_SEMANTIC_BINDINGS = {
+    "support_policy": {"identity": "eac-primary-support", "version": 1,
+                       "digest": "ef34b67ef618ed4b34a9c2720d854e02d8fb6af917a0cbe472daef8cc5603d51"},
+    "source_profile": {"identity": "minecraft-eac-primary", "version": 1,
+                       "digest": "01f65a8fd4bb68b1631e81d3c8d50f073747b5179995eeb60be3a55fdb6979be"},
+    "epre_classification": {"identity": "minecraft-preconditions", "version": 1,
+                            "digest": "7c8bf97b80c96f1d05e8250cb9d89bb21b35c073f49979501090d72f13b56001"},
+    "ingestion_contract": {"identity": "minecraft-eac-ingestion-contract", "version": 1,
+                           "digest": "33c9fd27a70ab3f6edffad14c07f9f66dc04b795363e7b1b55518a4d1a1ef42f"},
+}
+_FROZEN_K6_ACTIONS = {
+    "I1": ("MineBlock", 1, "f21619931b543f80e769e954ba66e9e401d22966db93f55d42de5cff9aabe315",
+           "minecraft", "target_block_present", ("x", "y", "z"), "current", ("x", "y", "z")),
+    "I2": ("placeBlock", 1, "f92a7ce9a8ab545e9cdabb4b68c85437a2304c40c2832cd3a379e8de59d0087b",
+           "minecraft", "placement_target_observed", ("x", "y", "z"), "current",
+           ("item_name", "x", "y", "z", "facing")),
+    "I3": ("navigateTo", 1, "eecfdbaf2fbe3577bc96645bd4836f495e9afc977818f661fd56290de4ab3a8b",
+           "minecraft", "destination_observed", ("x", "y", "z"), "current", ("x", "y", "z")),
+    "I4": ("attackTarget", 1, "88a5e9bf16c247a3184b4f75e4dbebe5c1a2198e508d4a267de14eb6639f68f4",
+           "minecraft", "entity_target_observed", ("target_name",), "current", ("target_name",)),
+    "I5": ("handoverBlock", 1, "2f273f5f6f9c61e3661f53aea31992d811945c873959768bf2391f790faab51a",
+           "minecraft", "recipient_observed", ("target_player_name",), "current",
+           ("target_player_name", "item_name", "item_count")),
+}
+_DISCLOSED_SOURCE_PATHS = frozenset({
+    "benchmarks/minecraft/k1_f1.py",
+    "benchmarks/minecraft/k2_dependency_ablation.py",
+    "benchmarks/minecraft/k3a_actor_scope.py",
+    "benchmarks/minecraft/k3b_contradiction.py",
+    "tests/test_minecraft_eac_runtime.py",
+    "tests/test_minecraft_k6_fixture.py",
+})
 
 EXPECTED_SELECTED = (
     ("K10-I1-H1", "K10-P-I1-04", "sha256:25621faadb7d12c82afc8ae7c745e374f76e22e2c6602955ac880d5d12e2e711"),
@@ -129,7 +183,7 @@ def _selection_projection(candidates: Iterable[Mapping[str, Any]]) -> dict[str, 
 
 
 @lru_cache(maxsize=8)
-def load_k10_candidate_pool(path: str | Path = CANDIDATE_POOL_PATH) -> tuple[dict[str, Any], ...]:
+def _load_k10_candidate_pool_cached(path: str) -> tuple[dict[str, Any], ...]:
     document = _load_json(Path(path))
     digest = _validate_detached(document, "K10 candidate pool")
     if set(document) != {
@@ -154,12 +208,7 @@ def load_k10_candidate_pool(path: str | Path = CANDIDATE_POOL_PATH) -> tuple[dic
         "env_pre_diagnostic_assumptions", "sec_pre_diagnostic_assumptions",
         "production_runtime_change_required",
     }
-    expected_actions = {
-        item.inventory_id: (item.action_identity, item.action_version, k6.expected_action_digest(item),
-                            item.proposition_namespace, item.proposition_predicate,
-                            item.proposition_argument_fields, item.temporal_scope)
-        for item in k6.load_k6_inventory()
-    }
+    expected_actions = _FROZEN_K6_ACTIONS
     expected_pool_ids = [f"K10-P-I{stratum}-{index:02d}" for stratum in range(1, 6) for index in range(1, 5)]
     if [row.get("pool_id") for row in rows] != expected_pool_ids:
         raise K10ContractError("K10 candidate pool order or IDs changed")
@@ -175,17 +224,15 @@ def load_k10_candidate_pool(path: str | Path = CANDIDATE_POOL_PATH) -> tuple[dic
         expected = expected_actions.get(stratum)
         if expected is None:
             raise K10ContractError("K10 candidate uses an unknown stratum")
-        identity, version, action_digest, namespace, predicate, fields, temporal_scope = expected
+        (identity, version, action_digest, namespace, predicate, fields, temporal_scope,
+         argument_fields) = expected
         if descriptor["descriptor_version"] != "minecraft-k10-candidate/1" or descriptor["action"] != {
             "identity": identity, "version": version, "digest": action_digest,
         }:
             raise K10ContractError("K10 candidate action binding mismatch")
         arguments = descriptor["arguments"]
         if (not isinstance(arguments, Mapping) or descriptor["target"] != arguments
-                or set(arguments) != set(next(
-                    definition["argument_fields"] for definition in
-                    _load_json(k6.CLASSIFICATION_PATH)["actions"]
-                    if definition["action_identity"] == identity))):
+                or set(arguments) != set(argument_fields)):
             raise K10ContractError("K10 candidate arguments or target mismatch")
         proposition_arguments = {field: arguments[field] for field in fields}
         if descriptor["expected_epre"] != {
@@ -223,6 +270,13 @@ def load_k10_candidate_pool(path: str | Path = CANDIDATE_POOL_PATH) -> tuple[dic
     if observed != EXPECTED_SELECTED:
         raise K10ContractError("K10 selected candidate set changed")
     return tuple(dict(row) for row in rows)
+
+
+def load_k10_candidate_pool(
+    path: str | Path = CANDIDATE_POOL_PATH,
+) -> tuple[dict[str, Any], ...]:
+    """Return a detached copy of the authenticated K10 candidate pool."""
+    return copy.deepcopy(_load_k10_candidate_pool_cached(str(Path(path))))
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,9 +434,9 @@ def _validate_result_schema(document: Mapping[str, Any]) -> str:
         raise K10ContractError("K10 result schema identity mismatch")
     if tuple(document["exact_action_fields"]) != EXACT_FIELDS:
         raise K10ContractError("K10 exact-action schema mismatch")
-    if (set(document["phase_fields"]) != set(k6._PHASE_KEYS)
+    if (set(document["phase_fields"]) != set(_FROZEN_PHASE_KEYS)
             or any(set(document["phase_fields"][name]) != fields
-                   for name, fields in k6._PHASE_KEYS.items())):
+                   for name, fields in _FROZEN_PHASE_KEYS.items())):
         raise K10ContractError("K10 phase schema mismatch")
     if tuple(document["c2_evaluator_truth_fields"]) != C2_EVALUATOR_FIELDS:
         raise K10ContractError("K10 C2 schema mismatch")
@@ -393,12 +447,110 @@ def _validate_result_schema(document: Mapping[str, Any]) -> str:
     return digest
 
 
-def _validate_protected_content(protocol: Mapping[str, Any]) -> None:
+def _validate_frozen_source_path(relative: object) -> str:
+    if (not isinstance(relative, str) or not relative or "\\" in relative
+            or "\x00" in relative or ":" in relative or relative.startswith("/")
+            or any(part in ("", ".", "..") for part in relative.split("/"))
+            or PurePosixPath(relative).as_posix() != relative):
+        raise K10ContractError("K10 frozen source path is invalid")
+    return relative
+
+
+def _protected_content_bindings(protocol: Mapping[str, Any]) -> Mapping[str, str]:
     bindings = protocol.get("protected_runtime_content_bindings")
     if not isinstance(bindings, Mapping) or len(bindings) != 19:
         raise K10ContractError("K10 protected-content manifest mismatch")
     for relative, expected in bindings.items():
-        path = ROOT / relative
+        _validate_frozen_source_path(relative)
+        if (not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None):
+            raise K10ContractError("K10 protected-content digest is malformed")
+    return bindings
+
+
+def _read_frozen_source_blob(revision: str, relative: str, *, root: Path = ROOT) -> bytes:
+    if _COMMIT_ID.fullmatch(revision) is None:
+        raise K10ContractError("K10 frozen source revision is invalid")
+    root = Path(root)
+    git_env = {**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        listing = subprocess.run(
+            ["git", "-C", str(root), "ls-tree", "-z", revision, "--", relative],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, env=git_env, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise K10ContractError(f"K10 frozen source object unavailable: {relative}") from exc
+    entries = listing.stdout.split(b"\0") if listing.returncode == 0 else []
+    entries = [entry for entry in entries if entry]
+    if len(entries) != 1:
+        raise K10ContractError(f"K10 frozen source object unavailable: {relative}")
+    try:
+        metadata, encoded_path = entries[0].split(b"\t", 1)
+        mode, object_type, object_id = metadata.split(b" ", 2)
+        listed_path = encoded_path.decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise K10ContractError(f"K10 frozen source object unavailable: {relative}") from exc
+    if (listed_path != relative or mode not in (b"100644", b"100755")
+            or object_type != b"blob" or re.fullmatch(rb"[0-9a-f]{40,64}", object_id) is None):
+        raise K10ContractError(f"K10 frozen source object unavailable: {relative}")
+    try:
+        blob = subprocess.run(
+            ["git", "-C", str(root), "cat-file", "blob", object_id.decode("ascii")],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, env=git_env, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise K10ContractError(f"K10 frozen source object unavailable: {relative}") from exc
+    if blob.returncode != 0:
+        raise K10ContractError(f"K10 frozen source object unavailable: {relative}")
+    return blob.stdout
+
+
+def _load_frozen_json(
+    revision: str, relative: str, *, source_reader=None,
+) -> dict[str, Any]:
+    """Load one frozen Git blob as a duplicate-key-safe JSON object."""
+    relative = _validate_frozen_source_path(relative)
+
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in items:
+            if key in value:
+                raise K10ContractError(f"duplicate JSON key in frozen K10 source: {relative}")
+            value[key] = item
+        return value
+
+    reader = source_reader or _read_frozen_source_blob
+    try:
+        text = reader(revision, relative).decode("utf-8")
+        value = json.loads(text, object_pairs_hook=pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise K10ContractError(f"cannot load frozen K10 JSON source: {relative}") from exc
+    if not isinstance(value, dict):
+        raise K10ContractError(f"frozen K10 JSON source must be an object: {relative}")
+    return value
+
+
+def _validate_frozen_protected_content(
+    protocol: Mapping[str, Any], *, source_reader=None,
+) -> None:
+    revision = protocol.get("subject_runtime_semantic_reference")
+    if revision != SUBJECT_RUNTIME_REFERENCE:
+        raise K10ContractError("K10 frozen source revision identity mismatch")
+    bindings = _protected_content_bindings(protocol)
+    reader = source_reader or _read_frozen_source_blob
+    for relative, expected in bindings.items():
+        observed = hashlib.sha256(reader(revision, relative)).hexdigest()
+        if observed != expected:
+            raise K10ContractError(f"K10 frozen protected source mismatch: {relative}")
+
+
+def validate_live_k10_checkout(
+    protocol: Mapping[str, Any], *, root: str | Path = ROOT,
+) -> None:
+    """Fail closed unless a prospective K10 execution checkout matches frozen source."""
+    bindings = _protected_content_bindings(protocol)
+    root = Path(root).resolve()
+    for relative, expected in bindings.items():
+        path = root.joinpath(*relative.split("/"))
         if (not path.is_file() or path.is_symlink()
                 or hashlib.sha256(path.read_bytes()).hexdigest() != expected):
             raise K10ContractError(f"K10 protected runtime content mismatch: {relative}")
@@ -407,9 +559,17 @@ def _validate_protected_content(protocol: Mapping[str, Any]) -> None:
 def audit_historical_submissions(
     protocol: Mapping[str, Any] | None = None,
     inventory: Iterable[K10InventoryItem] | None = None,
+    *, source_reader=None, frozen_json_loader=None,
 ) -> dict[str, Any]:
     """Fail closed unless selected requests are absent from all disclosed sources."""
     protocol = dict(protocol or _load_json(PROTOCOL_PATH))
+    protocol_source = {
+        key: value for key, value in protocol.items()
+        if not key.startswith("validated_")
+    }
+    if (_validate_detached(protocol_source, "K10 historical-audit protocol")
+            != PROTOCOL_DIGEST):
+        raise K10ContractError("K10 historical-audit protocol identity mismatch")
     audit = protocol.get("historical_unseen_audit")
     if not isinstance(audit, Mapping):
         raise K10ContractError("K10 historical-unseen audit declaration is missing")
@@ -435,17 +595,25 @@ def audit_historical_submissions(
     declared = {"sha256:" + value for value in audit.get("prior_request_content_digests", [])}
     if historical != declared or len(historical) != 5:
         raise K10ContractError("K8 historical request-content set changed")
-    k6_protocol = _load_json(ROOT / str(audit.get("k6_protocol_path", "")))
+    revision = protocol.get("subject_runtime_semantic_reference")
+    if revision != SUBJECT_RUNTIME_REFERENCE:
+        raise K10ContractError("K10 frozen source revision identity mismatch")
+    k6_protocol_path = _validate_frozen_source_path(audit.get("k6_protocol_path"))
+    json_loader = frozen_json_loader or _load_frozen_json
+    k6_protocol = json_loader(revision, k6_protocol_path)
     exposure = k6_protocol.get("pre_run_exposure", {}).get("representative_submission_validation")
     if (not isinstance(exposure, Mapping) or exposure.get("cell_count") != 7
             or len(exposure.get("cells", [])) != 7):
         raise K10ContractError("K6 disclosed engineering exposure metadata changed")
     sources = audit.get("disclosed_source_bindings")
-    if not isinstance(sources, Mapping) or len(sources) != 6:
+    if not isinstance(sources, Mapping) or set(sources) != _DISCLOSED_SOURCE_PATHS:
         raise K10ContractError("K10 disclosed-source audit bindings are incomplete")
+    reader = source_reader or _read_frozen_source_blob
     for relative, declaration in sources.items():
-        path = ROOT / relative
-        if (not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest()
+        relative = _validate_frozen_source_path(relative)
+        if (not isinstance(declaration, Mapping)
+                or re.fullmatch(r"[0-9a-f]{64}", str(declaration.get("sha256", ""))) is None
+                or hashlib.sha256(reader(revision, relative)).hexdigest()
                 != declaration.get("sha256")):
             raise K10ContractError(f"K10 disclosed submission source changed: {relative}")
         source_digests = {"sha256:" + value for value in declaration.get("request_content_digests", [])}
@@ -469,7 +637,7 @@ def audit_historical_submissions(
 
 
 @lru_cache(maxsize=8)
-def load_k10_protocol(path: str | Path = PROTOCOL_PATH) -> dict[str, Any]:
+def _load_k10_protocol_cached(path: str) -> dict[str, Any]:
     protocol = _load_json(Path(path))
     protocol_digest = _validate_detached(protocol, "K10 protocol")
     pool_document = _load_json(CANDIDATE_POOL_PATH)
@@ -498,9 +666,9 @@ def load_k10_protocol(path: str | Path = PROTOCOL_PATH) -> dict[str, Any]:
         "selection_manifest_digest": SELECTION_MANIFEST_DIGEST,
     }:
         raise K10ContractError("K10 protocol artifact binding mismatch")
-    if protocol.get("semantic_bindings") != k6.load_k6_protocol()["semantic_bindings"]:
+    if protocol.get("semantic_bindings") != _FROZEN_SEMANTIC_BINDINGS:
         raise K10ContractError("K10 semantic bindings differ from K8/K6")
-    _validate_protected_content(protocol)
+    _validate_frozen_protected_content(protocol)
     if protocol.get("study_design") != {
         "iid_samples": False, "inventory_census": True, "runtime_seeds": False,
         "primary_cell_count": 80, "control_cell_count": 40,
@@ -542,6 +710,11 @@ def load_k10_protocol(path: str | Path = PROTOCOL_PATH) -> dict[str, Any]:
         "validated_historical_audit_digest": audit["audit_digest"],
     })
     return result
+
+
+def load_k10_protocol(path: str | Path = PROTOCOL_PATH) -> dict[str, Any]:
+    """Return a detached copy of the historically authenticated K10 protocol."""
+    return copy.deepcopy(_load_k10_protocol_cached(str(Path(path))))
 
 
 def _selected_attestation(item: K10InventoryItem, protocol: Mapping[str, Any]) -> dict[str, Any]:

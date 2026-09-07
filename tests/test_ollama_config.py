@@ -78,12 +78,14 @@ def test_make_ollama_llm_config_uses_explicit_argument_overrides():
         api_model="custom-model",
         api_base="http://ollama.example/v1",
         api_key="custom-key",
+        reasoning_effort="none",
     )
 
     assert config["api_model"] == "custom-model"
     assert config["api_base"] == "http://ollama.example/v1"
     assert config["api_key"] == "custom-key"
     assert config["api_key_list"] == ["custom-key"]
+    assert config["reasoning_effort"] == "none"
 
 
 def test_configure_ollama_agent_uses_explicit_argument_overrides():

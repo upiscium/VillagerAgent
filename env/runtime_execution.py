@@ -123,7 +123,7 @@ _CONTROL_PLANE_SOURCES = {
 _ALLOWED_ROOT_DIRECTORIES = {
     ".cache", ".opencode", ".pytest_cache", "__pycache__", "benchmarks", "cache", "configs", "data", "docs",
     "env", "external", "fix-plans", "img", "impl-plans", "logs", "model", "node_modules", "pipeline",
-    "result", "rl_env", "tests", "type_define", "visualizer",
+    "result", "results", "rl_env", "tests", "type_define", "visualizer",
 }
 # These repository/control files are explicitly tolerated at the root but are
 # not executable runtime inputs and therefore never enter the runtime digest.
