@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
-from typing import Any, ClassVar
+from typing import Any, Callable, ClassVar, Mapping
 
 from benchmarks.common.eac import (
     EffectRejected,
@@ -10,6 +10,7 @@ from benchmarks.common.eac import (
     ExactRequest,
     PermitLifecycle,
     PermitView,
+    AttemptRecord,
 )
 from benchmarks.common.eac.model import EvidenceRoot
 from benchmarks.common.eac.canonical import canonical_bytes
@@ -20,12 +21,14 @@ from benchmarks.minecraft.eac_runtime import (
 )
 from benchmarks.minecraft.k12_identity import (
     AUTHORITY_REJECTION_SCHEMA,
+    FROZEN_ARGUMENT_SPECS,
     evidence_root_digest,
     exact_request_digest,
     exact_request_view,
     request_content_placeholder,
     sha256_identity,
 )
+from benchmarks.minecraft.k12_request import request_content_digest
 
 
 class K12AuthorityAdapterError(RuntimeError):
@@ -115,6 +118,113 @@ class AdvisoryBaseline:
     would_block: bool
 
 
+@dataclass(frozen=True, slots=True)
+class AdvisoryEvidence:
+    """The complete, typed K12 advisory observation and execution evidence."""
+    runtime: MinecraftEACRuntime
+    prepared: MinecraftPreparedAction
+    original_request: ExactRequest
+    original_request_digest: str
+    original_content_digest: str
+    evidence_root: EvidenceRoot
+    superseding_root: EvidenceRoot
+    evaluation: EpistemicAdmissibility
+    would_block: bool
+    attempt: AttemptRecord
+    native_entry_count: int
+    native_result: Any
+
+    @property
+    def candidate_id(self) -> str:
+        return self.original_request.candidate_id
+
+    @property
+    def attempt_id(self) -> str:
+        return self.attempt.attempt_id
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorityRecoveryEvidence:
+    """Public K12 evidence for stale rejection followed by semantic recovery."""
+    runtime: MinecraftEACRuntime
+    original: ControlledStaleEvidence
+    rejection: AuthorityRejectionV1
+    original_request: ExactRequest
+    original_request_digest: str
+    original_content_digest: str
+    recovery_request: ExactRequest
+    recovery_request_digest: str
+    recovery_content_digest: str
+    recovery_evidence_root: EvidenceRoot
+    recovery_evaluation: EpistemicAdmissibility
+    recovery_permit: PermitView
+    recovery_attempt: AttemptRecord
+    native_entry_count: int
+    native_result: Any
+
+    @property
+    def original_permit(self) -> PermitView:
+        return self.original.retained_permit
+
+    @property
+    def original_evaluation(self) -> EpistemicAdmissibility:
+        return self.original.evaluation_before
+
+    @property
+    def original_permit_id(self) -> str:
+        return self.original.retained_permit.permit_id
+
+    @property
+    def recovery_permit_id(self) -> str:
+        return self.recovery_permit.permit_id
+
+    @property
+    def original_candidate_id(self) -> str:
+        return self.original_request.candidate_id
+
+    @property
+    def recovery_candidate_id(self) -> str:
+        return self.recovery_request.candidate_id
+
+    @property
+    def original_attempt_id(self) -> str:
+        return self.original_request.attempt_id
+
+    @property
+    def recovery_attempt_id(self) -> str:
+        return self.recovery_request.attempt_id
+
+    @property
+    def original_native_entry_count(self) -> int:
+        return self.original.native_entry_count
+
+
+@dataclass(slots=True)
+class PreparedAuthorityRecovery:
+    runtime: MinecraftEACRuntime
+    original: ControlledStaleEvidence
+    rejection: AuthorityRejectionV1
+    prepared: MinecraftPreparedAction
+    recovery_evidence_root: EvidenceRoot
+    recovery_evaluation: EpistemicAdmissibility
+    entries: list[dict[str, Any]]
+
+
+@dataclass(slots=True)
+class StagedAuthorityRecovery:
+    runtime: MinecraftEACRuntime
+    original: ControlledStaleEvidence
+    rejection: AuthorityRejectionV1
+    preview_request: ExactRequest
+    recovery_evidence_root: EvidenceRoot
+    alternative: dict[str, Any]
+    entries: list[dict[str, Any]]
+
+
+def _content_digest(request: ExactRequest, actor_id: str) -> str:
+    return request_content_placeholder(request, actor_id=actor_id)[1]
+
+
 def _request_identity(value: dict[str, Any]) -> str:
     # UTF-8 canonical JSON is immutable and retains the complete public view.
     return canonical_bytes(value).decode("utf-8")
@@ -130,7 +240,7 @@ def project_stale_rejection(evidence: ControlledStaleEvidence) -> AuthorityRejec
         raise K12AuthorityAdapterError("typed controlled evidence is required")
     collector = evidence.collector
     if (not isinstance(collector, ControlledEACAdapter)
-            or collector._trusted_commitments != (
+            or collector.trusted_commitments != (
                 evidence.seal,
                 evidence.evidence_root_commitment,
                 evidence.superseding_root_commitment,
@@ -226,7 +336,9 @@ def project_stale_rejection(evidence: ControlledStaleEvidence) -> AuthorityRejec
         raise K12AuthorityAdapterError("attempt snapshot does not belong to the retained runtime")
 
     request_view = exact_request_view(request)
-    content_schema, content_digest, scientific = request_content_placeholder(request)
+    content_schema, content_digest, scientific = request_content_placeholder(
+        request, actor_id=actor_id,
+    )
     values = {
         "runtime_identity": RUNTIME_ID,
         "mode": evidence.runtime.mode,
@@ -268,11 +380,36 @@ def project_stale_rejection(evidence: ControlledStaleEvidence) -> AuthorityRejec
 
 
 class ControlledEACAdapter:
-    """Run the one controlled stale case through unchanged public EAC APIs."""
+    """Run bounded K12 cases through unchanged public EAC APIs.
 
-    def __init__(self, *, run_id: str = "k12-gate557-authority") -> None:
+    The defaults intentionally reproduce the Gate-557 MineBlock fixture.  All
+    variation is data-only: the runtime and its gateway are never replaced.
+    """
+
+    def __init__(self, *, run_id: str = "k12-gate557-authority",
+                 actor: str = "Alice", actor_id: str | None = None,
+                 action: str = "MineBlock", action_name: str | None = None,
+                 runtime_kwargs: Mapping[str, Any] | None = None,
+                 tool_kwargs: Mapping[str, Any] | None = None,
+                  kwargs: Mapping[str, Any] | None = None,
+                  observation_arguments: Mapping[str, Any] | None = None,
+                  alternative_tool_kwargs: Mapping[str, Any] | None = None,
+                  native_callback: Callable[..., Any] | None = None) -> None:
         self.run_id = run_id
-        self._trusted_commitments: tuple[Any, str, str] | None = None
+        self.actor = actor_id if actor_id is not None else actor
+        self.action = action_name if action_name is not None else action
+        if self.action not in {"MineBlock", "placeBlock", "navigateTo", "attackTarget", "handoverBlock"}:
+            raise ValueError("unknown K12 action")
+        supplied = tool_kwargs if tool_kwargs is not None else kwargs
+        self._tool_kwargs = dict(supplied) if supplied is not None else self._default_kwargs(self.action)
+        self._tool_kwargs["player_name"] = self.actor
+        self._observation_arguments = dict(observation_arguments or self._tool_kwargs)
+        self._observation_arguments["player_name"] = self.actor
+        self._alternative_tool_kwargs = (dict(alternative_tool_kwargs)
+                                         if alternative_tool_kwargs is not None else None)
+        self._runtime_kwargs = dict(runtime_kwargs or {})
+        self._native_callback = native_callback
+        self.trusted_commitments: tuple[Any, str, str] | None = None
 
     @staticmethod
     def _kwargs() -> dict[str, Any]:
@@ -281,22 +418,47 @@ class ControlledEACAdapter:
             "emotion": [], "murmur": "",
         }
 
+    @staticmethod
+    def _default_kwargs(action: str) -> dict[str, Any]:
+        values = {
+            "MineBlock": {"x": 1, "y": 2, "z": 3, "emotion": [], "murmur": ""},
+            "placeBlock": {"x": 1, "y": 2, "z": 3, "item_name": "stone", "facing": "east"},
+            "navigateTo": {"x": 4, "y": 2, "z": 3},
+            "attackTarget": {"target_name": "zombie", "emotion": ["😢"], "murmur": ""},
+            "handoverBlock": {"target_player_name": "Bob", "item_name": "stone", "item_count": 1},
+        }
+        return dict(values[action])
+
+    def _runtime(self, mode: str, run_id: str | None = None) -> MinecraftEACRuntime:
+        options = dict(self._runtime_kwargs)
+        if "mode" in options and options["mode"] != mode:
+            raise ValueError("runtime_kwargs mode conflicts with controlled flow")
+        if "run_id" in options and run_id is not None and options["run_id"] != run_id:
+            raise ValueError("runtime_kwargs run_id conflicts with controlled flow")
+        options.setdefault("mode", mode)
+        options.setdefault("run_id", run_id or self.run_id)
+        options.setdefault("env_prechecks", {self.action: lambda unused: True})
+        options.setdefault("sec_prechecks", {self.action: lambda unused: True})
+        return MinecraftEACRuntime(**options)
+
+    def _native(self, entries: list[dict[str, Any]]) -> Callable[..., Any]:
+        callback = self._native_callback
+        def native(**call_kwargs: Any) -> Any:
+            entries.append(dict(call_kwargs))
+            if callback is not None:
+                return callback(**dict(call_kwargs))
+            return {"status": True}
+        return native
+
     def collect(self) -> ControlledStaleEvidence:
         native_entries: list[dict[str, Any]] = []
-        runtime = MinecraftEACRuntime(
-            mode="dual_dag_authority",
-            run_id=self.run_id,
-            env_prechecks={"MineBlock": lambda unused: True},
-        )
+        runtime = self._runtime("dual_dag_authority")
+        observation = dict(self._observation_arguments)
+        observation.pop("player_name", None)
         positive = runtime.ingest_target_observation(
-            "Alice", "MineBlock", {"x": 1, "y": 2, "z": 3}, revision=1,
+            self.actor, self.action, observation, revision=1,
         )
-
-        def native(**kwargs: Any) -> dict[str, Any]:
-            native_entries.append(dict(kwargs))
-            return {"status": True}
-
-        prepared = runtime.prepare_tool("MineBlock", native, (), self._kwargs())
+        prepared = runtime.prepare_tool(self.action, self._native(native_entries), (), self._tool_kwargs)
         request, permit, gateway = prepared.request, prepared.permit, prepared.gateway
         if not isinstance(permit, PermitView):
             raise K12AuthorityAdapterError("authority preparation did not issue a permit")
@@ -304,7 +466,7 @@ class ControlledEACAdapter:
         permit_before = permit
         attempts_before = runtime.authority.attempt_snapshot()
         negative = runtime.ingest_actor_record(
-            actor_id="Alice",
+            actor_id=self.actor,
             proposition=replace(positive.proposition, polarity=False),
             record_type="direct_observation",
             source="minecraft-k12-controlled-visible-invalidation",
@@ -324,7 +486,7 @@ class ControlledEACAdapter:
         old_commitment = evidence_root_digest(positive)
         new_commitment = evidence_root_digest(negative)
         seal = object()
-        self._trusted_commitments = (seal, old_commitment, new_commitment)
+        self.trusted_commitments = (seal, old_commitment, new_commitment)
         return ControlledStaleEvidence(
             collector=self,
             seal=seal,
@@ -349,6 +511,151 @@ class ControlledEACAdapter:
 
     def run(self) -> AuthorityRejectionV1:
         return project_stale_rejection(self.collect())
+
+    def _alternative_kwargs(self) -> dict[str, Any]:
+        if self._alternative_tool_kwargs is not None:
+            values = dict(self._alternative_tool_kwargs)
+            values["player_name"] = self.actor
+            return values
+        values = dict(self._tool_kwargs)
+        alternatives = {
+            "MineBlock": {"x": 4, "y": 2, "z": 3},
+            "placeBlock": {"x": 4, "y": 2, "z": 3, "facing": "west"},
+            "navigateTo": {"x": 8, "y": 2, "z": 3},
+            "attackTarget": {"target_name": "skeleton"},
+            "handoverBlock": {"target_player_name": "villager2"},
+        }
+        values.update(alternatives[self.action])
+        values["player_name"] = self.actor
+        return values
+
+    def collect_advisory(self) -> AdvisoryEvidence:
+        entries: list[dict[str, Any]] = []
+        runtime = self._runtime("dual_dag_advisory", "k12-gate557-advisory")
+        observation = dict(self._observation_arguments)
+        observation.pop("player_name", None)
+        root = runtime.ingest_target_observation(self.actor, self.action, observation, revision=1)
+        prepared = runtime.prepare_tool(self.action, self._native(entries), (), self._tool_kwargs)
+        negative = runtime.ingest_actor_record(
+            actor_id=self.actor, proposition=replace(root.proposition, polarity=False),
+            record_type="direct_observation", source="minecraft-k12-controlled-visible-invalidation",
+            revision=2, supersedes=(root.root_id,),
+        )
+        result = runtime.execute_prepared(prepared)
+        attempts = runtime.authority.attempt_snapshot()
+        matching = tuple(item for item in attempts if item.attempt_id == prepared.request.attempt_id)
+        if len(matching) != 1 or len(entries) != 1:
+            raise K12AuthorityAdapterError("advisory execution did not retain one AttemptRecord and native entry")
+        decision = runtime.authority.evaluate(prepared.request.candidate_id)
+        return AdvisoryEvidence(
+            runtime=runtime, prepared=prepared, original_request=prepared.request,
+            original_request_digest=exact_request_digest(prepared.request),
+            original_content_digest=_content_digest(prepared.request, self.actor),
+            evidence_root=root, superseding_root=negative, evaluation=decision,
+            would_block=bool(matching[0].would_block), attempt=matching[0],
+            native_entry_count=len(entries), native_result=result,
+        )
+
+    def run_advisory(self) -> AdvisoryEvidence:
+        return self.collect_advisory()
+
+    def prepare_authority_recovery(self) -> PreparedAuthorityRecovery:
+        original = self.collect()
+        rejection = project_stale_rejection(original)
+        return self.prepare_recovery(original, rejection)
+
+    def stage_recovery(self, original: ControlledStaleEvidence,
+                       rejection: AuthorityRejectionV1) -> StagedAuthorityRecovery:
+        if rejection != project_stale_rejection(original):
+            raise K12AuthorityAdapterError("recovery rejection is not bound to original evidence")
+        runtime = original.runtime
+        alternative = self._alternative_kwargs()
+        action_view = exact_request_view(original.retained_request)["action"]
+        semantic_arguments = {
+            name: alternative[name]
+            for name in FROZEN_ARGUMENT_SPECS[self.action]
+            if name in alternative
+        }
+        alternative_content = request_content_digest(
+            self.actor, action_view, semantic_arguments, semantic_arguments,
+        )
+        if alternative_content == rejection.request_content_digest:
+            raise K12AuthorityAdapterError("recovery request repeats rejected semantic content")
+        visible = dict(alternative)
+        visible.pop("player_name", None)
+        recovery_root = runtime.ingest_target_observation(self.actor, self.action, visible, revision=3)
+        entries: list[dict[str, Any]] = []
+        classification = runtime.classification_for(self.action)
+        arguments = runtime.bind_tool_arguments(self._native(entries), (), alternative)
+        arguments.pop("player_name", None)
+        proposition = runtime._proposition(classification, arguments)
+        unused_definition, action, unused_epre, unused_ref, unused_declared = runtime._definitions(
+            classification, proposition)
+        candidate_id = f"{runtime.run_id}:{runtime._sequence + 1}:{self.action}"
+        preview = ExactRequest(
+            candidate_id, candidate_id + ":attempt", action,
+            tuple((key, value) for key, value in arguments.items()),
+            target={key: arguments[key] for key in classification["argument_fields"]
+                    if key in arguments},
+        )
+        return StagedAuthorityRecovery(runtime, original, rejection, preview, recovery_root,
+                                       alternative, entries)
+
+    def issue_recovery(self, staged: StagedAuthorityRecovery) -> PreparedAuthorityRecovery:
+        if not isinstance(staged, StagedAuthorityRecovery):
+            raise K12AuthorityAdapterError("staged recovery is required")
+        runtime, original, rejection = staged.runtime, staged.original, staged.rejection
+        if runtime is not original.runtime or rejection != project_stale_rejection(original):
+            raise K12AuthorityAdapterError("staged recovery binding changed")
+        prepared = runtime.prepare_tool(self.action, self._native(staged.entries), (), staged.alternative)
+        if prepared.request != staged.preview_request:
+            raise K12AuthorityAdapterError("issued recovery differs from parent-staged request")
+        permit = prepared.permit
+        if not isinstance(permit, PermitView) or permit.lifecycle is not PermitLifecycle.ISSUED:
+            raise K12AuthorityAdapterError("recovery preparation did not issue a fresh permit")
+        if prepared.request == original.retained_request:
+            raise K12AuthorityAdapterError("recovery request is not semantically novel")
+        evaluation = runtime.authority.evaluate(prepared.request.candidate_id)
+        if evaluation.admissible is not True:
+            raise K12AuthorityAdapterError("recovery request is not admissible")
+        return PreparedAuthorityRecovery(runtime, original, rejection, prepared,
+                                         staged.recovery_evidence_root, evaluation, staged.entries)
+
+    def prepare_recovery(self, original: ControlledStaleEvidence,
+                         rejection: AuthorityRejectionV1) -> PreparedAuthorityRecovery:
+        return self.issue_recovery(self.stage_recovery(original, rejection))
+
+    def execute_authority_recovery(self, recovery: PreparedAuthorityRecovery) -> AuthorityRecoveryEvidence:
+        runtime, original, rejection, prepared = (
+            recovery.runtime, recovery.original, recovery.rejection, recovery.prepared)
+        permit = prepared.permit
+        if not isinstance(permit, PermitView):
+            raise K12AuthorityAdapterError("prepared recovery permit is invalid")
+        result = runtime.execute_prepared(prepared)
+        attempts = tuple(item for item in runtime.authority.attempt_snapshot()
+                         if item.attempt_id == prepared.request.attempt_id)
+        if len(attempts) != 1 or len(recovery.entries) != 1:
+            raise K12AuthorityAdapterError("recovery did not retain one AttemptRecord and native entry")
+        return AuthorityRecoveryEvidence(
+            runtime=runtime, original=original, rejection=rejection,
+            original_request=original.retained_request,
+            original_request_digest=exact_request_digest(original.retained_request),
+            original_content_digest=_content_digest(original.retained_request, self.actor),
+            recovery_request=prepared.request,
+            recovery_request_digest=(attempts[0].request_digest
+                                     or exact_request_digest(prepared.request)),
+            recovery_content_digest=_content_digest(prepared.request, self.actor),
+            recovery_evidence_root=recovery.recovery_evidence_root,
+            recovery_evaluation=recovery.recovery_evaluation,
+            recovery_permit=permit, recovery_attempt=attempts[0],
+            native_entry_count=len(recovery.entries), native_result=result,
+        )
+
+    def collect_authority_recovery(self) -> AuthorityRecoveryEvidence:
+        return self.execute_authority_recovery(self.prepare_authority_recovery())
+
+    def run_authority_recovery(self) -> AuthorityRecoveryEvidence:
+        return self.collect_authority_recovery()
 
     @staticmethod
     def advisory_baseline() -> AdvisoryBaseline:
@@ -381,10 +688,13 @@ def run_controlled_stale_flow() -> AuthorityRejectionV1:
 
 __all__ = [
     "AdvisoryBaseline",
+    "AdvisoryEvidence",
+    "AuthorityRecoveryEvidence",
     "AuthorityRejectionV1",
     "ControlledEACAdapter",
     "ControlledStaleEvidence",
     "K12AuthorityAdapterError",
+    "PreparedAuthorityRecovery",
     "project_stale_rejection",
     "run_controlled_stale_flow",
 ]
