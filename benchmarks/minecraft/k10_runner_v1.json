@@ -14,7 +14,7 @@
     "pairs": 60,
     "primary_cells": 80
   },
-  "detached_artifact_sha256": "c03ce1e55dbb9ff2f1afb5e8ce6b6aa7e30508f9fc1ef9b63a45d03b552f0a03",
+  "detached_artifact_sha256": "a6f6d6a6f0d2379585f66ffde8f6ba4f4177af77ee497a6f8f00bf7d5c442e1f",
   "failure_policy": {
     "cell_retry": false,
     "global_exposure_marker": ".issue511-k10-effect-boundary-started.json",
@@ -35,7 +35,7 @@
     "staging_directory": ".final.tmp"
   },
   "implementation": "benchmarks/minecraft/k10_runner.py",
-  "implementation_sha256": "2ede1bd6d6d0068d5c8960ee0fdcd15fef24ea9751cb573bb0f514b355bedab2",
+  "implementation_sha256": "dca0febba417d76029087272a36337390b6ef19039f7ec56e17bbc97bb30b96d",
   "persistence_layout_version": "minecraft-k10-run/1",
   "protocol_binding": {
     "candidate_pool_digest": "5e95279edfbd45ee258932ebfaa33ef2c1dc563273afa0b4878eb86eaf7bb2ff",

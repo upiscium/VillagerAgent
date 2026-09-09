@@ -8,6 +8,7 @@ import pytest
 
 from benchmarks.common.eac import ActionRef, ExactRequest
 from benchmarks.common.eac.canonical import canonical_bytes
+from benchmarks.minecraft import k10_protocol as k10_protocol_module
 from benchmarks.minecraft.k10_protocol import (
     CANDIDATE_POOL_DIGEST,
     CONDITIONS,
@@ -15,6 +16,8 @@ from benchmarks.minecraft.k10_protocol import (
     EXPECTED_SELECTED,
     SELECTION_MANIFEST_DIGEST,
     K10ContractError,
+    SUBJECT_RUNTIME_REFERENCE,
+    _validate_frozen_protected_content,
     aggregate_k10_results,
     audit_historical_submissions,
     build_k10_cells,
@@ -25,6 +28,7 @@ from benchmarks.minecraft.k10_protocol import (
     load_k10_protocol,
     trace_pairing_digest,
     validate_k10_trace,
+    validate_live_k10_checkout,
 )
 
 
@@ -290,6 +294,164 @@ def test_historical_unseen_audit_is_read_only_and_selected_absent():
     assert result["selected_absent"] is True and result["read_only"] is True
 
 
+def test_historical_unseen_audit_does_not_depend_on_current_disclosed_source(monkeypatch):
+    protocol = load_k10_protocol()
+    disclosed = {
+        (k10_protocol_module.ROOT / relative).resolve()
+        for relative in protocol["historical_unseen_audit"]["disclosed_source_bindings"]
+    }
+    original = Path.read_bytes
+    original_text = Path.read_text
+    current_k6_protocol = (
+        k10_protocol_module.ROOT
+        / protocol["historical_unseen_audit"]["k6_protocol_path"]
+    ).resolve()
+
+    def reject_current_disclosed_source(path):
+        if path.resolve() in disclosed:
+            raise AssertionError("historical audit read current disclosed source")
+        return original(path)
+
+    def reject_current_k6_protocol(path, *args, **kwargs):
+        if path.resolve() == current_k6_protocol:
+            raise AssertionError("historical audit read current K6 protocol")
+        return original_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_current_disclosed_source)
+    monkeypatch.setattr(Path, "read_text", reject_current_k6_protocol)
+
+    assert audit_historical_submissions(protocol)["selected_absent"] is True
+
+
+def test_historical_audit_valid_frozen_k6_protocol_passes():
+    protocol = load_k10_protocol()
+    path = protocol["historical_unseen_audit"]["k6_protocol_path"]
+    frozen = k10_protocol_module._load_frozen_json(SUBJECT_RUNTIME_REFERENCE, path)
+
+    result = audit_historical_submissions(
+        protocol, frozen_json_loader=lambda revision, relative: frozen,
+    )
+
+    assert result["selected_absent"] is True
+
+
+def test_frozen_k6_protocol_missing_and_malformed_objects_fail_closed():
+    protocol = load_k10_protocol()
+
+    def unavailable(_revision, _relative):
+        raise K10ContractError("K10 frozen source object unavailable")
+
+    with pytest.raises(K10ContractError, match="frozen source object unavailable"):
+        audit_historical_submissions(protocol, frozen_json_loader=unavailable)
+
+    def malformed(revision, relative):
+        return k10_protocol_module._load_frozen_json(
+            revision, relative, source_reader=lambda *_args: b"{not-json",
+        )
+
+    with pytest.raises(K10ContractError, match="cannot load frozen K10 JSON"):
+        audit_historical_submissions(protocol, frozen_json_loader=malformed)
+
+
+def test_frozen_k6_protocol_duplicate_key_and_non_object_fail_closed():
+    protocol = load_k10_protocol()
+
+    def duplicate(revision, relative):
+        return k10_protocol_module._load_frozen_json(
+            revision, relative, source_reader=lambda *_args: b'{"a": 1, "a": 2}',
+        )
+
+    with pytest.raises(K10ContractError, match="duplicate JSON key"):
+        audit_historical_submissions(protocol, frozen_json_loader=duplicate)
+
+    def non_object(revision, relative):
+        return k10_protocol_module._load_frozen_json(
+            revision, relative, source_reader=lambda *_args: b"[]",
+        )
+
+    with pytest.raises(K10ContractError, match="must be an object"):
+        audit_historical_submissions(protocol, frozen_json_loader=non_object)
+
+
+def test_frozen_k6_protocol_invalid_utf8_fails_closed():
+    protocol = load_k10_protocol()
+
+    def invalid_utf8(revision, relative):
+        return k10_protocol_module._load_frozen_json(
+            revision, relative, source_reader=lambda *_args: b"\xff",
+        )
+
+    with pytest.raises(K10ContractError, match="cannot load frozen K10 JSON"):
+        audit_historical_submissions(protocol, frozen_json_loader=invalid_utf8)
+
+
+def test_frozen_k6_protocol_exposure_metadata_tamper_fails():
+    protocol = load_k10_protocol()
+    path = protocol["historical_unseen_audit"]["k6_protocol_path"]
+    frozen = k10_protocol_module._load_frozen_json(SUBJECT_RUNTIME_REFERENCE, path)
+    frozen["pre_run_exposure"]["representative_submission_validation"]["cell_count"] = 8
+
+    with pytest.raises(K10ContractError, match="exposure metadata changed"):
+        audit_historical_submissions(
+            protocol, frozen_json_loader=lambda _revision, _relative: frozen,
+        )
+
+
+def test_historical_disclosed_source_blob_mismatch_and_missing_object_fail_closed():
+    protocol = load_k10_protocol()
+
+    with pytest.raises(K10ContractError, match="disclosed submission source changed"):
+        audit_historical_submissions(
+            protocol, source_reader=lambda _revision, _path: b"tampered",
+        )
+
+    def unavailable(_revision, _path):
+        raise K10ContractError("K10 frozen source object unavailable")
+
+    with pytest.raises(K10ContractError, match="frozen source object unavailable"):
+        audit_historical_submissions(protocol, source_reader=unavailable)
+
+
+def test_historical_disclosed_source_declared_hash_tamper_fails():
+    protocol = copy.deepcopy(load_k10_protocol())
+    declarations = protocol["historical_unseen_audit"]["disclosed_source_bindings"]
+    declarations[next(iter(declarations))]["sha256"] = "0" * 64
+
+    with pytest.raises(K10ContractError, match="protocol|disclosed submission source changed"):
+        audit_historical_submissions(protocol)
+
+
+def test_historical_disclosed_source_path_and_hash_substitution_fails():
+    protocol = copy.deepcopy(load_k10_protocol())
+    declarations = protocol["historical_unseen_audit"]["disclosed_source_bindings"]
+    replaced = declarations.pop(next(iter(declarations)))
+    replacement = "README.md"
+    replacement_bytes = k10_protocol_module._read_frozen_source_blob(
+        SUBJECT_RUNTIME_REFERENCE, replacement,
+    )
+    declarations[replacement] = {
+        **replaced,
+        "sha256": hashlib.sha256(replacement_bytes).hexdigest(),
+    }
+
+    with pytest.raises(K10ContractError, match="protocol.*digest|bindings are incomplete"):
+        audit_historical_submissions(protocol)
+
+
+def test_historical_disclosed_source_request_digest_substitution_fails():
+    protocol = json.loads(Path("benchmarks/minecraft/k10_protocol_v1.json").read_text())
+    declarations = protocol["historical_unseen_audit"]["disclosed_source_bindings"]
+    declaration = next(
+        value for value in declarations.values()
+        if len(value["request_content_digests"]) > 1
+    )
+    declaration["request_content_digests"] = declaration["request_content_digests"][:1]
+    protocol["detached_artifact_sha256"] = detached_digest(protocol)
+
+    with pytest.raises(K10ContractError, match="protocol identity"):
+        audit_historical_submissions(protocol)
+
+
 def test_protocol_freezes_zero_exposure_protected_content_and_reporting_separation(tmp_path):
     protocol = load_k10_protocol()
     assert protocol["zero_pre_exposure"] == {
@@ -310,6 +472,109 @@ def test_protocol_freezes_zero_exposure_protected_content_and_reporting_separati
     _write_detached(path, changed)
     with pytest.raises(K10ContractError, match="protocol identity|protected runtime content"):
         load_k10_protocol(path)
+
+
+def test_historical_validation_passes_while_modified_live_checkout_fails():
+    protocol = load_k10_protocol()
+
+    _validate_frozen_protected_content(protocol)
+    with pytest.raises(K10ContractError, match="protected runtime content mismatch"):
+        validate_live_k10_checkout(protocol)
+
+
+def test_frozen_source_blob_mismatch_and_unavailable_object_fail_closed():
+    protocol = load_k10_protocol()
+
+    with pytest.raises(K10ContractError, match="frozen protected source mismatch"):
+        _validate_frozen_protected_content(
+            protocol, source_reader=lambda _revision, _path: b"tampered",
+        )
+
+    def unavailable(_revision, _path):
+        raise K10ContractError("K10 frozen source object unavailable")
+
+    with pytest.raises(K10ContractError, match="frozen source object unavailable"):
+        _validate_frozen_protected_content(protocol, source_reader=unavailable)
+
+
+def test_frozen_source_revision_and_protected_path_tamper_fail_before_object_read():
+    protocol = copy.deepcopy(load_k10_protocol())
+    protocol["subject_runtime_semantic_reference"] = "0" * 40
+    with pytest.raises(K10ContractError, match="revision identity mismatch"):
+        _validate_frozen_protected_content(protocol, source_reader=lambda *_args: b"")
+
+    protocol["subject_runtime_semantic_reference"] = SUBJECT_RUNTIME_REFERENCE
+    bindings = protocol["protected_runtime_content_bindings"]
+    expected = bindings.pop(next(iter(bindings)))
+    bindings["../outside"] = expected
+    called = False
+
+    def reader(*_args):
+        nonlocal called
+        called = True
+        return b""
+
+    with pytest.raises(K10ContractError, match="path is invalid"):
+        _validate_frozen_protected_content(protocol, source_reader=reader)
+    assert called is False
+
+
+def test_protocol_loader_returns_detached_copy_of_cached_historical_validation():
+    first = load_k10_protocol()
+    original = first["protected_runtime_content_bindings"]["env/minecraft_client.py"]
+    first["protected_runtime_content_bindings"]["env/minecraft_client.py"] = "0" * 64
+
+    second = load_k10_protocol()
+
+    assert second["protected_runtime_content_bindings"]["env/minecraft_client.py"] == original
+
+
+def test_historical_loader_does_not_call_live_k6_loaders(monkeypatch):
+    k10_protocol_module._load_k10_protocol_cached.cache_clear()
+    k10_protocol_module._load_k10_candidate_pool_cached.cache_clear()
+    k10_protocol_module.load_k10_inventory.cache_clear()
+    monkeypatch.setattr(
+        k10_protocol_module.k6, "load_k6_protocol",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("live K6 protocol read")),
+    )
+    monkeypatch.setattr(
+        k10_protocol_module.k6, "load_k6_inventory",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("live K6 inventory read")),
+    )
+
+    assert load_k10_protocol()["subject_runtime_semantic_reference"] == SUBJECT_RUNTIME_REFERENCE
+
+
+def test_candidate_pool_loader_returns_detached_nested_data():
+    first = load_k10_candidate_pool()
+    original = first[0]["descriptor"]["arguments"].copy()
+    first[0]["descriptor"]["arguments"]["x"] = 999
+
+    second = load_k10_candidate_pool()
+
+    assert second[0]["descriptor"]["arguments"] == original
+
+
+def test_frozen_source_git_reader_disables_lazy_fetch(monkeypatch):
+    relative = "env/minecraft_client.py"
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        if "ls-tree" in command:
+            stdout = b"100644 blob " + b"a" * 40 + b"\t" + relative.encode() + b"\0"
+        else:
+            stdout = b"frozen bytes"
+        return type("Result", (), {"returncode": 0, "stdout": stdout})()
+
+    monkeypatch.setattr(k10_protocol_module.subprocess, "run", run)
+
+    assert k10_protocol_module._read_frozen_source_blob(
+        SUBJECT_RUNTIME_REFERENCE, relative,
+    ) == b"frozen bytes"
+    assert len(calls) == 2
+    assert all(call[1]["env"]["GIT_NO_LAZY_FETCH"] == "1" for call in calls)
+    assert all(call[1]["env"]["GIT_TERMINAL_PROMPT"] == "0" for call in calls)
 
 
 def test_census_has_exact_cells_families_and_sixty_pairs():

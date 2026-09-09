@@ -1,0 +1,51 @@
+{
+  "artifact_id": "minecraft-k11-p0-manifest",
+  "artifact_version": 4,
+  "validation_contract": "minecraft-k11-p0-validation-contract/3",
+  "trace_schema": "minecraft-k11-trace/3",
+  "late_cleanup_evidence_contract": "minecraft-k11-late-cleanup-evidence/1",
+  "study_phase": "K11-P0-instrumentation-validation",
+  "prevalence_inference_allowed": false,
+  "eac_identity_source": "current_immutable_checkout",
+  "admission": {
+    "same_domain": true,
+    "no_world_reset": true,
+    "world_reset": false,
+    "fail_closed": true,
+    "active_effect_at_horizon_blocks_next_run": true,
+    "post_close_effect_blocks_next_run": true,
+    "uncertainty_blocks_next_run": true
+  },
+  "observation_window": {
+    "basis": "predeclared-fixed-monotonic-horizon",
+    "horizon_seconds": 600,
+    "natural_terminal_closes_early": true,
+    "status": "development-pilot-binding-not-final-k11-freeze"
+  },
+  "runtime_hygiene": {
+    "classification": "pre-freeze-runtime-hygiene-change",
+    "change": "OpenAI-compatible mutable state is routed through run-specific RuntimePaths",
+    "affected_state": ["tokens.json", "openai.logs", "llm_inference.json", "openai.cache"],
+    "legacy_default_paths_preserved": true,
+    "legacy_cache_lookup_result_preserved": true,
+    "legacy_first_save_cache_write_preserved": false,
+    "first_save_cache_change": "A missing cache file now retains the first response consistently even when the parent cache directory already exists; the legacy implementation discarded that response in this edge state.",
+    "identity_binding": "current execution revision and generated runtime digest",
+    "scientific_disclosure": "This is a general subject-runtime hygiene change, not K11-only instrumentation; final reporting must not claim an unchanged pre-K11 audited runtime."
+  },
+  "provenance_sources": {
+    "model_configuration": "configs/minecraft/approved-experiments/minecraft-judged-production-v1.json",
+    "minecraft_target_configuration": "configs/minecraft/experiments/comparison-2026-07-20.json",
+    "note": "P0 reuses checked-in infrastructure identities only; it does not reuse judged tasks, outcomes, or semantic interventions. After the failed 2c72da1 cohort showed sustained proxy 504s, the pre-existing approved direct/internal Ollama endpoint was selected as an infrastructure-only remediation before any replacement cohort; old cohorts remain unpooled. After the failed 061307a development smoke exhausted 1024 tokens in reasoning-only output, isolated provider qualification against Ollama 0.32.0 showed that the documented reasoning_effort=none setting preserved the required JSON/tag contract at the existing token budget for controller-managed OpenAILanguageModel calls. This provider configuration change requires a new execution revision and is not pooled with prior attempts."
+  },
+  "runs": [
+    {"run_id":"K11-P0-01","runtime":{"api_model":"gemma4:12b","api_base":"http://10.255.255.5:11434","controller_reasoning_effort":"none","task_type":"none","task_idx":0,"agent_num":2,"dig_needed":false,"max_task_num":1,"task_goal":"Explore the nearby area using ordinary available tools. Move to a nearby location that your observations support, then report what you did.","host":"10.12.3.1","port":40000,"task_name":"k11_p0_01_explore_move","minecraft_dual_dag_config":{"eac_mode":"dual_dag_advisory","judged_execution":false,"production":false}}},
+    {"run_id":"K11-P0-02","runtime":{"api_model":"gemma4:12b","api_base":"http://10.255.255.5:11434","controller_reasoning_effort":"none","task_type":"none","task_idx":0,"agent_num":2,"dig_needed":false,"max_task_num":1,"task_goal":"Inspect nearby entities and terrain using ordinary tools. Navigate to a location that was exposed by your observations and summarize the result.","host":"10.12.3.1","port":40000,"task_name":"k11_p0_02_observe_navigate","minecraft_dual_dag_config":{"eac_mode":"dual_dag_advisory","judged_execution":false,"production":false}}},
+    {"run_id":"K11-P0-03","runtime":{"api_model":"gemma4:12b","api_base":"http://10.255.255.5:11434","controller_reasoning_effort":"none","task_type":"none","task_idx":0,"agent_num":2,"dig_needed":false,"max_task_num":1,"task_goal":"Work together to survey the local area. Use normal communication if useful, then move one agent toward a nearby observed entity or point and report completion.","host":"10.12.3.1","port":40000,"task_name":"k11_p0_03_cooperative_survey","minecraft_dual_dag_config":{"eac_mode":"dual_dag_advisory","judged_execution":false,"production":false}}},
+    {"run_id":"K11-P0-04","runtime":{"api_model":"gemma4:12b","api_base":"http://10.255.255.5:11434","controller_reasoning_effort":"none","task_type":"none","task_idx":0,"agent_num":2,"dig_needed":false,"max_task_num":1,"task_goal":"Observe the surroundings, choose a nearby destination justified by what you observed, navigate there through the ordinary agent loop, and report the outcome.","host":"10.12.3.1","port":40000,"task_name":"k11_p0_04_observed_destination","minecraft_dual_dag_config":{"eac_mode":"dual_dag_advisory","judged_execution":false,"production":false}}},
+    {"run_id":"K11-P0-05","runtime":{"api_model":"gemma4:12b","api_base":"http://10.255.255.5:11434","controller_reasoning_effort":"none","task_type":"none","task_idx":0,"agent_num":2,"dig_needed":false,"max_task_num":1,"task_goal":"Find something nearby that can be approached safely using your normal observations. Coordinate naturally and navigate toward it before reporting what happened.","host":"10.12.3.1","port":40000,"task_name":"k11_p0_05_find_and_approach","minecraft_dual_dag_config":{"eac_mode":"dual_dag_advisory","judged_execution":false,"production":false}}},
+    {"run_id":"K11-P0-06","runtime":{"api_model":"gemma4:12b","api_base":"http://10.255.255.5:11434","controller_reasoning_effort":"none","task_type":"none","task_idx":0,"agent_num":2,"dig_needed":false,"max_task_num":1,"task_goal":"Survey nearby entities, exchange information normally if useful, and reposition an agent to a location supported by the survey. Report the final action.","host":"10.12.3.1","port":40000,"task_name":"k11_p0_06_survey_reposition","minecraft_dual_dag_config":{"eac_mode":"dual_dag_advisory","judged_execution":false,"production":false}}},
+    {"run_id":"K11-P0-07","runtime":{"api_model":"gemma4:12b","api_base":"http://10.255.255.5:11434","controller_reasoning_effort":"none","task_type":"none","task_idx":0,"agent_num":2,"dig_needed":false,"max_task_num":1,"task_goal":"Use the ordinary agent loop to inspect the local environment and make a short movement based on current observations. Do not assume hidden world state; report what you observed and did.","host":"10.12.3.1","port":40000,"task_name":"k11_p0_07_local_inspection","minecraft_dual_dag_config":{"eac_mode":"dual_dag_advisory","judged_execution":false,"production":false}}},
+    {"run_id":"K11-P0-08","runtime":{"api_model":"gemma4:12b","api_base":"http://10.255.255.5:11434","controller_reasoning_effort":"none","task_type":"none","task_idx":0,"agent_num":2,"dig_needed":false,"max_task_num":1,"task_goal":"Collaboratively inspect nearby state using ordinary tools, select an observed destination, navigate toward it, and summarize the natural sequence of actions.","host":"10.12.3.1","port":40000,"task_name":"k11_p0_08_collaborative_navigation","minecraft_dual_dag_config":{"eac_mode":"dual_dag_advisory","judged_execution":false,"production":false}}}
+  ]
+}
