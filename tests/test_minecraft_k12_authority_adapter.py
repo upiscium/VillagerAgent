@@ -13,9 +13,10 @@ from benchmarks.minecraft.k12_authority_adapter import (
 )
 from benchmarks.minecraft.k12_identity import (
     AUTHORITY_REJECTION_SCHEMA,
-    REQUEST_CONTENT_PLACEHOLDER_SCHEMA,
+    REQUEST_CONTENT_SCHEMA,
     evidence_root_digest,
 )
+from benchmarks.minecraft.k12_fixture import K12_ACTIONS
 
 
 @pytest.fixture()
@@ -64,8 +65,8 @@ def test_projection_binds_every_required_public_identity(evidence):
     assert result.permit_fingerprint == evidence.permit_after.fingerprint
     assert result.evidence_root_id == evidence.evidence_root.root_id
     assert result.superseding_root_id == evidence.superseding_root.root_id
-    assert result.request_content_schema == REQUEST_CONTENT_PLACEHOLDER_SCHEMA
-    assert result.request_content_scientific is False
+    assert result.request_content_schema == REQUEST_CONTENT_SCHEMA
+    assert result.request_content_scientific is True
 
 
 def test_projection_digest_is_deterministic_for_identical_evidence(evidence):
@@ -193,3 +194,77 @@ def test_adapter_source_does_not_use_forbidden_private_authority_state():
     source = Path("benchmarks/minecraft/k12_authority_adapter.py").read_text(encoding="utf-8")
     for name in ("._candidates", "._permits", "._tokens", "._audit"):
         assert name not in source
+
+
+@pytest.mark.parametrize("action", K12_ACTIONS)
+def test_authority_recovery_is_semantically_new_for_each_k12_action(action):
+    calls = []
+
+    def native(**kwargs):
+        calls.append(kwargs)
+        return {"status": True, "action": action}
+
+    evidence = ControlledEACAdapter(
+        run_id=f"k12-recovery-{action}", action=action, native_callback=native,
+    ).collect_authority_recovery()
+    assert evidence.original_request != evidence.recovery_request
+    assert evidence.original_request_digest != evidence.recovery_request_digest
+    assert evidence.original_content_digest != evidence.recovery_content_digest
+    assert evidence.recovery_evaluation.admissible is True
+    assert evidence.recovery_permit.lifecycle is PermitLifecycle.ISSUED
+    assert evidence.recovery_attempt.attempt_id == evidence.recovery_request.attempt_id
+    assert evidence.native_entry_count == len(calls) == 1
+    assert evidence.native_result["status"] is True
+
+
+def test_recovery_preparation_never_enters_native_effect():
+    calls = []
+    adapter = ControlledEACAdapter(
+        action="MineBlock", native_callback=lambda **kwargs: calls.append(kwargs) or {"status": True},
+    )
+    prepared = adapter.prepare_authority_recovery()
+    assert calls == []
+    evidence = adapter.execute_authority_recovery(prepared)
+    assert len(calls) == evidence.native_entry_count == 1
+
+
+def test_parent_can_stage_exact_recovery_request_before_permit_issuance():
+    adapter = ControlledEACAdapter(action="MineBlock")
+    stale = adapter.collect()
+    original_permit = stale.runtime._last_permit["MineBlock"].permit_id
+    staged = adapter.stage_recovery(stale, project_stale_rejection(stale))
+    assert staged.runtime._last_permit["MineBlock"].permit_id == original_permit
+    prepared = adapter.issue_recovery(staged)
+    assert prepared.prepared.request == staged.preview_request
+    assert prepared.prepared.permit.permit_id == staged.runtime._last_permit["MineBlock"].permit_id
+    assert prepared.prepared.permit.permit_id != original_permit
+
+
+def test_semantically_repeated_recovery_is_rejected_before_permit_or_effect():
+    calls = []
+    original = {"x": 1, "y": 2, "z": 3, "emotion": [], "murmur": ""}
+    adapter = ControlledEACAdapter(
+        action="MineBlock", tool_kwargs=original, alternative_tool_kwargs=original,
+        native_callback=lambda **kwargs: calls.append(kwargs),
+    )
+    stale = adapter.collect()
+    with pytest.raises(K12AuthorityAdapterError, match="repeats rejected semantic content"):
+        adapter.prepare_recovery(stale, project_stale_rejection(stale))
+    assert calls == []
+
+
+@pytest.mark.parametrize("action", K12_ACTIONS)
+def test_advisory_invalidation_keeps_gateway_execution_and_records_would_block(action):
+    calls = []
+
+    def native(**kwargs):
+        calls.append(kwargs)
+        return {"status": True}
+
+    evidence = ControlledEACAdapter(
+        run_id=f"k12-advisory-{action}", action=action, native_callback=native,
+    ).collect_advisory()
+    assert evidence.prepared.request is evidence.original_request
+    assert evidence.would_block is True
+    assert evidence.attempt.attempt_id == evidence.original_request.attempt_id
+    assert evidence.native_entry_count == len(calls) == 1
