@@ -12,7 +12,8 @@ _RECORD_DOMAIN = "minecraft-k12-evidence-record/1"
 _SNAPSHOT_DOMAIN = "minecraft-k12-evidence-snapshot/1"
 EVIDENCE_KINDS = frozenset({"reset", "authority_rejection", "model_call",
                             "backend_effect", "containment", "oracle", "finalization",
-                            "campaign_stop"})
+                            "campaign_stop", "live_containment", "live_validation",
+                            "live_artifact", "live_qualification"})
 
 
 def _text(name: str, value: Any) -> str:
