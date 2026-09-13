@@ -1,0 +1,14 @@
+{
+  "schema": "minecraft-k12-live-reset-readback/1",
+  "version": "v1",
+  "acknowledgement": "en_us",
+  "identity": ["profile", "campaign", "cell", "reset_token", "generation"],
+  "operations": ["forceload_add", "forceload_query", "gamerule", "actor_exists", "tp", "clear_all", "clear", "give", "count", "setblock", "if_block", "pos", "inventory", "cardinality", "uuid", "health", "kill_score", "score", "objective", "objective_remove", "residual_census", "item_snbt", "kill_competing", "kill_items", "summon"],
+  "parser_identity": "minecraft-en_us-command-readback/1",
+  "result_identity": ["plan_digest", "ordinal", "command_digest", "parser_identity", "raw_sha256", "typed_value"],
+  "read_after_write": true,
+  "completeness": ["blocks", "positions", "inventories", "entities", "scoreboard", "residual"],
+  "raw_digest": "sha256(raw_reply)",
+  "detached_artifact_sha256": "1494403bdeee4b60c38f09089a643226e198cce06093e6d8c7dcbe146f12c523",
+  "fail_closed": ["malformed", "ambiguous", "stale", "partial", "wrong_acknowledgement", "wrong_binding"]
+}
