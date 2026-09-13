@@ -3,7 +3,12 @@ import threading
 import pytest
 
 from pipeline.agent import BaseAgent
-from env.minecraft_client import MinecraftActionLogError, MinecraftToolTimeoutError
+from env.minecraft_client import (
+    MinecraftActionLogError,
+    MinecraftToolEffectUnknownError,
+    MinecraftToolTimeoutError,
+    ToolActionBlockedError,
+)
 from model.vllm_model import VLLMLanguageModel
 from type_define.graph import Task
 
@@ -180,6 +185,96 @@ def test_base_agent_normal_step_does_not_retry_action_log_failure(monkeypatch):
 
     assert env.step_calls == 1
     assert sleep_calls == []
+
+
+@pytest.mark.parametrize("error", [
+    ToolActionBlockedError("admission closed"),
+    MinecraftToolEffectUnknownError("effect unknown"),
+])
+def test_base_agent_normal_step_does_not_retry_non_retryable_tool_outcomes(error, monkeypatch):
+    env = FakeEnv()
+    agent = BaseAgent(llm=object(), env=env, data_manager=FakeDataManager(),
+                      name="Alice", silent=True)
+    task = Task("Place block", {})
+    task._agent = ["Alice"]
+    sleeps = []
+
+    def fail_once(*_args, **_kwargs):
+        env.step_calls += 1
+        raise error
+
+    env.step = fail_once
+    monkeypatch.setattr("pipeline.agent.time.sleep", sleeps.append)
+    with pytest.raises(type(error), match=str(error)):
+        agent.normal_step(task)
+    assert env.step_calls == 1
+    assert sleeps == []
+
+
+def test_normal_step_cancelled_before_env_step_returns_canonical_detail():
+    cancellation = threading.Event()
+    cancellation.set()
+    agent, task, _llm, dm = make_local_agent([])
+
+    feedback, detail = agent.normal_step(task, cancellation_token=cancellation)
+
+    assert feedback["status"] is False
+    assert detail["failure"]["reason"] == "cancelled"
+    assert detail["failure"]["cancellation_acknowledged"] is True
+    assert detail["failure"]["phase"] == "before_env_step"
+    assert agent.env.step_calls == 0
+    assert dm.updated == []
+
+
+def test_normal_step_cancelled_after_env_step_has_no_status_or_database_side_effects():
+    cancellation = threading.Event()
+
+    class CancelAfterStepEnv(FakeEnv):
+        def step(self, name, task_prompt, **kwargs):
+            result = super().step(name, task_prompt)
+            cancellation.set()
+            return result
+
+    env = CancelAfterStepEnv()
+    dm = FakeDataManager()
+    agent = BaseAgent(llm=object(), env=env, data_manager=dm, name="Alice", silent=True)
+    task = Task("Inspect area", {})
+    task._agent = ["Alice"]
+
+    feedback, detail = agent.normal_step(task, cancellation_token=cancellation)
+
+    assert feedback["status"] is False
+    assert detail["failure"]["reason"] == "cancelled"
+    assert detail["failure"]["phase"] == "after_env_return"
+    assert env.agent_status_calls == 0
+    assert dm.updated == []
+
+
+def test_normal_step_retry_wait_is_cancellation_aware_and_does_not_call_env_again():
+    cancellation = threading.Event()
+    env = FakeEnv(failures_before_success=3)
+    dm = FakeDataManager()
+    agent = BaseAgent(llm=object(), env=env, data_manager=dm, name="Alice", silent=True)
+    task = Task("Inspect area", {})
+    task._agent = ["Alice"]
+
+    def cancel_during_wait(_token, _timeout):
+        cancellation.set()
+        return True
+
+    # The production wait helper is intentionally replaced only to make the
+    # cancellation boundary deterministic and avoid wall-clock sleeps.
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("pipeline.agent.wait_for_agent_cancellation", cancel_during_wait)
+    try:
+        feedback, detail = agent.normal_step(task, cancellation_token=cancellation)
+    finally:
+        monkeypatch.undo()
+
+    assert env.step_calls == 1
+    assert feedback["status"] is False
+    assert detail["failure"]["reason"] == "cancelled"
+    assert dm.updated == []
 
 
 def test_local_step_records_minecraft_timeout_as_retry_unsafe():
@@ -396,7 +491,7 @@ def test_base_agent_rejects_ambiguous_local_budget_configuration(config, message
         make_local_agent([], **config)
 
 
-def test_step_rejects_cancellation_token_for_non_local_path():
+def test_step_accepts_cancellation_token_for_non_local_path():
     env = FakeEnv()
     agent = BaseAgent(
         llm=object(),
@@ -407,9 +502,12 @@ def test_step_rejects_cancellation_token_for_non_local_path():
     )
     task = Task("Inspect area", {"document": "public"})
 
-    with pytest.raises(ValueError, match="only supported for local VLLM"):
-        agent.step(task, cancellation_token=threading.Event())
+    cancellation = threading.Event()
+    cancellation.set()
+    feedback, detail = agent.step(task, cancellation_token=cancellation)
 
+    assert feedback["status"] is False
+    assert detail["failure"]["reason"] == "cancelled"
     assert env.step_calls == 0
 
 

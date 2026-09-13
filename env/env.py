@@ -1,5 +1,6 @@
 from env.minecraft_client import (
     Agent,
+    check_agent_cancellation,
     MinecraftActionLogError,
     MinecraftBridgeCleanupError,
 )
@@ -14,7 +15,9 @@ import time
 import os
 from env.utils import init_logger
 import logging
+import inspect
 from pathlib import Path
+from langchain_core.pydantic_v1 import BaseModel
 
 from env.runtime_paths import RuntimePaths, atomic_write_json, read_json_artifact
 from env.runtime_execution import RuntimeExecution
@@ -100,6 +103,10 @@ class VillagerBench:
           
     @contextmanager
     def run(self, server_debug: bool = False, fast_api=False):
+        self.runtime_failure_chain = None
+        self.runtime_cleanup_failure = None
+        primary_error = None
+        primary_traceback = None
         try:
             if not self._virtual_debug:
                 self.launch(debug=server_debug, fast_api=fast_api)
@@ -108,13 +115,18 @@ class VillagerBench:
                 self.logger.info("[virtual debug mode, env not launched]")
             self.launch_time = time.time()
             yield
-        except Exception as e:
+        except BaseException as e:
             tb = traceback.format_exc()
             self.logger.error(f"Exception occurred: {e}\n{tb}")
+            primary_error = e
+            primary_traceback = e.__traceback__
+
+        cleanup_error = None
+        try:
             self.stop()
-            raise
+        except Exception as error:
+            cleanup_error = error
         finally:
-            self.stop()
             paths = self._paths()
             state_result = read_json_artifact(paths.state)
             if state_result.state == "valid" and isinstance(state_result.value, dict):
@@ -124,11 +136,50 @@ class VillagerBench:
             if paths.env_cache.exists():
                 atomic_write_json(paths.env_cache, [])
 
+        if primary_error is not None:
+            if isinstance(cleanup_error, Exception):
+                cleanup_failure = {
+                    "error_type": type(cleanup_error).__name__,
+                }
+                if isinstance(cleanup_error, MinecraftBridgeCleanupError):
+                    cleanup_failure["cleanup_result"] = dict(
+                        cleanup_error.cleanup_result
+                    )
+                self.runtime_cleanup_failure = cleanup_failure
+                self.runtime_failure_chain = {
+                    "primary_failure": {
+                        "error_type": type(primary_error).__name__,
+                    },
+                    "cleanup_failure": cleanup_failure,
+                }
+                try:
+                    setattr(primary_error, "cleanup_error", cleanup_error)
+                    setattr(primary_error, "cleanup_failure", cleanup_failure)
+                except (AttributeError, TypeError):
+                    pass
+                raise primary_error.with_traceback(primary_traceback) from cleanup_error
+            raise primary_error.with_traceback(primary_traceback)
+        if cleanup_error is not None:
+            if isinstance(cleanup_error, Exception):
+                cleanup_failure = {
+                    "error_type": type(cleanup_error).__name__,
+                }
+                if isinstance(cleanup_error, MinecraftBridgeCleanupError):
+                    cleanup_failure["cleanup_result"] = dict(
+                        cleanup_error.cleanup_result
+                    )
+                self.runtime_cleanup_failure = cleanup_failure
+                self.runtime_failure_chain = {
+                    "primary_failure": None,
+                    "cleanup_failure": cleanup_failure,
+                }
+            raise cleanup_error
+
     def stop(self):
         if self.bridge_cleanup_result is not None:
             return self.bridge_cleanup_result
         if not self.running:
-            return {"processes": {}, "cleanup_complete": True}
+            return Agent.empty_bridge_cleanup_result()
         try:
             self.bridge_cleanup_result = Agent.kill()
             return self.bridge_cleanup_result
@@ -138,6 +189,12 @@ class VillagerBench:
             raise
         finally:
             self.running = False
+
+    def cancel_active_movements(self, actor_names=None, *, reason="controller_shutdown",
+                                timeout_seconds=None):
+        return Agent.cancel_active_movements(
+            actor_names, reason=reason, total_timeout_seconds=timeout_seconds,
+        )
 
     def virtual_env(name: str):
         env = {
@@ -350,11 +407,49 @@ class VillagerBench:
         return [self._guard_tool_action(tool, actor_name=actor_name) for tool in tools
                 if runtime.supports_tool(getattr(tool, "name", ""))]
 
+    @staticmethod
+    def _copy_tool_for_guard(tool):
+        """Copy the tool's callable binding before installing an actor wrapper.
+
+        LangChain's Pydantic-v1 tools implement ``__copy__`` by sharing their
+        internal ``__dict__``.  Assigning ``func`` on such a shallow copy also
+        mutates the raw tool and every earlier actor copy, creating nested
+        cross-actor guards.  Split the Pydantic-v1 instance bookkeeping while
+        intentionally retaining immutable schemas and callback configuration.
+        """
+        guarded_tool = copy(tool)
+        if guarded_tool is tool:
+            raise RuntimeError("Minecraft guarded tool must support independent copying")
+        source_state = getattr(tool, "__dict__", None)
+        if source_state is not None and getattr(guarded_tool, "__dict__", None) is source_state:
+            # Pydantic-v1's __copy__ returns a distinct model object but reuses
+            # this mapping.  Split only the object state; callback/schema
+            # objects remain intentionally shared and immutable here.
+            if not isinstance(tool, BaseModel):
+                raise RuntimeError("Minecraft guarded tool copy shares unsupported mutable state")
+            object.__setattr__(guarded_tool, "__dict__", source_state.copy())
+            fields_set = getattr(tool, "__fields_set__", None)
+            if isinstance(fields_set, set):
+                object.__setattr__(guarded_tool, "__fields_set__", fields_set.copy())
+            constructor_state = getattr(tool, "_lc_kwargs", None)
+            if isinstance(constructor_state, dict):
+                object.__setattr__(guarded_tool, "_lc_kwargs", constructor_state.copy())
+        return guarded_tool
+
+    @staticmethod
+    def _set_tool_func(tool, function) -> None:
+        tool.func = function
+        constructor_state = getattr(tool, "_lc_kwargs", None)
+        if isinstance(constructor_state, dict):
+            constructor_state["func"] = function
+
     def _guard_tool_action(self, tool, *, actor_name: str | None = None):
         original = getattr(tool, "func", None)
         if not callable(original):
+            if getattr(self, "_eac_runtime", None) is not None:
+                raise RuntimeError("Minecraft EAC guarded tool requires callable func")
             return tool
-        guarded_tool = copy(tool)
+        guarded_tool = self._copy_tool_for_guard(tool)
 
         @wraps(original)
         def guarded(*args, **kwargs):
@@ -370,18 +465,51 @@ class VillagerBench:
             finally:
                 self._tool_action_exit()
 
-        guarded_tool.func = guarded
+        self._set_tool_func(guarded_tool, guarded)
         return guarded_tool
 
+    def _cancellation_tools(self, tools, cancellation_token, phase_callback):
+        """Make invocation-local gates without replacing the authoritative guards."""
+        if cancellation_token is None:
+            return tools
+        wrapped = []
+        for tool in tools:
+            invocation_tool = self._copy_tool_for_guard(tool)
+            original = getattr(tool, "func", None)
+            if not callable(original):
+                wrapped.append(invocation_tool)
+                continue
+            @wraps(original)
+            def gated(*args, _original=original, **kwargs):
+                check_agent_cancellation(cancellation_token, phase="before_tool_guard")
+                if callable(phase_callback):
+                    phase_callback("tool_start")
+                result = _original(*args, **kwargs)
+                if callable(phase_callback):
+                    phase_callback("tool_end")
+                check_agent_cancellation(cancellation_token, phase="after_tool_return")
+                return result
+            self._set_tool_func(invocation_tool, gated)
+            wrapped.append(invocation_tool)
+        return wrapped
+
     def launch(self, debug: bool = False, fast_api=False):
-        Agent.launch(
-            host=self.host,
-            port=self.port,
-            debug=debug,
-            fast=fast_api,
-            runtime_paths=self.runtime_paths,
-            runtime_execution=self.runtime_execution,
-        )
+        try:
+            Agent.launch(
+                host=self.host,
+                port=self.port,
+                debug=debug,
+                fast=fast_api,
+                runtime_paths=self.runtime_paths,
+                runtime_execution=self.runtime_execution,
+            )
+        except BaseException:
+            try:
+                self.bridge_cleanup_result = Agent.kill()
+            except MinecraftBridgeCleanupError as cleanup_error:
+                self.bridge_cleanup_result = cleanup_error.cleanup_result
+                self.bridge_cleanup_error = cleanup_error
+            raise
         self.running = True
         self.reset()
 
@@ -544,7 +672,8 @@ class VillagerBench:
         else:
             return {"message": "env not running", "status": False}
 
-    def step(self, agent_name: str, action: str, max_turn: int = 7):
+    def step(self, agent_name: str, action: str, max_turn: int = 7,
+             cancellation_token=None, phase_callback=None):
         '''
         final_answer, {"input": response["input"], "action_list": action_list, "final_answer": final_answer}
         '''
@@ -555,7 +684,21 @@ class VillagerBench:
         find_agent = False
         for agent in self.agent_pool:
             if agent.name == agent_name:
-                feedback, detail = agent.run(action, max_iterations=max_turn)
+                check_agent_cancellation(cancellation_token, phase="before_env_step")
+                tools = self._cancellation_tools(agent.tools, cancellation_token, phase_callback)
+                run_kwargs = {"max_iterations": max_turn, "tools": tools,
+                              "cancellation_token": cancellation_token,
+                              "phase_callback": phase_callback}
+                try:
+                    parameters = inspect.signature(agent.run).parameters
+                    if not any(p.kind == inspect.Parameter.VAR_KEYWORD
+                               for p in parameters.values()):
+                        run_kwargs = {k: v for k, v in run_kwargs.items() if k in parameters}
+                except (TypeError, ValueError):
+                    pass
+                feedback, detail = agent.run(action, **run_kwargs)
+
+                check_agent_cancellation(cancellation_token, phase="after_env_step")
 
                 self.log[agent_name].append(detail)
 
@@ -603,6 +746,16 @@ class VillagerBench:
 
     def get_tool_runtime_context(self) -> dict:
         return Agent.tool_runtime_context()
+
+    def get_tool_runtime_context_snapshot(self) -> dict:
+        return Agent.tool_runtime_snapshot()
+
+    def get_minecraft_bridge_diagnostics(self) -> dict:
+        return (
+            Agent.last_bridge_diagnostics
+            if Agent.last_bridge_diagnostics is not None
+            else Agent.bridge_diagnostics_summary()
+        )
 
     def is_task_complete(self):
         if self.env_type != env_type.meta:

@@ -1,0 +1,16 @@
+{
+  "artifact_id": "minecraft-eac-k12-live-runtime-qualification",
+  "artifact_version": 1,
+  "schema_version": "minecraft-eac-k12-live-runtime-qualification/1",
+  "runtime_profile": "minecraft-k12-live-runtime-profile/1",
+  "cell_count": 15,
+  "schedule": [
+    "K12Q-S1-T1-N1-A", "K12Q-S1-T1-N1-R", "K12Q-S1-T1-N1-S",
+    "K12Q-S2-T1-N1-R", "K12Q-S2-T1-N1-S", "K12Q-S2-T1-N1-A",
+    "K12Q-S3-T1-N1-S", "K12Q-S3-T1-N1-A", "K12Q-S3-T1-N1-R",
+    "K12Q-S4-T1-N1-A", "K12Q-S4-T1-N1-S", "K12Q-S4-T1-N1-R",
+    "K12Q-S5-T1-N1-R", "K12Q-S5-T1-N1-A", "K12Q-S5-T1-N1-S"
+  ],
+  "schedule_identity": "minecraft-k12-live-runtime-qualification-schedule/1",
+  "detached_artifact_sha256": "a8b0d68a3bc577a694d181284df905d8f4ffa3e45e86ab9b1f6a458793e81109"
+}

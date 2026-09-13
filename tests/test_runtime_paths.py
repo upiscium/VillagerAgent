@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -8,20 +9,35 @@ from types import SimpleNamespace
 
 import pytest
 import requests
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from langchain.agents import tool
+from langchain_core.callbacks.manager import CallbackManager
 
 from env.env import VillagerBench, env_type
 from env.judger_artifacts import ScoreOwnershipError, TerminalArtifactWriter
 from env.minecraft_client import (
     Agent as MinecraftAgent,
+    AgentExecutionCancelledError,
+    CancellationCallbackHandler,
     MinecraftActionLogError,
     MinecraftBridgeCleanupError,
+    MinecraftToolEffectUnknownError,
     MinecraftToolTimeoutError,
     ToolActionBlockedError,
     _minecraft_request,
     timeit,
 )
 from env.runtime_paths import RuntimePaths, atomic_write_json, read_json_artifact
+from pipeline.controller_tiny import ControllerShutdownError
+from env.minecraft_bridge_diagnostics import (
+    MOVEMENT_FAILURE_REASON_HEADER,
+    MOVEMENT_TERMINAL_HEADER,
+    OUTCOME_CERTAINTY_HEADER,
+    RETRY_SAFE_HEADER,
+)
+from env.movement_http_contract import movement_effect_unknown_response
+from env.movement_runtime import MovementEffectUnknownError
 from pipeline.agent import BaseAgent
 from start_with_config import (
     RuntimeDocumentResolution,
@@ -50,6 +66,18 @@ def test_isolated_runtime_paths_stay_under_attempt_root(tmp_path):
     assert paths.recipe_hint == tmp_path / "attempt-a" / "data" / "recipe_hint.json"
     assert paths.build_map == tmp_path / "attempt-a" / "data" / "map.json"
     assert paths.map_description == tmp_path / "attempt-a" / "data" / "map_description.json"
+    assert paths.openai_log == tmp_path / "attempt-a" / "data" / "openai.logs"
+    assert paths.openai_cache == tmp_path / "attempt-a" / "cache" / "openai.cache"
+    assert paths.llm_inference == tmp_path / "attempt-a" / "data" / "llm_inference.json"
+
+
+def test_openai_artifact_paths_preserve_legacy_relative_layout(tmp_path):
+    paths = RuntimePaths.legacy(tmp_path)
+
+    assert paths.tokens == tmp_path / "data" / "tokens.json"
+    assert paths.openai_log == tmp_path / "data" / "openai.logs"
+    assert paths.openai_cache == tmp_path / ".cache" / "openai.cache"
+    assert paths.llm_inference == tmp_path / "data" / "llm_inference.json"
 
 
 def test_runtime_subprocess_environment_supports_direct_bridge_entrypoint(tmp_path):
@@ -416,12 +444,46 @@ def test_bridge_cleanup_escalates_to_bounded_kill():
     ]
     assert result["cleanup_complete"] is True
     assert result["processes"]["Alice"]["alive_after_kill"] is False
+    metadata = result["processes"]["Alice"]
+    assert metadata["pid"] == 1234
+    assert "process_group_id" in metadata
+    assert "session_id" in metadata
+    assert metadata["initial_poll"]["returncode"] is None
+    assert metadata["initial_poll"]["completed"] is True
+    assert metadata["terminate"]["attempted"] is True
+    assert metadata["terminate"]["completed"] is True
+    assert metadata["terminate_wait"]["budget_seconds"] == 0.2
+    assert metadata["terminate_wait"]["timed_out"] is True
+    assert metadata["post_terminate_poll"]["returncode"] is None
+    assert metadata["kill"]["attempted"] is True
+    assert metadata["kill"]["completed"] is True
+    assert metadata["kill_wait"]["budget_seconds"] == 0.1
+    assert metadata["kill_wait"]["completed"] is True
+    assert metadata["kill_wait"]["returncode"] == 0
+    assert metadata["final_poll"]["returncode"] == 0
+    for stage_name in (
+        "initial_poll", "terminate", "terminate_wait", "post_terminate_poll",
+        "kill", "kill_wait", "final_poll",
+    ):
+        stage = metadata[stage_name]
+        if stage["attempted"]:
+            assert isinstance(stage["elapsed_ns"], int)
+            assert stage["elapsed_ns"] >= 0
+    assert metadata["exit_code"] == 0
+    assert result["process_retention"] == {
+        "capacity": 64,
+        "retained": 1,
+        "truncated": False,
+        "dropped_count": 0,
+    }
 
 
-def test_bridge_cleanup_failure_preserves_process_mapping():
+def test_bridge_cleanup_failure_preserves_process_mapping(tmp_path):
     process = _FakeBridgeProcess(exit_on_kill=False)
     MinecraftAgent.agent_process["Alice"] = process
-    MinecraftAgent.runtime_paths_by_name["Alice"] = RuntimePaths.legacy()
+    MinecraftAgent.runtime_paths_by_name["Alice"] = RuntimePaths.isolated(
+        tmp_path / "attempt"
+    )
 
     try:
         with pytest.raises(MinecraftBridgeCleanupError) as raised:
@@ -431,11 +493,75 @@ def test_bridge_cleanup_failure_preserves_process_mapping():
         assert raised.value.cleanup_result["processes"]["Alice"]["alive_after_kill"] is True
         assert MinecraftAgent.agent_process["Alice"] is process
         assert "Alice" in MinecraftAgent.runtime_paths_by_name
+        assert MinecraftAgent._bridge_diagnostic_recorders == {}
     finally:
         MinecraftAgent.agent_process.clear()
         MinecraftAgent.runtime_paths_by_name.clear()
         MinecraftAgent.name2port.clear()
         MinecraftAgent.last_bridge_cleanup = None
+
+
+def test_bridge_cleanup_records_signal_errors_and_all_stage_timings(tmp_path):
+    class ErrorProcess(_FakeBridgeProcess):
+        def terminate(self):
+            self.calls.append("terminate")
+            raise OSError("sensitive terminate detail")
+
+        def kill(self):
+            self.calls.append("kill")
+            raise RuntimeError("sensitive kill detail")
+
+    process = ErrorProcess(exit_on_kill=False)
+    MinecraftAgent.agent_process["Alice"] = process
+    MinecraftAgent.runtime_paths_by_name["Alice"] = RuntimePaths.isolated(
+        tmp_path / "attempt"
+    )
+
+    try:
+        with pytest.raises(MinecraftBridgeCleanupError) as raised:
+            MinecraftAgent.kill(
+                terminate_grace_seconds=0.01, kill_grace_seconds=0.01,
+            )
+        metadata = raised.value.cleanup_result["processes"]["Alice"]
+        assert metadata["terminate"]["error_type"] == "OSError"
+        assert metadata["terminate"]["error_text"] == "operation_failed"
+        assert metadata["terminate_wait"]["timed_out"] is True
+        assert metadata["post_terminate_poll"]["returncode"] is None
+        assert metadata["kill"]["error_type"] == "RuntimeError"
+        assert metadata["kill"]["error_text"] == "operation_failed"
+        assert metadata["kill_wait"]["timed_out"] is True
+        assert metadata["final_poll"]["returncode"] is None
+        for stage_name in (
+            "initial_poll", "terminate", "terminate_wait",
+            "post_terminate_poll", "kill", "kill_wait", "final_poll",
+        ):
+            stage = metadata[stage_name]
+            assert stage["attempted"] is True
+            assert isinstance(stage["started_monotonic_ns"], int)
+            assert isinstance(stage["completed_monotonic_ns"], int)
+            assert isinstance(stage["elapsed_ns"], int)
+        assert "sensitive" not in str(metadata)
+        assert MinecraftAgent._bridge_diagnostic_recorders == {}
+    finally:
+        MinecraftAgent.agent_process.clear()
+        MinecraftAgent.runtime_paths_by_name.clear()
+        MinecraftAgent.name2port.clear()
+        MinecraftAgent.last_bridge_cleanup = None
+
+
+def test_tool_runtime_snapshot_marks_active_diagnostics_as_not_finalized():
+    previous = MinecraftAgent.last_bridge_diagnostics
+    MinecraftAgent.last_bridge_diagnostics = None
+    try:
+        snapshot = MinecraftAgent.tool_runtime_snapshot()
+    finally:
+        MinecraftAgent.last_bridge_diagnostics = previous
+
+    assert snapshot["snapshot_source"] == "in_memory_only"
+    assert snapshot["bridge_diagnostics"] is None
+    assert snapshot["bridge_diagnostics_state"] == (
+        "not_finalized_active_recorder_snapshot_unavailable"
+    )
 
 
 def test_environment_stop_is_idempotent_and_keeps_cleanup_result(monkeypatch):
@@ -477,6 +603,147 @@ def test_environment_stop_does_not_repeat_cleanup_failure(monkeypatch):
         environment.stop()
     assert environment.stop() is cleanup
     assert calls == [True]
+
+
+def test_environment_run_preserves_primary_error_and_attaches_cleanup_failure(tmp_path):
+    environment = object.__new__(VillagerBench)
+    environment._virtual_debug = True
+    environment.logger = logging.getLogger("test-environment-error-chain")
+    environment.runtime_paths = RuntimePaths.isolated(tmp_path / "attempt")
+    environment.runtime_paths.ensure_directories()
+    cleanup_result = {
+        "processes": {"Alice": {"alive_after_kill": True}},
+        "cleanup_complete": False,
+    }
+    cleanup_error = MinecraftBridgeCleanupError(
+        "cleanup failed", cleanup_result=cleanup_result,
+    )
+    environment.stop = lambda: (_ for _ in ()).throw(cleanup_error)
+    primary_error = RuntimeError("controller failed")
+
+    with pytest.raises(RuntimeError) as raised:
+        with environment.run():
+            raise primary_error
+
+    assert raised.value is primary_error
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.cleanup_error is cleanup_error
+    assert raised.value.cleanup_failure == {
+        "error_type": "MinecraftBridgeCleanupError",
+        "cleanup_result": cleanup_result,
+    }
+    assert environment.runtime_cleanup_failure == raised.value.cleanup_failure
+
+
+def test_controller_error_and_real_bridge_nonexit_cleanup_remain_separate(tmp_path):
+    environment = object.__new__(VillagerBench)
+    environment._virtual_debug = True
+    environment.running = True
+    environment.bridge_cleanup_result = None
+    environment.bridge_cleanup_error = None
+    environment.logger = logging.getLogger("test-controller-bridge-error-chain")
+    environment.runtime_paths = RuntimePaths.isolated(tmp_path / "attempt")
+    environment.runtime_paths.ensure_directories()
+    process = _FakeBridgeProcess(exit_on_kill=False)
+    MinecraftAgent.agent_process["Alice"] = process
+    MinecraftAgent.runtime_paths_by_name["Alice"] = environment.runtime_paths
+    primary_error = ControllerShutdownError("shutdown incomplete")
+
+    try:
+        with pytest.raises(ControllerShutdownError) as raised:
+            with environment.run():
+                raise primary_error
+
+        assert raised.value is primary_error
+        assert isinstance(raised.value.__cause__, MinecraftBridgeCleanupError)
+        chain = environment.runtime_failure_chain
+        assert chain["primary_failure"] == {
+            "error_type": "ControllerShutdownError",
+        }
+        cleanup = chain["cleanup_failure"]["cleanup_result"]
+        assert cleanup["cleanup_complete"] is False
+        assert cleanup["processes"]["Alice"]["kill_wait"]["timed_out"] is True
+        assert cleanup["processes"]["Alice"]["final_poll"]["returncode"] is None
+    finally:
+        MinecraftAgent.agent_process.clear()
+        MinecraftAgent.runtime_paths_by_name.clear()
+        MinecraftAgent.name2port.clear()
+        MinecraftAgent.last_bridge_cleanup = None
+
+
+def test_environment_run_records_generic_cleanup_failure_with_primary(tmp_path):
+    environment = object.__new__(VillagerBench)
+    environment._virtual_debug = True
+    environment.logger = logging.getLogger("test-environment-generic-cleanup")
+    environment.runtime_paths = RuntimePaths.isolated(tmp_path / "attempt")
+    environment.runtime_paths.ensure_directories()
+    cleanup_error = OSError("cleanup failed")
+    environment.stop = lambda: (_ for _ in ()).throw(cleanup_error)
+    primary_error = RuntimeError("controller failed")
+
+    with pytest.raises(RuntimeError) as raised:
+        with environment.run():
+            raise primary_error
+
+    assert raised.value is primary_error
+    assert raised.value.__cause__ is cleanup_error
+    assert environment.runtime_failure_chain == {
+        "primary_failure": {"error_type": "RuntimeError"},
+        "cleanup_failure": {"error_type": "OSError"},
+    }
+
+
+def test_environment_run_records_cleanup_only_generic_failure(tmp_path):
+    environment = object.__new__(VillagerBench)
+    environment._virtual_debug = True
+    environment.logger = logging.getLogger("test-environment-cleanup-only")
+    environment.runtime_paths = RuntimePaths.isolated(tmp_path / "attempt")
+    environment.runtime_paths.ensure_directories()
+    cleanup_error = OSError("cleanup failed")
+    environment.stop = lambda: (_ for _ in ()).throw(cleanup_error)
+
+    with pytest.raises(OSError) as raised:
+        with environment.run():
+            pass
+
+    assert raised.value is cleanup_error
+    assert environment.runtime_failure_chain == {
+        "primary_failure": None,
+        "cleanup_failure": {"error_type": "OSError"},
+    }
+
+
+def test_environment_run_cleans_up_after_base_exception(tmp_path):
+    environment = object.__new__(VillagerBench)
+    environment._virtual_debug = True
+    environment.logger = logging.getLogger("test-environment-base-exception")
+    environment.runtime_paths = RuntimePaths.isolated(tmp_path / "attempt")
+    environment.runtime_paths.ensure_directories()
+    cleanup_calls = []
+    environment.stop = lambda: cleanup_calls.append(True)
+    interrupt = KeyboardInterrupt()
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with environment.run():
+            raise interrupt
+
+    assert raised.value is interrupt
+    assert cleanup_calls == [True]
+
+
+def test_environment_run_clears_stale_failure_chain(tmp_path):
+    environment = object.__new__(VillagerBench)
+    environment._virtual_debug = True
+    environment.logger = logging.getLogger("test-environment-failure-reset")
+    environment.runtime_paths = RuntimePaths.isolated(tmp_path / "attempt")
+    environment.runtime_paths.ensure_directories()
+    environment.runtime_failure_chain = {"cleanup_failure": {"stale": True}}
+    environment.runtime_cleanup_failure = {"stale": True}
+    environment.stop = lambda: None
+
+    with environment.run():
+        assert environment.runtime_failure_chain is None
+        assert environment.runtime_cleanup_failure is None
 
 
 def test_action_log_uses_injected_paths_without_activation(tmp_path):
@@ -696,6 +963,205 @@ def test_environment_guarded_tool_does_not_run_after_barrier_rejection():
     assert calls == []
 
 
+def test_environment_step_forwards_exact_cancellation_token_and_phase_callback():
+    environment = object.__new__(VillagerBench)
+    environment.logger = SimpleNamespace(debug=lambda *_: None, info=lambda *_: None)
+    environment.agent_iteration_limit = None
+    environment.log = {"Alice": []}
+    token = threading.Event()
+    phases = []
+    observed = {}
+
+    class FakeAgent:
+        name = "Alice"
+        tools = []
+
+        def run(self, action, **kwargs):
+            observed.update(kwargs)
+            kwargs["phase_callback"]("fake_phase")
+            return "done", {"final_answer": action}
+
+    environment.agent_pool = [FakeAgent()]
+    assert environment.step("Alice", "inspect", cancellation_token=token,
+                            phase_callback=phases.append) == (
+                                "done", {"final_answer": "inspect"})
+    assert observed["cancellation_token"] is token
+    assert observed["phase_callback"] is phases.append or callable(observed["phase_callback"])
+    assert phases == ["fake_phase"]
+
+
+def test_environment_step_does_not_append_log_after_cancellation():
+    environment = object.__new__(VillagerBench)
+    environment.logger = SimpleNamespace(debug=lambda *_: None, info=lambda *_: None)
+    environment.agent_iteration_limit = None
+    environment.log = {"Alice": []}
+    token = threading.Event()
+
+    class FakeAgent:
+        name = "Alice"
+        tools = []
+
+        def run(self, _action, **kwargs):
+            token.set()
+            return "done", {"final_answer": "done"}
+
+    environment.agent_pool = [FakeAgent()]
+    with pytest.raises(AgentExecutionCancelledError) as raised:
+        environment.step("Alice", "inspect", cancellation_token=token)
+    assert raised.value.failure_detail["reason"] == "cancelled"
+    assert environment.log["Alice"] == []
+
+
+def test_invocation_local_tool_gate_blocks_before_authoritative_tool():
+    environment = object.__new__(VillagerBench)
+    token = threading.Event()
+    calls = []
+
+    @tool
+    def sample_action(value: int) -> dict:
+        """Return the supplied value."""
+        calls.append(value)
+        return {"status": True, "message": str(value)}
+
+    gated = environment._cancellation_tools([sample_action], token, None)[0]
+    token.set()
+    with pytest.raises(AgentExecutionCancelledError):
+        gated.invoke({"value": 4})
+    assert calls == []
+
+    token.clear()
+    assert gated.invoke({"value": 5})["status"] is True
+    assert calls == [5]
+
+
+def test_cancellation_callback_handler_blocks_model_and_tool_admission():
+    token = threading.Event()
+    phases = []
+    handler = CancellationCallbackHandler(token, phases.append)
+    handler.on_llm_start({}, [])
+    handler.on_tool_start({}, "input")
+    assert phases == ["model_start", "tool_start"]
+    token.set()
+    with pytest.raises(AgentExecutionCancelledError) as raised:
+        handler.on_llm_start({}, [])
+    assert raised.value.failure_detail["reason"] == "cancelled"
+    with pytest.raises(AgentExecutionCancelledError):
+        handler.on_tool_start({}, "input")
+
+    completion_phases = []
+    completion_handler = CancellationCallbackHandler(
+        token, completion_phases.append,
+    )
+    with pytest.raises(AgentExecutionCancelledError) as completed:
+        completion_handler.on_llm_end(SimpleNamespace())
+    assert completion_phases == ["model_end"]
+    assert completed.value.failure_detail["blocking_operation_termination"] == "confirmed"
+
+
+def test_langchain_callback_manager_propagates_cancellation_handler_error():
+    token = threading.Event()
+    token.set()
+    manager = CallbackManager(
+        handlers=[CancellationCallbackHandler(token)],
+    )
+
+    with pytest.raises(AgentExecutionCancelledError):
+        manager.on_llm_start({}, ["prompt"])
+
+
+def test_agent_run_installs_cancellation_handler_and_does_not_persist_after_cancel(
+    monkeypatch, tmp_path,
+):
+    token = threading.Event()
+    captured = []
+    agent = object.__new__(MinecraftAgent)
+    agent.name = "Alice"
+    agent.model = "test"
+    monkeypatch.setattr(MinecraftAgent, "api_key_list", ["test-key"])
+    agent.tools = []
+    agent.runtime_paths = RuntimePaths.isolated(tmp_path / "attempt")
+    agent.reflection_output_dir = tmp_path / "results"
+    persisted = []
+    agent._save_interaction_history = lambda *args: persisted.append("save")
+    agent.update_history = lambda *args: persisted.append("update")
+    monkeypatch.setattr(MinecraftAgent, "provider", "ollama")
+    monkeypatch.setattr("env.minecraft_client.OllamaReasoningChatOpenAI",
+                        lambda **_kwargs: object())
+
+    class FakeExecutor:
+        handle_parsing_errors = False
+
+        def __call__(self, _payload):
+            token.set()
+            return {"input": "inspect", "output": "done", "intermediate_steps": []}
+
+    def initialize(**kwargs):
+        captured.append(kwargs["callback_manager"])
+        return FakeExecutor()
+
+    monkeypatch.setattr("env.minecraft_client.initialize_agent", initialize)
+    with pytest.raises(AgentExecutionCancelledError):
+        agent.run("inspect", max_try_turn=1, cancellation_token=token)
+    assert len(captured) == 1
+    assert any(isinstance(handler, CancellationCallbackHandler)
+               for handler in captured[0].handlers)
+    assert persisted == []
+
+
+def test_agent_run_keeps_blocking_provider_active_until_it_really_returns(
+    monkeypatch, tmp_path,
+):
+    token = threading.Event()
+    started = threading.Event()
+    release = threading.Event()
+    outcome = []
+    agent = object.__new__(MinecraftAgent)
+    agent.name = "Alice"
+    agent.model = "test"
+    agent.tools = []
+    agent.runtime_paths = RuntimePaths.isolated(tmp_path / "attempt")
+    agent.reflection_output_dir = tmp_path / "results"
+    agent._save_interaction_history = lambda *_args: outcome.append("save")
+    agent.update_history = lambda *_args: outcome.append("update")
+    monkeypatch.setattr(MinecraftAgent, "api_key_list", ["test-key"])
+    monkeypatch.setattr(MinecraftAgent, "provider", "ollama")
+    monkeypatch.setattr(
+        "env.minecraft_client.OllamaReasoningChatOpenAI", lambda **_kwargs: object(),
+    )
+
+    class BlockingExecutor:
+        handle_parsing_errors = False
+
+        def __call__(self, _payload):
+            started.set()
+            assert release.wait(1)
+            return {"input": "inspect", "output": "done", "intermediate_steps": []}
+
+    monkeypatch.setattr(
+        "env.minecraft_client.initialize_agent", lambda **_kwargs: BlockingExecutor(),
+    )
+
+    def invoke():
+        try:
+            agent.run("inspect", max_try_turn=1, cancellation_token=token)
+        except BaseException as error:
+            outcome.append(error)
+
+    worker = threading.Thread(target=invoke)
+    worker.start()
+    assert started.wait(1)
+    token.set()
+    worker.join(0.05)
+    assert worker.is_alive()
+    assert outcome == []
+
+    release.set()
+    worker.join(1)
+    assert not worker.is_alive()
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], AgentExecutionCancelledError)
+
+
 def test_minecraft_agent_does_not_retry_terminal_blocked_tool(monkeypatch):
     attempts = []
     agent = object.__new__(MinecraftAgent)
@@ -846,6 +1312,56 @@ def test_minecraft_request_passes_connect_and_read_timeout(monkeypatch):
     assert calls[0][1]["timeout"] == (5.0, 30.0)
 
 
+def test_minecraft_request_preserves_explicit_bridge_effect_unknown(tmp_path, monkeypatch):
+    paths = RuntimePaths.isolated(tmp_path / "attempt")
+    atomic_write_json(paths.url_prefix, {"Alice": "http://localhost:5000"})
+    monkeypatch.setattr(MinecraftAgent, "runtime_paths_by_name", {"Alice": paths})
+    app = FastAPI()
+    app.add_exception_handler(MovementEffectUnknownError, movement_effect_unknown_response)
+
+    @app.post("/post_move_to_pos")
+    async def cleanup_unknown():
+        raise MovementEffectUnknownError(
+            "movement cleanup did not complete", reason="cleanup_timeout",
+            status_code=503, terminal=False,
+        )
+
+    response = TestClient(app).post("/post_move_to_pos")
+    assert response.status_code == 503
+    assert response.headers[OUTCOME_CERTAINTY_HEADER] == "unknown"
+    assert response.headers[RETRY_SAFE_HEADER] == "false"
+    assert response.headers[MOVEMENT_TERMINAL_HEADER] == "false"
+    assert response.headers[MOVEMENT_FAILURE_REASON_HEADER] == "cleanup_timeout"
+    monkeypatch.setattr(
+        "env.minecraft_client.requests.request", lambda *_args, **_kwargs: response,
+    )
+
+    with pytest.raises(MinecraftToolEffectUnknownError) as captured:
+        _minecraft_request("POST", "http://localhost:5000/post_move_to_pos")
+
+    assert captured.value.failure_detail == {
+        "reason": "minecraft_tool_effect_unknown",
+        "outcome_certainty": "unknown",
+        "retry_safe": False,
+        "message": "Minecraft tool outcome is unknown: post_move_to_pos",
+        "agent": "Alice",
+        "tool": "post_move_to_pos",
+        "request_id": captured.value.failure_detail["request_id"],
+        "timeout_type": "bridge_effect_unknown",
+        "status_code": 503,
+        "bridge_reason": "cleanup_timeout",
+        "coordinator_terminal": False,
+    }
+    MinecraftAgent._caller_diagnostic_recorder("Alice").flush()
+    snapshot = read_json_artifact(paths.minecraft_bridge_caller_diagnostics).value
+    events = snapshot["events"] + snapshot["critical_events"]
+    matching = [event for event in events
+                if event.get("correlation_id") == captured.value.failure_detail["request_id"]]
+    assert any(event["event_type"] == "caller_request_failed" for event in matching)
+    assert not any(event["event_type"] == "caller_request_completed" for event in matching)
+    assert all(event.get("outcome_certainty", "unknown") == "unknown" for event in matching)
+
+
 def test_minecraft_client_has_no_direct_unbounded_http_calls():
     source = (Path(__file__).resolve().parents[1] / "env" / "minecraft_client.py").read_text(
         encoding="utf-8"
@@ -856,7 +1372,11 @@ def test_minecraft_client_has_no_direct_unbounded_http_calls():
 
 
 @pytest.mark.parametrize("method_name", ["run", "step"])
-def test_minecraft_agent_does_not_retry_timed_out_tool(monkeypatch, method_name):
+@pytest.mark.parametrize("error_type", [
+    MinecraftToolTimeoutError, MinecraftToolEffectUnknownError,
+])
+def test_minecraft_agent_does_not_retry_unknown_tool_outcome(monkeypatch, method_name,
+                                                             error_type):
     attempts = []
     agent = object.__new__(MinecraftAgent)
     agent.name = "Alice"
@@ -877,14 +1397,14 @@ def test_minecraft_agent_does_not_retry_timed_out_tool(monkeypatch, method_name)
 
         def __call__(self, _input):
             attempts.append(True)
-            raise MinecraftToolTimeoutError("bridge timed out")
+            raise error_type("bridge outcome unknown")
 
     monkeypatch.setattr(
         "env.minecraft_client.initialize_agent",
         lambda **_kwargs: TimedOutExecutor(),
     )
 
-    with pytest.raises(MinecraftToolTimeoutError, match="bridge timed out"):
+    with pytest.raises(error_type, match="bridge outcome unknown"):
         getattr(agent, method_name)("move", max_try_turn=10)
     assert attempts == [True]
 

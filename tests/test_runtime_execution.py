@@ -193,6 +193,21 @@ def test_allowlisted_non_runtime_root_file_does_not_change_identity(tmp_path):
     first.verify()
 
 
+def test_allowlisted_results_directory_is_non_runtime_and_deterministic(tmp_path):
+    _minimal_default_root(tmp_path)
+    archive = tmp_path / "results" / "archived-study"
+    archive.mkdir(parents=True)
+    (archive / "evidence.json").write_text('{"status": "archived"}\n', encoding="utf-8")
+
+    first = RuntimeExecution.resolve(tmp_path)
+    second = RuntimeExecution.resolve(tmp_path)
+
+    assert second.manifest_sha256 == first.manifest_sha256
+    assert second.assets == first.assets
+    assert "results" not in first.assets
+    assert all(not asset.relative_path.startswith("results/") for asset in first.assets.values())
+
+
 def test_default_closure_identities_installed_node_dependencies(tmp_path):
     _minimal_default_root(tmp_path)
     dependency = tmp_path / "node_modules" / "mineflayer" / "index.js"

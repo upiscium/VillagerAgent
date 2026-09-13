@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "artifact_id": "minecraft-k12-recovery-validation-contract",
+  "artifact_version": 1,
+  "schema_version": "minecraft-k12-recovery-validation-contract/1",
+  "identity": {"protocol": "minecraft-eac-k12-controlled-recovery/1", "trace": "minecraft-k12-recovery-trace/1", "cell_result": "minecraft-k12-recovery-cell-result/1"},
+  "census": {"strata": ["S1", "S2", "S3", "S4", "S5"], "templates_per_stratum": 2, "seeds_per_template": 3, "triplets": 30, "ordered_cells": 90, "permutations_per_stratum": 6},
+  "admission": {"offline_only": true, "network": false, "runtime": false, "clean_reset_required": true, "no_replacement": true, "no_retry": true, "no_reconsideration": true},
+  "evaluation": {"oracle_owner": "evaluator", "planner_visible_truth": false, "finite_descriptive_analysis_only": true, "inferential_fields_forbidden": ["p_value", "confidence_interval", "standard_error", "effect_estimate", "hypothesis_test", "scientific_conclusion"]},
+  "containment": {"required": true, "failed_containment_is_infrastructure_failure": true, "blocks_next_launch": true},
+  "detached_artifact_sha256": "ad3db8f403b029acc25573706170d31125a292d24432ea34e430abcb420a60cf"
+}

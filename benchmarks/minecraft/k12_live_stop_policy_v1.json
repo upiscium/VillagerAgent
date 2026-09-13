@@ -1,0 +1,30 @@
+{
+  "artifact_id": "minecraft-k12-live-stop-policy",
+  "artifact_version": 1,
+  "identity": "minecraft-k12-live-stop-policy/1",
+  "retry": "forbidden",
+  "resume": "forbidden",
+  "replacement": "forbidden",
+  "unknown": "reject",
+  "unmapped": "reject",
+  "term_grace_seconds": 5,
+  "kill_grace_seconds": 5,
+  "consequences": {
+    "expected_stale_rejection": {"cell_disposition":"STOPPED_AFTER_REJECTION","capability":"REVOKED","campaign_stop":false,"target_quarantine":false,"result_consequence":"valid_cell"},
+    "known_objective_true": {"cell_disposition":"scientific_success","capability":"REVOKED","campaign_stop":false,"target_quarantine":false,"result_consequence":"valid_cell"},
+    "known_objective_false": {"cell_disposition":"scientific_non_success","capability":"REVOKED","campaign_stop":false,"target_quarantine":false,"result_consequence":"qualification_fails"},
+    "proposal_invalid": {"cell_disposition":"scientific_terminal","capability":"REVOKED","campaign_stop":false,"target_quarantine":false,"result_consequence":"qualification_fails"},
+    "reset_or_readback_failure": {"cell_disposition":"infrastructure_terminal","capability":"POISONED","campaign_stop":true,"target_quarantine":true,"result_consequence":"disqualifier"},
+    "provider_admission_failure": {"cell_disposition":"infrastructure_terminal","capability":"REVOKED","campaign_stop":true,"target_quarantine":false,"result_consequence":"disqualifier"},
+    "provider_termination_unknown": {"cell_disposition":"infrastructure_terminal","capability":"POISONED","campaign_stop":true,"target_quarantine":true,"result_consequence":"disqualifier"},
+    "authority_mismatch": {"cell_disposition":"integrity_terminal","capability":"POISONED","campaign_stop":true,"target_quarantine":true,"result_consequence":"disqualifier"},
+    "worker_active_operation": {"cell_disposition":"infrastructure_terminal","capability":"POISONED","campaign_stop":true,"target_quarantine":true,"result_consequence":"disqualifier"},
+    "native_effect_unknown": {"cell_disposition":"infrastructure_terminal","capability":"POISONED","campaign_stop":true,"target_quarantine":true,"result_consequence":"disqualifier"},
+    "oracle_unknown": {"cell_disposition":"infrastructure_terminal","capability":"POISONED","campaign_stop":true,"target_quarantine":true,"result_consequence":"disqualifier"},
+    "evidence_tamper": {"cell_disposition":"integrity_terminal","capability":"POISONED","campaign_stop":true,"target_quarantine":true,"result_consequence":"disqualifier"},
+    "containment_failure": {"cell_disposition":"infrastructure_terminal","capability":"POISONED","campaign_stop":true,"target_quarantine":true,"result_consequence":"disqualifier"},
+    "target_lock_loss": {"cell_disposition":"infrastructure_terminal","capability":"POISONED","campaign_stop":true,"target_quarantine":true,"result_consequence":"disqualifier"},
+    "identity_mismatch": {"cell_disposition":"prelaunch_infrastructure_stop","capability":"REVOKED","campaign_stop":true,"target_quarantine":false,"result_consequence":"disqualifier"}
+  },
+  "detached_artifact_sha256": "ebd8746c1c81f3e8912a453d72865ac50ea2ea66714fc16dcf2e406fa5819460"
+}

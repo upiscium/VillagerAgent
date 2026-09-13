@@ -1,0 +1,11 @@
+{
+  "schema": "minecraft-k12-live-oracle/1",
+  "version": "v1",
+  "acknowledgement": "en_us",
+  "identity": ["profile", "campaign", "cell", "reset_token", "generation", "request", "permit", "effect", "arm"],
+  "truth_values": ["true", "false", "unknown", "not_applicable"],
+  "strata": {"S1": "block_and_inventory", "S2": "air_to_stone_inventory_minus_one", "S3": "position_distance_le_1", "S4": "bound_uuid_kill_score_and_death", "S5": "connected_handover_250ms_to_5s"},
+  "poll_samples_ms": [0, 250, 500, 750, 1000, 1250, 1500, 1750, 2000, 2250, 2500, 2750, 3000, 3250, 3500, 3750, 4000, 4250, 4500, 4750, 5000],
+  "tool_prose_is_truth": false,
+  "detached_artifact_sha256": "6c3c8d2a3574111de985b5c6b52b863c118b48abfbc0dfbb8dd737ece890de0f"
+}

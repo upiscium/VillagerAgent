@@ -1,0 +1,21 @@
+{
+  "artifact_id": "minecraft-k12-recovery-randomization-manifest",
+  "artifact_version": 1,
+  "public_salt": "minecraft-k12-recovery-public-salt-v1",
+  "algorithm": "balanced-block-ordinal-v1+sha256-commitment",
+  "scenario_inputs": {"strata": ["S1", "S2", "S3", "S4", "S5"], "templates": [1, 2], "seeds": [1, 2, 3], "arms": [["A", "R", "S"], ["A", "S", "R"], ["R", "A", "S"], ["R", "S", "A"], ["S", "A", "R"], ["S", "R", "A"]]},
+  "cell_count": 90,
+  "schema_version": "minecraft-k12-recovery-randomization-manifest/1",
+  "permutations_per_stratum": 6,
+  "permutations": [["A","R","S"],["A","S","R"],["R","A","S"],["R","S","A"],["S","A","R"],["S","R","A"]],
+  "ordered_schedule": [
+    "K12-S1-T1-N1-A","K12-S1-T1-N1-R","K12-S1-T1-N1-S","K12-S1-T1-N2-A","K12-S1-T1-N2-S","K12-S1-T1-N2-R","K12-S1-T1-N3-R","K12-S1-T1-N3-A","K12-S1-T1-N3-S","K12-S1-T2-N1-R","K12-S1-T2-N1-S","K12-S1-T2-N1-A","K12-S1-T2-N2-S","K12-S1-T2-N2-A","K12-S1-T2-N2-R","K12-S1-T2-N3-S","K12-S1-T2-N3-R","K12-S1-T2-N3-A",
+    "K12-S2-T1-N1-A","K12-S2-T1-N1-R","K12-S2-T1-N1-S","K12-S2-T1-N2-A","K12-S2-T1-N2-S","K12-S2-T1-N2-R","K12-S2-T1-N3-R","K12-S2-T1-N3-A","K12-S2-T1-N3-S","K12-S2-T2-N1-R","K12-S2-T2-N1-S","K12-S2-T2-N1-A","K12-S2-T2-N2-S","K12-S2-T2-N2-A","K12-S2-T2-N2-R","K12-S2-T2-N3-S","K12-S2-T2-N3-R","K12-S2-T2-N3-A",
+    "K12-S3-T1-N1-A","K12-S3-T1-N1-R","K12-S3-T1-N1-S","K12-S3-T1-N2-A","K12-S3-T1-N2-S","K12-S3-T1-N2-R","K12-S3-T1-N3-R","K12-S3-T1-N3-A","K12-S3-T1-N3-S","K12-S3-T2-N1-R","K12-S3-T2-N1-S","K12-S3-T2-N1-A","K12-S3-T2-N2-S","K12-S3-T2-N2-A","K12-S3-T2-N2-R","K12-S3-T2-N3-S","K12-S3-T2-N3-R","K12-S3-T2-N3-A",
+    "K12-S4-T1-N1-A","K12-S4-T1-N1-R","K12-S4-T1-N1-S","K12-S4-T1-N2-A","K12-S4-T1-N2-S","K12-S4-T1-N2-R","K12-S4-T1-N3-R","K12-S4-T1-N3-A","K12-S4-T1-N3-S","K12-S4-T2-N1-R","K12-S4-T2-N1-S","K12-S4-T2-N1-A","K12-S4-T2-N2-S","K12-S4-T2-N2-A","K12-S4-T2-N2-R","K12-S4-T2-N3-S","K12-S4-T2-N3-R","K12-S4-T2-N3-A",
+    "K12-S5-T1-N1-A","K12-S5-T1-N1-R","K12-S5-T1-N1-S","K12-S5-T1-N2-A","K12-S5-T1-N2-S","K12-S5-T1-N2-R","K12-S5-T1-N3-R","K12-S5-T1-N3-A","K12-S5-T1-N3-S","K12-S5-T2-N1-R","K12-S5-T2-N1-S","K12-S5-T2-N1-A","K12-S5-T2-N2-S","K12-S5-T2-N2-A","K12-S5-T2-N2-R","K12-S5-T2-N3-S","K12-S5-T2-N3-R","K12-S5-T2-N3-A"
+  ],
+  "no_replacement": true,
+  "results": [],
+  "detached_artifact_sha256": "116e568b5c5f87ac957bf8ceea25ce9443c2370012a6ec2f5f180e10602c3693"
+}

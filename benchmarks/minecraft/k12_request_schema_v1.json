@@ -1,0 +1,30 @@
+{
+  "artifact_id": "minecraft-k12-request-content-schema",
+  "artifact_version": 1,
+  "schema_version": "minecraft-k12-request-content-canonicalization/1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "actor_id": {"type": "string", "minLength": 1},
+    "action": {"type": "object", "additionalProperties": false, "required": ["identity", "version", "digest"], "properties": {"identity": {"enum": ["MineBlock", "placeBlock", "navigateTo", "attackTarget", "handoverBlock"]}, "version": {"type": "integer", "minimum": 1}, "digest": {"type": "string", "pattern": "^(sha256:)?[0-9a-f]{64}$"}}},
+    "arguments": {"type": "object"},
+    "target": {}
+  },
+  "required": ["actor_id", "action", "arguments", "target"],
+  "allOf": [
+    {"if": {"properties": {"action": {"properties": {"identity": {"const": "MineBlock"}}}}}, "then": {"properties": {"arguments": {"additionalProperties": false, "required": ["x", "y", "z"], "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}}}}},
+    {"if": {"properties": {"action": {"properties": {"identity": {"const": "placeBlock"}}}}}, "then": {"properties": {"arguments": {"additionalProperties": false, "required": ["item_name", "x", "y", "z", "facing"], "properties": {"item_name": {"type": "string"}, "x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}, "facing": {"type": "string"}}}}}},
+    {"if": {"properties": {"action": {"properties": {"identity": {"const": "navigateTo"}}}}}, "then": {"properties": {"arguments": {"additionalProperties": false, "required": ["x", "y", "z"], "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}}}}},
+    {"if": {"properties": {"action": {"properties": {"identity": {"const": "attackTarget"}}}}}, "then": {"properties": {"arguments": {"additionalProperties": false, "required": ["target_name"], "properties": {"target_name": {"type": "string"}}}}}},
+    {"if": {"properties": {"action": {"properties": {"identity": {"const": "handoverBlock"}}}}}, "then": {"properties": {"arguments": {"additionalProperties": false, "required": ["target_player_name", "item_name", "item_count"], "properties": {"target_player_name": {"type": "string"}, "item_name": {"type": "string"}, "item_count": {"type": "integer", "minimum": 1}}}}}}
+  ],
+  "fields": ["actor_id", "action", "arguments", "target"],
+  "excluded_fields": ["run_id", "cell_id", "candidate_id", "attempt_id", "permit_id", "permit_fingerprint", "gateway", "model_call_id"],
+  "default_rule": "materialize only when the argument specification contains a default key",
+  "null_rule": "null is a present value and is distinct from absence",
+  "array_rule": "arrays retain source order",
+  "numeric_rule": "booleans and safe integers only; floating point and unsafe integers are rejected",
+  "prohibitions": ["run_id", "cell_id", "candidate_id", "attempt_id", "permit_id", "permit_fingerprint", "gateway", "model_call_id"],
+  "detached_artifact_sha256": "b2e7b85f6f81b05d395e0213f1f6cdb1bb7b62680d281f3804d4e6a9024fab40"
+}
