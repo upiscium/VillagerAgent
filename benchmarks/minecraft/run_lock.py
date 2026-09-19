@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import fcntl
 import hashlib
 import json
 import math
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 
 LOCK_METADATA_SCHEMA_VERSION = 2
@@ -36,6 +39,29 @@ class MinecraftTargetLockUnavailableError(MinecraftTargetLockError):
 
 class MinecraftTargetLockBusyError(MinecraftTargetLockUnavailableError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class MinecraftTargetLeaseSnapshot:
+    """Read-only identity for a lease retained by a target lock."""
+
+    fd: int
+    fd_dev: int
+    fd_ino: int
+    path_dev: int
+    path_ino: int
+    attempt_id: str
+    lock_key: str
+    owner_pid: int
+    owner_alive: bool
+    metadata: Mapping[str, object]
+    acquired: bool
+    quarantined: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("metadata must be a mapping")
+        object.__setattr__(self, "metadata", _freeze_metadata(self.metadata))
 
 
 def minecraft_target_lock_key(*, host: str, port: int) -> str:
@@ -196,6 +222,88 @@ class MinecraftTargetLock:
         self._stream = None
         self.acquired = False
 
+    def retained_lease_snapshot(self) -> MinecraftTargetLeaseSnapshot:
+        """Return an observational snapshot of the currently retained lease.
+
+        The descriptor identity comes from the retained stream while the path
+        identity is obtained independently with ``lstat``.  In particular,
+        the path identity is not substituted for the descriptor identity if
+        the lock path has drifted since acquisition.
+        """
+        stream = self._stream
+        if not self.acquired or stream is None:
+            raise MinecraftTargetLockError(
+                "Minecraft target lock must be acquired before lease snapshot"
+            )
+
+        try:
+            fd = stream.fileno()
+            fd_stat = os.fstat(fd)
+        except (OSError, TypeError, ValueError) as exc:
+            raise self._unavailable_error() from exc
+
+        try:
+            path_stat = os.lstat(self.path)
+        except OSError as exc:
+            raise self._unavailable_error() from exc
+
+        try:
+            stream_position = stream.tell()
+        except (OSError, TypeError, ValueError) as exc:
+            raise self._unavailable_error() from exc
+        try:
+            metadata = self._read_metadata()
+        except MinecraftTargetLockMetadataError:
+            raise
+        except (OSError, TypeError, ValueError) as exc:
+            raise self._unavailable_error() from exc
+        finally:
+            try:
+                stream.seek(stream_position)
+            except (OSError, TypeError, ValueError) as exc:
+                raise self._unavailable_error() from exc
+
+        if not metadata:
+            raise MinecraftTargetLockMetadataError(
+                "Minecraft target lock metadata is missing"
+            )
+
+        status = metadata.get("status")
+        if status not in {"acquired", "quarantined"}:
+            raise MinecraftTargetLockError(
+                "Minecraft target lock does not retain an acquired lease"
+            )
+        if self.quarantined and status != "quarantined":
+            raise MinecraftTargetLockMetadataError(
+                "Minecraft target quarantine state does not match its metadata"
+            )
+        if metadata.get("attempt_id") != self.attempt_id:
+            raise MinecraftTargetLockMetadataError(
+                "Minecraft target acquired metadata does not match the current owner"
+            )
+
+        owner_pid = metadata["pid"]
+        try:
+            owner_alive = _pid_exists(owner_pid)
+        except OverflowError as exc:
+            raise MinecraftTargetLockMetadataError(
+                "Minecraft target lock owner pid is invalid"
+            ) from exc
+        return MinecraftTargetLeaseSnapshot(
+            fd=fd,
+            fd_dev=fd_stat.st_dev,
+            fd_ino=fd_stat.st_ino,
+            path_dev=path_stat.st_dev,
+            path_ino=path_stat.st_ino,
+            attempt_id=metadata["attempt_id"],
+            lock_key=metadata["lock_key"],
+            owner_pid=owner_pid,
+            owner_alive=owner_alive,
+            metadata=metadata,
+            acquired=True,
+            quarantined=status == "quarantined",
+        )
+
     def _read_metadata(self) -> dict:
         if self._stream is None:
             return {}
@@ -282,6 +390,23 @@ def _pid_exists(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _freeze_metadata(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType({
+            key: _freeze_metadata(item)
+            for key, item in value.items()
+        })
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_metadata(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_metadata(item) for item in value)
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return value
+    raise TypeError("metadata contains an unsupported mutable value")
 
 
 def _public_lock_owner_snapshot(payload: dict) -> dict:
@@ -436,7 +561,8 @@ def _validate_metadata_identity(
 
 
 def _validate_schema_v1_metadata(payload: dict) -> dict:
-    if payload.get("status") not in {"acquired", "released"}:
+    status = payload.get("status")
+    if not isinstance(status, str) or status not in {"acquired", "released"}:
         raise MinecraftTargetLockMetadataError("Minecraft target lock metadata status is invalid")
     attempt_id = payload.get("attempt_id")
     if not isinstance(attempt_id, str) or not attempt_id:
@@ -450,7 +576,7 @@ def _validate_schema_v1_metadata(payload: dict) -> dict:
 
 def _validate_schema_v2_metadata(payload: dict) -> dict:
     status = payload.get("status")
-    if status not in LOCK_METADATA_STATUSES:
+    if not isinstance(status, str) or status not in LOCK_METADATA_STATUSES:
         raise MinecraftTargetLockMetadataError("Minecraft target lock metadata status is invalid")
     if status == "acquired":
         _validate_acquisition_metadata(payload)
@@ -496,7 +622,10 @@ def _validate_acquisition_metadata(payload: dict) -> None:
         raise MinecraftTargetLockMetadataError("Minecraft target migration metadata is invalid")
     if (
         "previous_status" in payload
-        and payload["previous_status"] not in {"acquired", "released"}
+        and (
+            not isinstance(payload["previous_status"], str)
+            or payload["previous_status"] not in {"acquired", "released"}
+        )
     ):
         raise MinecraftTargetLockMetadataError("Minecraft target migration metadata is invalid")
 
