@@ -1,8 +1,10 @@
+import hashlib
 import json
 import multiprocessing
 import os
 import threading
 import time
+from dataclasses import FrozenInstanceError, fields
 
 import pytest
 
@@ -12,6 +14,7 @@ from benchmarks.minecraft.run_lock import (
     MinecraftTargetLockError,
     MinecraftTargetLockMetadataError,
     MinecraftTargetLockUnavailableError,
+    MinecraftTargetLeaseSnapshot,
     MinecraftTargetQuarantinedError,
     clear_minecraft_target_quarantine,
     minecraft_target_lock_key,
@@ -27,6 +30,279 @@ def _lock(tmp_path, attempt_id, *, port=25565):
         world_id="world-a",
         attempt_id=attempt_id,
     )
+
+
+def test_retained_lease_snapshot_exposes_immutable_lease_identity(tmp_path):
+    lock = _lock(tmp_path, "attempt-snapshot").acquire()
+    try:
+        snapshot = lock.retained_lease_snapshot()
+        fd_stat = os.fstat(lock._stream.fileno())
+        path_stat = os.lstat(lock.path)
+
+        assert isinstance(snapshot, MinecraftTargetLeaseSnapshot)
+        assert tuple(field.name for field in fields(snapshot)) == (
+            "fd",
+            "fd_dev",
+            "fd_ino",
+            "path_dev",
+            "path_ino",
+            "attempt_id",
+            "lock_key",
+            "owner_pid",
+            "owner_alive",
+            "metadata",
+            "acquired",
+            "quarantined",
+        )
+        assert snapshot.fd == lock._stream.fileno()
+        assert (snapshot.fd_dev, snapshot.fd_ino) == (fd_stat.st_dev, fd_stat.st_ino)
+        assert (snapshot.path_dev, snapshot.path_ino) == (path_stat.st_dev, path_stat.st_ino)
+        assert snapshot.attempt_id == "attempt-snapshot"
+        assert snapshot.lock_key == lock.key
+        assert snapshot.owner_pid == os.getpid()
+        assert snapshot.owner_alive is True
+        assert snapshot.metadata["status"] == "acquired"
+        assert snapshot.acquired is True
+        assert snapshot.quarantined is False
+        assert not hasattr(snapshot, "_stream")
+        with pytest.raises(FrozenInstanceError):
+            snapshot.fd = -1
+    finally:
+        lock.release()
+
+
+def test_retained_lease_snapshot_requires_acquisition(tmp_path):
+    lock = _lock(tmp_path, "attempt-never-acquired")
+
+    with pytest.raises(MinecraftTargetLockError):
+        lock.retained_lease_snapshot()
+
+
+def test_retained_lease_snapshot_is_read_only_and_repeated_calls_are_idempotent(tmp_path):
+    lock = _lock(tmp_path, "attempt-read-only").acquire()
+    try:
+        before_bytes = lock.path.read_bytes()
+        before_hash = hashlib.sha256(before_bytes).hexdigest()
+        before_stat = os.stat(lock.path, follow_symlinks=False)
+        before_position = lock._stream.tell()
+
+        first = lock.retained_lease_snapshot()
+        second = lock.retained_lease_snapshot()
+
+        after_bytes = lock.path.read_bytes()
+        after_stat = os.stat(lock.path, follow_symlinks=False)
+        assert hashlib.sha256(after_bytes).hexdigest() == before_hash
+        assert after_bytes == before_bytes
+        assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
+        assert lock._stream.tell() == before_position
+        assert first == second
+        assert first.metadata == second.metadata
+    finally:
+        lock.release()
+
+
+def test_retained_lease_snapshot_surfaces_path_inode_drift(tmp_path):
+    lock = _lock(tmp_path, "attempt-inode-drift").acquire()
+    replacement = lock.path.with_name("replacement.lock")
+    try:
+        replacement.write_bytes(lock.path.read_bytes())
+        os.replace(replacement, lock.path)
+
+        snapshot = lock.retained_lease_snapshot()
+
+        assert snapshot.fd_ino != snapshot.path_ino
+        assert (snapshot.path_dev, snapshot.path_ino) == (
+            os.lstat(lock.path).st_dev,
+            os.lstat(lock.path).st_ino,
+        )
+    finally:
+        lock.release()
+        if lock.path.exists():
+            lock.path.unlink()
+
+
+def test_retained_lease_snapshot_fails_for_missing_path(tmp_path):
+    lock = _lock(tmp_path, "attempt-missing-path").acquire()
+    try:
+        lock.path.unlink()
+        with pytest.raises(MinecraftTargetLockUnavailableError):
+            lock.retained_lease_snapshot()
+    finally:
+        lock.release()
+
+
+def test_retained_lease_snapshot_fails_for_closed_retained_stream(tmp_path):
+    lock = _lock(tmp_path, "attempt-closed-stream").acquire()
+    try:
+        lock._stream.close()
+        with pytest.raises(MinecraftTargetLockUnavailableError):
+            lock.retained_lease_snapshot()
+    finally:
+        lock._stream = None
+        lock.acquired = False
+
+
+def test_retained_lease_snapshot_fails_for_malformed_metadata(tmp_path):
+    lock = _lock(tmp_path, "attempt-malformed-snapshot").acquire()
+    original_content = lock.path.read_text(encoding="utf-8")
+    try:
+        lock.path.write_text("{", encoding="utf-8")
+        with pytest.raises(MinecraftTargetLockMetadataError):
+            lock.retained_lease_snapshot()
+    finally:
+        lock.path.write_text(original_content, encoding="utf-8")
+        lock.release()
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "field"),
+    [(2, "status"), (1, "status"), (2, "previous_status")],
+)
+def test_retained_lease_snapshot_classifies_structured_metadata_corruption(
+    tmp_path,
+    schema_version,
+    field,
+):
+    lock = _lock(tmp_path, "attempt-structured-corruption").acquire()
+    original_content = lock.path.read_text(encoding="utf-8")
+    original_position = lock._stream.tell()
+    try:
+        metadata = json.loads(original_content)
+        metadata["schema_version"] = schema_version
+        metadata[field] = ["acquired"]
+        lock.path.write_text(json.dumps(metadata), encoding="utf-8")
+
+        with pytest.raises(MinecraftTargetLockMetadataError):
+            lock.retained_lease_snapshot()
+        assert lock._stream.tell() == original_position
+    finally:
+        lock.path.write_text(original_content, encoding="utf-8")
+        lock.release()
+
+
+def test_retained_lease_snapshot_classifies_unrepresentable_owner_pid(tmp_path):
+    lock = _lock(tmp_path, "attempt-oversized-pid").acquire()
+    original_content = lock.path.read_text(encoding="utf-8")
+    try:
+        metadata = json.loads(original_content)
+        metadata["pid"] = 1 << 100
+        lock.path.write_text(json.dumps(metadata), encoding="utf-8")
+
+        with pytest.raises(MinecraftTargetLockMetadataError, match="owner pid"):
+            lock.retained_lease_snapshot()
+    finally:
+        lock.path.write_text(original_content, encoding="utf-8")
+        lock.release()
+
+
+def test_retained_lease_snapshot_observes_quarantined_state_and_freezes_metadata(tmp_path):
+    lock = _lock(tmp_path, "attempt-quarantined-snapshot").acquire()
+    try:
+        record = lock.quarantine(
+            run_name="run-a",
+            reasons=["bridge_cleanup_incomplete"],
+            diagnostics={"nested": {"items": [{"safe": True}]}},
+        )
+        snapshot = lock.retained_lease_snapshot()
+
+        assert snapshot.acquired is True
+        assert snapshot.quarantined is True
+        assert snapshot.attempt_id == record["attempt_id"]
+        assert snapshot.owner_pid == os.getpid()
+        assert snapshot.owner_alive is True
+        assert snapshot.metadata["status"] == "quarantined"
+        assert snapshot.metadata["reasons"] == ("bridge_cleanup_incomplete",)
+        assert snapshot.metadata["diagnostics"]["nested"]["items"][0]["safe"] is True
+        with pytest.raises(TypeError):
+            snapshot.metadata["status"] = "acquired"
+        with pytest.raises(TypeError):
+            snapshot.metadata["diagnostics"]["nested"]["items"][0]["safe"] = False
+        with pytest.raises(AttributeError):
+            snapshot.metadata["reasons"].append("new-reason")
+
+        constructed = MinecraftTargetLeaseSnapshot(
+            fd=snapshot.fd,
+            fd_dev=snapshot.fd_dev,
+            fd_ino=snapshot.fd_ino,
+            path_dev=snapshot.path_dev,
+            path_ino=snapshot.path_ino,
+            attempt_id=snapshot.attempt_id,
+            lock_key=snapshot.lock_key,
+            owner_pid=snapshot.owner_pid,
+            owner_alive=snapshot.owner_alive,
+            metadata={"mutable_set": {"value"}, "mutable_bytes": bytearray(b"x")},
+            acquired=snapshot.acquired,
+            quarantined=snapshot.quarantined,
+        )
+        assert constructed.metadata["mutable_set"] == frozenset({"value"})
+        assert constructed.metadata["mutable_bytes"] == b"x"
+    finally:
+        lock.release()
+
+
+def test_retained_lease_snapshot_preserves_owner_liveness_semantics(tmp_path, monkeypatch):
+    lock = _lock(tmp_path, "attempt-liveness").acquire()
+    try:
+        monkeypatch.setattr(
+            "benchmarks.minecraft.run_lock._pid_exists",
+            lambda pid: False,
+        )
+        snapshot = lock.retained_lease_snapshot()
+        assert snapshot.owner_pid == os.getpid()
+        assert snapshot.owner_alive is False
+    finally:
+        lock.release()
+
+
+def test_retained_lease_snapshot_lstats_symlink_without_following(tmp_path):
+    lock = _lock(tmp_path, "attempt-symlink-path").acquire()
+    target = tmp_path / "target.lock"
+    try:
+        target.write_bytes(lock.path.read_bytes())
+        lock.path.unlink()
+        lock.path.symlink_to(target)
+
+        snapshot = lock.retained_lease_snapshot()
+
+        link_stat = os.lstat(lock.path)
+        target_stat = os.stat(lock.path)
+        assert (snapshot.path_dev, snapshot.path_ino) == (link_stat.st_dev, link_stat.st_ino)
+        assert snapshot.path_ino != target_stat.st_ino
+    finally:
+        if lock.path.is_symlink():
+            lock.path.unlink()
+        lock.release()
+
+
+def test_retained_lease_snapshot_accepts_legacy_metadata_after_compatibility_migration(tmp_path):
+    lock = _lock(tmp_path, "attempt-legacy-snapshot")
+    _write_schema_v1_metadata(lock, status="released", attempt_id="attempt-old")
+
+    with lock:
+        snapshot = lock.retained_lease_snapshot()
+        assert snapshot.metadata["schema_version"] == 2
+        assert snapshot.metadata["status"] == "acquired"
+        assert snapshot.attempt_id == "attempt-legacy-snapshot"
+
+
+def test_retained_lease_snapshot_rejects_released_lock(tmp_path):
+    lock = _lock(tmp_path, "attempt-released-snapshot").acquire()
+    lock.release()
+
+    with pytest.raises(MinecraftTargetLockError):
+        lock.retained_lease_snapshot()
+
+
+def test_contended_lock_cannot_publish_a_retained_lease_snapshot(tmp_path):
+    owner = _lock(tmp_path, "attempt-owner").acquire()
+    contender = _lock(tmp_path, "attempt-contender")
+    try:
+        with pytest.raises(MinecraftTargetLockBusyError):
+            contender.acquire()
+        with pytest.raises(MinecraftTargetLockError):
+            contender.retained_lease_snapshot()
+    finally:
+        owner.release()
 
 
 def test_same_minecraft_target_rejects_second_owner(tmp_path):
