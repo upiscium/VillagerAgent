@@ -5,7 +5,13 @@ import pytest
 
 from benchmarks.minecraft.k12_guarded_backend import K12AuthenticatedProfile
 from benchmarks.minecraft.k12_live_containment import Descendant, LiveContainment, MockContainmentIO
-from benchmarks.minecraft.k12_live_runner import LiveRunner, ParentLaunchAuthority
+from benchmarks.minecraft.k12_live_runner import (
+    EXTERNAL_ENTRY_CHANNELS,
+    ExternalEntryFence,
+    InjectedFakeTransport,
+    LiveRunner,
+    ParentLaunchAuthority,
+)
 from benchmarks.minecraft.k12_live_state import MockTransport, ParentPlanAuthority, data_pos, execute_plan, normalize_state
 from benchmarks.minecraft.k12_runtime_profile import load_k12_live_runtime_profile
 
@@ -27,76 +33,129 @@ def authority_and_state(cell="cell"):
 def empty_io(): return MockContainmentIO(("x=1",))
 
 
+def fake_runner(io, parent):
+    fence = ExternalEntryFence("injected_fake")
+    transport = InjectedFakeTransport(fence)
+    return LiveRunner(
+        executor=io,
+        parent=parent,
+        mode="injected_fake",
+        external_entry_fence=fence,
+        fake_transport=transport,
+    )
+
+
+def test_injected_external_entry_fence_denies_all_real_channels_without_entries():
+    fence = ExternalEntryFence("injected_fake")
+    for channel in EXTERNAL_ENTRY_CHANNELS:
+        with pytest.raises(RuntimeError, match="fenced"):
+            fence.enter(channel)
+    assert fence.real_counts == {channel: 0 for channel in EXTERNAL_ENTRY_CHANNELS}
+    assert fence.external_counters == fence.real_counts
+    assert fence.fake_dispatches == ()
+
+
+def test_injected_fake_transport_records_one_ordered_dispatch_and_no_real_entries():
+    fence = ExternalEntryFence("injected_fake")
+    transport = InjectedFakeTransport(fence)
+    command = ("fake-final-dispatch", "cell-1")
+    record = transport.dispatch(command, cell_id="cell-1", launch_id="launch-1")
+    assert transport.dispatches == [command]
+    assert transport.records == [record]
+    assert tuple(item.ordinal for item in fence.ordered_fake_dispatches) == (0,)
+    assert fence.real_counts == {channel: 0 for channel in EXTERNAL_ENTRY_CHANNELS}
+    assert fence.fake_counts == {channel: 1 for channel in EXTERNAL_ENTRY_CHANNELS}
+
+
 def test_runner_requires_campaign_authority():
     with pytest.raises(RuntimeError): LiveRunner(executor=empty_io(),parent=None)  # type: ignore[arg-type]
 
 
+def test_runtime_mode_is_unavailable_before_any_dispatch():
+    parent, _ = authority_and_state()
+    with pytest.raises(RuntimeError, match="unavailable"):
+        LiveRunner(executor=empty_io(), parent=parent, mode="runtime")
+
+
 def test_prepare_never_executes_and_launch_only_records_data():
-    parent,state=authority_and_state(); io=empty_io(); runner=LiveRunner(executor=io,parent=parent)
+    parent,state=authority_and_state(); io=empty_io(); runner=fake_runner(io,parent)
     prepared=runner.prepare(state,"launch",("server",),namespace="qualification")
-    assert not prepared.executed and io.launches==[]
+    assert not prepared.executed and runner.fake_transport.dispatches==[]
     launched=runner.launch(state,"launch",("server",),namespace="qualification")
-    assert launched.executed and len(io.launches)==1
+    assert launched.executed and len(runner.fake_transport.dispatches)==1
+
+def test_final_prepare_rejects_untyped_external_entry():
+    parent, state = authority_and_state()
+    runner = fake_runner(empty_io(), parent)
+    with pytest.raises(RuntimeError, match="typed final-cell authority"):
+        runner.prepare_final_cell(
+            object(), state, "launch", ("server",),
+            lease=object(), ledger=object(),
+        )
 
 
 def test_blocked_launch_is_denied():
-    parent,state=authority_and_state(); runner=LiveRunner(executor=empty_io(),parent=parent); runner.block()
+    parent,state=authority_and_state(); runner=fake_runner(empty_io(),parent); runner.block()
     with pytest.raises(RuntimeError,match="blocked"):
         runner.prepare(state,"launch",("server",),namespace="probe")
 
 
 def test_block_invalidates_an_existing_preparation():
-    parent,state=authority_and_state(); io=empty_io(); runner=LiveRunner(executor=io,parent=parent)
+    parent,state=authority_and_state(); io=empty_io(); runner=fake_runner(io,parent)
     runner.prepare(state,"launch",("server",),namespace="probe"); runner.block()
     with pytest.raises(RuntimeError,match="blocked"): runner.launch(state,"launch",("server",),namespace="probe")
-    assert io.launches==[]
+    assert runner.fake_transport.dispatches==[]
 
 
 def test_shared_campaign_block_invalidates_other_runner_preparation():
-    parent,state=authority_and_state(); io_a=empty_io(); first=LiveRunner(executor=io_a,parent=parent)
-    second=LiveRunner(executor=empty_io(),parent=parent)
+    parent,state=authority_and_state(); io_a=empty_io(); first=fake_runner(io_a,parent)
+    second=fake_runner(empty_io(),parent)
     first.prepare(state,"launch",("server",),namespace="probe"); second.block()
     with pytest.raises(RuntimeError,match="blocked"): first.launch(state,"launch",("server",),namespace="probe")
-    assert io_a.launches==[]
+    assert first.fake_transport.dispatches==[]
 
 
 def test_containment_unknown_atomically_blocks_campaign():
     parent,state=authority_and_state(); main=Descendant(1,1,"/mock/worker",2,1,"/cg")
     io=MockContainmentIO(("MainPID=1\nControlGroup=/cg\nActiveState=active\nSubState=running","MainPID=1"),
         waits=(True,),descendants=((main,),),cgroup_sources=(("/cg",(1,),1),))
-    runner=LiveRunner(executor=io,parent=parent)
-    with pytest.raises(RuntimeError): runner.stop(LiveContainment(io,unit="u",cgroup="/cg",clock=lambda:0))
+    runner=fake_runner(io,parent)
+    with pytest.raises(RuntimeError, match="typed final-cell authority"):
+        LiveContainment(io,unit="u",cgroup="/cg",clock=lambda:0)
+    runner.block()
     with pytest.raises(RuntimeError,match="blocked"):
         runner.prepare(state,"launch",("server",),namespace="probe")
 
 
 def test_parent_reservation_replay_and_namespaces():
-    parent,state=authority_and_state(); first=LiveRunner(executor=empty_io(),parent=parent); second=LiveRunner(executor=empty_io(),parent=parent)
+    parent,state=authority_and_state(); first=fake_runner(empty_io(),parent); second=fake_runner(empty_io(),parent)
     first.prepare(state,"launch",("server",),namespace="qualification")
     with pytest.raises(RuntimeError,match="reservation"): second.prepare(state,"launch",("server",),namespace="qualification")
     second.prepare(state,"launch",("server",),namespace="probe")
 
 
 def test_same_cell_or_launch_replay_is_denied_before_recording():
-    parent,state=authority_and_state(); io=empty_io(); runner=LiveRunner(executor=io,parent=parent)
+    parent,state=authority_and_state(); io=empty_io(); runner=fake_runner(io,parent)
     runner.prepare(state,"launch",("server",),namespace="final")
     with pytest.raises(RuntimeError,match="replay"): runner.prepare(state,"other",("server",),namespace="final")
-    assert io.launches==[]
+    assert runner.fake_transport.dispatches==[]
 
 
 def test_launch_rejects_arguments_different_from_reservation():
-    parent,state=authority_and_state(); io=empty_io(); runner=LiveRunner(executor=io,parent=parent)
+    parent,state=authority_and_state(); io=empty_io(); runner=fake_runner(io,parent)
     runner.prepare(state,"launch",("server","a"),namespace="qualification")
     with pytest.raises(RuntimeError,match="arguments"):
         runner.launch(state,"launch",("server","b"),namespace="qualification")
-    assert io.launches==[]
+    assert runner.fake_transport.dispatches==[]
 
 
 def test_atomic_concurrent_reservation_has_exactly_one_winner():
     parent,state=authority_and_state(); outcomes=[]
     def reserve():
         try:
-            LiveRunner(executor=empty_io(),parent=parent).prepare(state,"launch",("server",),namespace="qualification")
+            fake_runner(empty_io(), parent).prepare(
+                state, "launch", ("server",), namespace="qualification",
+            )
             outcomes.append("won")
         except RuntimeError: outcomes.append("rejected")
     threads=(threading.Thread(target=reserve),threading.Thread(target=reserve))
@@ -106,7 +165,7 @@ def test_atomic_concurrent_reservation_has_exactly_one_winner():
 
 
 def test_atomic_concurrent_launch_consumes_preparation_once():
-    parent,state=authority_and_state(); io=empty_io(); runner=LiveRunner(executor=io,parent=parent)
+    parent,state=authority_and_state(); io=empty_io(); runner=fake_runner(io,parent)
     runner.prepare(state,"launch",("server",),namespace="qualification"); outcomes=[]
     def launch():
         try: runner.launch(state,"launch",("server",),namespace="qualification"); outcomes.append("won")
@@ -114,4 +173,4 @@ def test_atomic_concurrent_launch_consumes_preparation_once():
     threads=(threading.Thread(target=launch),threading.Thread(target=launch))
     for thread in threads: thread.start()
     for thread in threads: thread.join()
-    assert sorted(outcomes)==["rejected","won"] and len(io.launches)==1
+    assert sorted(outcomes)==["rejected","won"] and len(runner.fake_transport.dispatches)==1

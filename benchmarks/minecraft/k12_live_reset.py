@@ -2,12 +2,21 @@
 from __future__ import annotations
 import json
 import hashlib
+import os
 from pathlib import Path
 import re
 from benchmarks.minecraft.k12_live_state import *
+from benchmarks.minecraft.k12_guarded_backend import (
+    authority_binding_is_current,
+    is_mock_authority_binding,
+)
+from benchmarks.minecraft.k12_execution_provenance import (
+    INJECTED_FAKE_ORIGIN,
+    INJECTED_TEST_ORIGIN,
+)
 from benchmarks.minecraft.k12_runtime_profile import strict_json_load
 
-def reset_plan(stratum: str, *, authority:ParentPlanAuthority, cell="cell", reset_token="token", generation=1, origin=(0,64,0), support=(0,63,0), actor="agent", recipient="recipient", item="stone", zombie_uuid=None, fixture=None):
+def reset_plan(stratum: str, *, authority:ParentPlanAuthority, cell="cell", reset_token="token", generation=1, origin=(0,64,0), support=(0,63,0), actor="agent", recipient="recipient", item="stone", zombie_uuid=None, fixture=None, authority_binding=None, authority_owner=None):
     if stratum not in {"S1","S2","S3","S4","S5"}: raise LiveStateError("invalid stratum")
     if not isinstance(authority,ParentPlanAuthority): raise LiveStateError("parent plan authority required")
     profile,campaign=authority.profile.profile_digest,authority.campaign
@@ -40,9 +49,33 @@ def reset_plan(stratum: str, *, authority:ParentPlanAuthority, cell="cell", rese
         cs=load+(kill_competing(center,radius), summon_zombie(target_pos,tag), gamerule("doMobLoot","false"), objective_remove("k12_kill"), objective_remove("k12_cardinality"), objective_remove("k12_total_zombies"), objective_add("k12_kill", "minecraft.killed:minecraft.zombie"), objective_add("k12_cardinality"), objective_add("k12_total_zombies"), kill_score(actor, "k12_kill", 0), score_query(actor,"k12_kill"), cardinality(tag_count_selector(tag,radius),"k12_cardinality",center), cardinality(zombie_count_selector(radius),"k12_total_zombies",center), entity_uuid(target,center), entity_health(target,center), actor_exists(actor), teleport(actor,actor_pos), data_pos(actor))
     else:
         cs=load+(actor_exists(actor), actor_exists(recipient), teleport(actor,actor_pos), teleport(recipient,recipient_pos), data_pos(actor), data_pos(recipient), clear_all(actor), clear_all(recipient), give(actor,item,1), count_items(actor,item), count_items(recipient,item), data_inventory(actor), data_inventory(recipient), kill_items(center,radius), residual_census(center,radius))
-    return authority.mint(cs,cell=cell,reset_token=reset_token,generation=generation,descriptor=stratum,purpose="before")
+    selected_owner = authority_owner if authority_owner is not None else authority.authority
+    return authority.mint(
+        cs, cell=cell, reset_token=reset_token, generation=generation,
+        descriptor=stratum, purpose="before", authority_binding=authority_binding,
+        authority=selected_owner,
+    )
 
 def execute_reset(plan, transport):
+    if not isinstance(plan, CommandPlan):
+        raise LiveStateError("typed reset plan required")
+    # The token registry is process-local; a copied plan is not a supported
+    # cross-process authority handle unless a durable boundary is added.
+    if plan.minting_process_id != os.getpid():
+        raise LiveStateError("cross-process reset authority handle is unsupported")
+    owner = plan.authority
+    if not is_mock_authority_binding(plan.authority_binding):
+        if owner is None:
+            raise LiveStateError("live reset authority is required")
+        if isinstance(owner, ParentPlanAuthority):
+            owner.assert_current(plan.authority_binding)
+        elif not authority_binding_is_current(
+            owner, plan.authority_binding, profile_digest=plan.profile,
+            allow_injected=plan.authority_binding.origin in {
+                INJECTED_FAKE_ORIGIN, INJECTED_TEST_ORIGIN,
+            },
+        ):
+            raise LiveStateError("live reset authority is stale or revoked")
     consume_reset_token(plan.reset_token, plan.generation, profile=plan.profile,
                         campaign=plan.campaign, cell=plan.cell)
     return execute_plan(plan, transport)
@@ -52,12 +85,17 @@ def residual_readback_plan(*,authority:ParentPlanAuthority,census_plan:CommandPl
             or census_plan.commands[0].kind is not CommandKind.RESIDUAL_CENSUS or not census_plan.authority_digest
             or census_plan.descriptor!="S5" or census_plan.purpose!="census"
             or type(census_results) is not tuple or len(census_results)!=1): raise LiveStateError("authenticated residual census required")
+    if not isinstance(census_results[0], CommandResult) \
+            or census_results[0].authority_binding != census_plan.authority_binding:
+        raise LiveStateError("residual command-result authority mismatch")
     census=normalize_state(census_plan,census_results)
     expected_count=census.residual_count
     if type(expected_count) is not int or not 0<=expected_count<=64: raise LiveStateError("invalid residual census count")
     profile,campaign,cell,reset_token,generation=(census.profile,census.campaign,census.cell,census.reset_token,census.generation)
     if (not isinstance(authority,ParentPlanAuthority) or not authority.owns(census_plan)
-            or authority.profile.profile_digest!=profile or authority.campaign!=campaign): raise LiveStateError("residual parent authority mismatch")
+            or authority.profile.profile_digest!=profile or authority.campaign!=campaign
+            or census_plan.authority_binding != authority.authority_binding): raise LiveStateError("residual parent authority mismatch")
+    authority.assert_current(census_plan.authority_binding)
     census_args=dict(census_plan.commands[0].args); center=census_args["position"]; radius=census_args["radius"]
     tags=tuple("k12_item_"+hashlib.sha256(f"{profile}:{campaign}:{cell}:{reset_token}:{generation}:{index}".encode()).hexdigest()[:16] for index in range(expected_count))
     if type(after_commands) is not tuple or not {"positions","inventories"}<={domain for command in after_commands for domain in command.completeness}: raise LiveStateError("complete S5 after read-back required")

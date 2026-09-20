@@ -31,6 +31,9 @@ def admitted():
 def test_parent_minted_fsm_and_parent_evidence():
     cap, handle, parent, tool, entry = admitted()
     assert parent.state(cap) is CapabilityState.PERMIT_ISSUED
+    assert cap.authority_binding == parent.authority_binding
+    assert entry.authority_binding == cap.authority_binding
+    assert dict(entry.ids)["authority_binding"] == cap.authority_binding
     assert K12GuardedBackend().execute("MineBlock", cap, ids=IDS, entry=entry, x=1, y=2, z=3)["status"]
     assert parent.state(cap) is CapabilityState.REVOKED and len(tool.calls) == 1
     assert all(item["authority"] == "parent" for item in parent.evidence)

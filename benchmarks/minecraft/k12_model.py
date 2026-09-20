@@ -6,7 +6,7 @@ import time
 import math
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator
 
 from model.openai_models import (
@@ -14,7 +14,18 @@ from model.openai_models import (
     ProviderCallCancellationError,
     ProviderCallTerminationError,
 )
-from benchmarks.minecraft.k12_guarded_backend import K12AuthenticatedProfile
+from benchmarks.minecraft.k12_guarded_backend import (
+    K12AuthenticatedProfile,
+    authority_binding_is_current,
+    is_mock_authority_binding,
+    mock_authority_binding,
+    resolve_authority_binding,
+)
+from benchmarks.minecraft.k12_execution_provenance import (
+    AuthorityBinding,
+    INJECTED_FAKE_ORIGIN,
+    INJECTED_TEST_ORIGIN,
+)
 
 _ACTIVE_POLICY: ContextVar[Any] = ContextVar("k12_model_policy", default=None)
 
@@ -44,13 +55,16 @@ class ModelCallRecord:
     error_type: str | None
     provider_started_count: int
     provider_termination_confirmed: bool | None
+    authority_binding: AuthorityBinding = field(default_factory=mock_authority_binding)
 
 
 class K12ModelPolicy:
     """One lock-protected, identity-exact K12 model-call budget."""
 
     def __init__(self, cell_id: str, *, model_call_budget: int = 2,
-                 clock_ns: Callable[[], int] = time.monotonic_ns) -> None:
+                 clock_ns: Callable[[], int] = time.monotonic_ns,
+                 authority_binding: AuthorityBinding | None = None,
+                 authority: Any = None) -> None:
         if not isinstance(cell_id, str) or not cell_id:
             raise ValueError("cell_id is required")
         if type(model_call_budget) is not int or model_call_budget < 0:
@@ -58,6 +72,15 @@ class K12ModelPolicy:
         self.cell_id = cell_id
         self.model_call_budget = model_call_budget
         self._clock_ns = clock_ns
+        resolved = resolve_authority_binding(authority if authority is not None else authority_binding)
+        if authority is not None and authority_binding is not None \
+                and resolve_authority_binding(authority_binding) != resolved:
+            raise K12ModelPolicyError("provider authority binding mismatch")
+        owner_cell = getattr(authority, "cell_id", None)
+        if owner_cell is not None and owner_cell != cell_id:
+            raise K12ModelPolicyError("provider cell/authority binding mismatch")
+        self.authority_binding = resolved
+        self.authority = authority
         self._lock = threading.RLock()
         self._used = 0
         self._inflight = False
@@ -79,6 +102,23 @@ class K12ModelPolicy:
                 raise K12ModelPoisonedError("K12 policy has unconfirmed provider activity")
             if self._inflight:
                 raise K12ModelReentryError("nested K12 provider entry is forbidden")
+
+    def assert_authority_current(self) -> None:
+        if is_mock_authority_binding(self.authority_binding):
+            return
+        if self.authority is None or not authority_binding_is_current(
+            self.authority,
+            self.authority_binding,
+            profile_digest=getattr(self.authority, "profile_digest", None),
+            allow_injected=self.authority_binding.origin in {
+                INJECTED_FAKE_ORIGIN, INJECTED_TEST_ORIGIN,
+            },
+        ):
+            raise K12ModelPolicyError("provider authority lifecycle is stale or revoked")
+
+    @property
+    def binding(self) -> AuthorityBinding:
+        return self.authority_binding
 
     def begin_call(self) -> tuple[int, int]:
         with self._lock:
@@ -130,6 +170,8 @@ class K12OpenAILanguageModel(OpenAILanguageModel):
 
     def __init__(self, *, policy: K12ModelPolicy, close_timeout_seconds: float = 0.1,
                  provider_client: Any | None = None,
+                 authority_binding: AuthorityBinding | None = None,
+                 authority: Any = None,
                  **kwargs: Any) -> None:
         if not isinstance(policy, K12ModelPolicy):
             raise TypeError("a typed K12ModelPolicy is required")
@@ -139,6 +181,18 @@ class K12OpenAILanguageModel(OpenAILanguageModel):
         # install a transport without constructing an OpenAI client (and hence
         # without putting an endpoint or credential in the provider worker).
         self._k12_provider_client = provider_client
+        resolved_binding = resolve_authority_binding(
+            authority if authority is not None else authority_binding
+        )
+        if authority is not None and authority_binding is not None \
+                and resolve_authority_binding(authority_binding) != resolved_binding:
+            raise K12ModelPolicyError("provider authority binding mismatch")
+        if authority_binding is None and authority is None:
+            resolved_binding = policy.authority_binding
+        elif resolved_binding != policy.authority_binding:
+            raise K12ModelPolicyError("provider/policy authority binding mismatch")
+        self._k12_authority_binding = resolved_binding
+        self._k12_authority = authority if authority is not None else policy.authority
         kwargs["model_call_attempts"] = 1
         kwargs["retry_delay_seconds"] = 0
         super().__init__(**kwargs)
@@ -160,6 +214,23 @@ class K12OpenAILanguageModel(OpenAILanguageModel):
     def _require_policy(self) -> None:
         if _ACTIVE_POLICY.get() is not self._k12_policy:
             raise K12ModelPolicyError("exact active K12 model policy is required")
+
+    def _require_authority_current(self) -> None:
+        if is_mock_authority_binding(self._k12_authority_binding):
+            return
+        if self._k12_authority is None or not authority_binding_is_current(
+            self._k12_authority,
+            self._k12_authority_binding,
+            profile_digest=getattr(self._k12_authority, "profile_digest", None),
+            allow_injected=self._k12_authority_binding.origin in {
+                INJECTED_FAKE_ORIGIN, INJECTED_TEST_ORIGIN,
+            },
+        ):
+            raise K12ModelPolicyError("provider authority lifecycle is stale or revoked")
+
+    @property
+    def authority_binding(self) -> AuthorityBinding:
+        return self._k12_authority_binding
 
     def controlled_planning(self, system_prompt: str = "", example_prompt: Any = (),
                              **kwargs: Any) -> str:
@@ -202,6 +273,8 @@ class K12OpenAILanguageModel(OpenAILanguageModel):
         # fresh thread where ContextVars intentionally do not propagate.
         with self._k12_state_lock:
             self._k12_policy.assert_available()
+            self._k12_policy.assert_authority_current()
+            self._require_authority_current()
             self._require_policy()
             order, admitted_ns = self._k12_policy.begin_call()
             record = {
@@ -212,6 +285,7 @@ class K12OpenAILanguageModel(OpenAILanguageModel):
                 "error_type": None,
                 "provider_started_count": 0,
                 "provider_termination_confirmed": None,
+                "authority_binding": self._k12_authority_binding,
             }
             self._k12_records.append(record)
 
@@ -219,6 +293,10 @@ class K12OpenAILanguageModel(OpenAILanguageModel):
         def provider_started() -> None:
             with self._k12_state_lock:
                 record["provider_started_count"] += 1
+            try:
+                self._require_authority_current()
+            except BaseException as error:
+                callback_errors.append(error)
             if provider_started_callback is not None:
                 try:
                     provider_started_callback()
@@ -302,8 +380,13 @@ class _BoundedCloseProxy:
 
 class K12LiveProviderPolicy(K12ModelPolicy):
     """The live-mock contract: one admission and one terminal outcome."""
-    def __init__(self, cell_id: str, *, clock_ns: Callable[[], int] = time.monotonic_ns) -> None:
-        super().__init__(cell_id, model_call_budget=1, clock_ns=clock_ns)
+    def __init__(self, cell_id: str, *, clock_ns: Callable[[], int] = time.monotonic_ns,
+                 authority_binding: AuthorityBinding | None = None,
+                 authority: Any = None) -> None:
+        super().__init__(
+            cell_id, model_call_budget=1, clock_ns=clock_ns,
+            authority_binding=authority_binding, authority=authority,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,6 +395,25 @@ class K12LiveProviderConfig:
     profile_digest: str
     campaign_id: str
     cell_id: str
+    authority_binding: AuthorityBinding = field(default_factory=mock_authority_binding)
+    authority: Any = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.authority_binding, AuthorityBinding):
+            raise TypeError("typed provider authority binding is required")
+        if self.authority is not None:
+            owner_cell = getattr(self.authority, "cell_id", None)
+            if owner_cell is not None and owner_cell != self.cell_id:
+                raise ValueError("provider cell/authority binding mismatch")
+            derived = resolve_authority_binding(self.authority)
+            if is_mock_authority_binding(self.authority_binding):
+                object.__setattr__(self, "authority_binding", derived)
+            elif derived != self.authority_binding:
+                raise ValueError("provider authority binding mismatch")
+
+    @property
+    def binding(self) -> AuthorityBinding:
+        return self.authority_binding
 
 
 class K12ScriptedMockTransport:
@@ -383,8 +485,10 @@ class K12LiveProviderFactory:
     no path from this issue to an OpenAI client, network, or secret resolver.
     """
     def __init__(self, *, profile: Any, config: K12LiveProviderConfig,
-                 transport: K12ScriptedMockTransport,
-                 clock_ns: Callable[[], int] = time.monotonic_ns) -> None:
+                  transport: K12ScriptedMockTransport,
+                  clock_ns: Callable[[], int] = time.monotonic_ns,
+                  authority: Any = None,
+                  authority_binding: AuthorityBinding | None = None) -> None:
         if not isinstance(profile, K12AuthenticatedProfile):
             try:
                 profile = K12AuthenticatedProfile.from_runtime_profile(profile)
@@ -392,19 +496,42 @@ class K12LiveProviderFactory:
                 pass
         if not isinstance(profile, K12AuthenticatedProfile):
             raise K12ModelPolicyError("loader-issued typed profile required")
+        if not isinstance(config, K12LiveProviderConfig):
+            raise K12ModelPolicyError("profile/config binding mismatch")
+        owner = authority if authority is not None else config.authority
+        selected_binding = (
+            resolve_authority_binding(authority_binding)
+            if authority_binding is not None
+            else config.authority_binding
+        )
+        if owner is not None:
+            owner_binding = resolve_authority_binding(owner)
+            if selected_binding != owner_binding:
+                raise K12ModelPolicyError("provider authority binding mismatch")
+            selected_binding = owner_binding
         if (not isinstance(config, K12LiveProviderConfig)
                  or type(transport) is not K12ScriptedMockTransport
                  or profile.profile_id != config.profile_id
                  or profile.profile_digest != config.profile_digest
                  or not all(isinstance(value, str) and value for value in
                             (config.profile_id, config.profile_digest,
-                             config.campaign_id, config.cell_id))):
+                             config.campaign_id, config.cell_id))
+                 or selected_binding != config.authority_binding):
             raise K12ModelPolicyError("profile/config binding mismatch")
-        self.__policy = K12LiveProviderPolicy(config.cell_id, clock_ns=clock_ns)
+        self.__authority_binding = selected_binding
+        self.__authority = owner
+        self.__policy = K12LiveProviderPolicy(
+            config.cell_id,
+            clock_ns=clock_ns,
+            authority_binding=selected_binding,
+            authority=owner,
+        )
         self.__transport = transport
         self.__model = K12OpenAILanguageModel(
             policy=self.__policy,
             provider_client=_K12MockClient(transport),
+            authority_binding=selected_binding,
+            authority=owner,
             api_key="k12-sealed-mock",
             api_base="k12-sealed-mock",
             api_model="k12-sealed-mock",
@@ -420,6 +547,7 @@ class K12LiveProviderFactory:
         raise K12ModelPolicyError("sealed provider exposes no underlying attributes")
 
     def plan(self, system_prompt: str = "", example_prompt: Any = (), **kwargs: Any) -> str:
+        self.__policy.assert_authority_current()
         allowed = {"temperature", "cache_enabled", "stream", "image", "retries",
                    "attempts", "request_timeout_seconds", "connect_timeout_seconds",
                    "cancellation_event"}
@@ -445,12 +573,21 @@ class K12LiveProviderFactory:
             except K12ModelPoisonedError as error:
                 raise K12ModelPoisonedError("K12 live provider stop: uncertain termination") from error
 
+    @property
+    def authority_binding(self) -> AuthorityBinding:
+        return self.__authority_binding
+
+    @property
+    def binding(self) -> AuthorityBinding:
+        return self.__authority_binding
+
 
 def make_k12_live_provider(**kwargs: Any) -> K12LiveProviderFactory:
     return K12LiveProviderFactory(**kwargs)
 
 
 __all__ = [
+    "AuthorityBinding",
     "K12ModelBudgetExhausted",
     "K12ModelPolicy",
     "K12ModelPolicyError",

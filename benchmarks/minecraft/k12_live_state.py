@@ -4,11 +4,24 @@ There is intentionally no RCON client here.  Commands are rendered only by the
 typed factories below and can only be sent to :class:`MockTransport`.
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
-import hashlib, json, re, secrets
+import hashlib, json, os, re, secrets
+from threading import RLock
 from typing import Any, Mapping, Sequence
 from benchmarks.common.eac.canonical import canonical_bytes
+from benchmarks.common.eac.canonical import canonical_sha256
+from .k12_execution_provenance import (
+    AuthorityBinding,
+    INJECTED_FAKE_ORIGIN,
+    INJECTED_TEST_ORIGIN,
+)
+from .k12_guarded_backend import (
+    authority_binding_is_current,
+    is_mock_authority_binding,
+    mock_authority_binding,
+    resolve_authority_binding,
+)
 
 class LiveStateError(ValueError): pass
 IDENT = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
@@ -17,8 +30,47 @@ UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{
 MAX_COMMANDS, MAX_TEXT, MAX_ROWS = 128, 4096, 1024
 MAX_TIMEOUT_MS = 30_000
 
+def canonical_digest_value(value: Any) -> Any:
+    """Project immutable state values into a deterministic JSON value.
+
+    State digests must not inspect ``__dict__``: slots-backed dataclasses do
+    not have one, while mutable objects may expose implementation details that
+    are not part of their authenticated identity.  Authority bindings have an
+    explicit public projection; other dataclasses contribute their public
+    fields recursively.
+    """
+
+    if isinstance(value, AuthorityBinding):
+        return {key: canonical_digest_value(item)
+                for key, item in value.canonical().items()}
+    if isinstance(value, Enum):
+        return canonical_digest_value(value.value)
+    if is_dataclass(value):
+        return {
+            descriptor.name: canonical_digest_value(getattr(value, descriptor.name))
+            for descriptor in fields(value)
+            if not descriptor.name.startswith("_")
+        }
+    if isinstance(value, Mapping):
+        return {
+            str(key): canonical_digest_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (tuple, list)):
+        return [canonical_digest_value(item) for item in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise TypeError(f"unsupported digest value type: {type(value).__name__}")
+
 def _sha(value: Any) -> str:
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+    return hashlib.sha256(
+        json.dumps(
+            canonical_digest_value(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode()
+    ).hexdigest()
 def detached_artifact_digest(value: Mapping[str, Any]) -> str:
     body = {key: item for key, item in value.items()
             if key != "detached_artifact_sha256"}
@@ -185,42 +237,202 @@ _PLAN_MARKER=object()
 
 @dataclass(frozen=True, slots=True)
 class CommandPlan:
-    profile: str; campaign: str; cell: str; reset_token: str; generation: int; commands: tuple[RconCommand,...]; digest: str; acknowledgement: str="en_us"; upstream_digest: str=""; authority_digest:str=""; authority_id:str=""; descriptor:str="mock"; purpose:str="mock"; _authority_marker:object=field(default=None,repr=False,compare=False)
+    profile: str; campaign: str; cell: str; reset_token: str; generation: int; commands: tuple[RconCommand,...]; digest: str; acknowledgement: str="en_us"; upstream_digest: str=""; authority_digest:str=""; authority_id:str=""; descriptor:str="mock"; purpose:str="mock"; authority_binding: AuthorityBinding = field(default_factory=mock_authority_binding); minting_process_id:int=field(default=0,repr=False,compare=False); _authority_marker:object=field(default=None,repr=False,compare=False); _authority_owner:object=field(default=None,repr=False,compare=False)
     _marker: object=field(default=None,repr=False,compare=False)
     def __post_init__(self):
         if self._marker is not _PLAN_MARKER: raise LiveStateError("command plans are parent-minted")
+        if not isinstance(self.authority_binding, AuthorityBinding): raise LiveStateError("typed plan authority binding required")
         if not re.fullmatch(r"[0-9a-f]{64}",self.profile): raise LiveStateError("authenticated profile digest required")
         if self.upstream_digest and not re.fullmatch(r"[0-9a-f]{64}",self.upstream_digest): raise LiveStateError("invalid upstream plan binding")
         if self.authority_digest and not re.fullmatch(r"[0-9a-f]{64}",self.authority_digest): raise LiveStateError("invalid plan authority binding")
         if self.authority_id and not re.fullmatch(r"[0-9a-f]{64}",self.authority_id): raise LiveStateError("invalid parent authority identity")
+        if type(self.minting_process_id) is not int or self.minting_process_id < 1: raise LiveStateError("invalid plan process binding")
         if not re.fullmatch(r"[A-Za-z0-9_]+",self.descriptor) or not re.fullmatch(r"[a-z_]+",self.purpose): raise LiveStateError("invalid plan descriptor binding")
         for v in (self.campaign,self.cell,self.reset_token): _ident(v)
         if type(self.generation) is not int or self.generation < 1 or len(self.commands) > MAX_COMMANDS or not self.commands or self.acknowledgement != "en_us": raise LiveStateError("invalid plan binding")
         if self.digest != plan_digest(self): raise LiveStateError("stale plan")
-def plan_digest(p: CommandPlan) -> str: return _sha({"profile":p.profile,"campaign":p.campaign,"cell":p.cell,"token":p.reset_token,"generation":p.generation,"ack":p.acknowledgement,"upstream":p.upstream_digest,"authority":p.authority_digest,"authority_id":p.authority_id,"descriptor":p.descriptor,"purpose":p.purpose,"commands":[(c.kind.value,c.args,c.read_after_write,c.expected_ack,c.parser,c.timeout_ms,c.completeness,c.raw_digest) for c in p.commands]})
-def make_plan(commands: Sequence[RconCommand], *, profile="0"*64, campaign="k12", cell="cell", reset_token="token", generation=1,upstream_digest=""):
-    return _make_plan(commands,profile,campaign,cell,reset_token,generation,upstream_digest)
-def _make_plan(commands, profile,campaign,cell,token,generation,upstream_digest="",authority_digest="",descriptor="mock",purpose="mock",authority_id="",authority_marker=None):
-    p=CommandPlan.__new__(CommandPlan); object.__setattr__(p,"profile",_ident(profile)); object.__setattr__(p,"campaign",_ident(campaign)); object.__setattr__(p,"cell",_ident(cell)); object.__setattr__(p,"reset_token",_ident(token)); object.__setattr__(p,"generation",generation); object.__setattr__(p,"commands",tuple(commands)); object.__setattr__(p,"acknowledgement","en_us"); object.__setattr__(p,"upstream_digest",upstream_digest); object.__setattr__(p,"authority_digest",authority_digest); object.__setattr__(p,"authority_id",authority_id); object.__setattr__(p,"descriptor",descriptor); object.__setattr__(p,"purpose",purpose); object.__setattr__(p,"_authority_marker",authority_marker); object.__setattr__(p,"_marker",_PLAN_MARKER); object.__setattr__(p,"digest",plan_digest(p)); CommandPlan.__post_init__(p); return p
+
+    @property
+    def binding(self) -> AuthorityBinding:
+        return self.authority_binding
+
+    @property
+    def authority(self) -> Any:
+        """Parent authority retained by the authenticated plan."""
+        return self._authority_owner
+
+    @property
+    def authority_marker(self) -> object:
+        """Opaque ownership marker exposed through the plan API."""
+        return self._authority_marker
+
+    @property
+    def origin(self) -> str:
+        """Evidence origin carried by the parent-minted plan binding."""
+        return self.authority_binding.origin
+
+    @property
+    def evidence_origin(self) -> str:
+        return self.origin
+
+    @property
+    def runtime_admissible(self) -> bool:
+        return self.authority_binding.runtime_admissible
+
+
+def _binding_canonical(binding: AuthorityBinding) -> dict[str, str]:
+    return binding.canonical()
+
+
+def plan_digest(p: CommandPlan) -> str:
+    return _sha({
+        "profile": p.profile, "campaign": p.campaign, "cell": p.cell,
+        "token": p.reset_token, "generation": p.generation,
+        "ack": p.acknowledgement, "upstream": p.upstream_digest,
+        "authority": p.authority_digest, "authority_id": p.authority_id,
+        "descriptor": p.descriptor, "purpose": p.purpose,
+        "minting_process_id": p.minting_process_id,
+        "authority_binding": _binding_canonical(p.authority_binding),
+        "commands": [
+            (c.kind.value, c.args, c.read_after_write, c.expected_ack, c.parser,
+             c.timeout_ms, c.completeness, c.raw_digest)
+            for c in p.commands
+        ],
+    })
+
+
+def make_plan(
+    commands: Sequence[RconCommand], *, profile="0" * 64, campaign="k12", cell="cell",
+    reset_token="token", generation=1, upstream_digest="", authority_binding=None,
+    authority=None,
+):
+    return _make_plan(
+        commands, profile, campaign, cell, reset_token, generation, upstream_digest,
+        authority_binding=authority_binding, authority=authority,
+    )
+
+
+def _make_plan(
+    commands, profile, campaign, cell, token, generation, upstream_digest="",
+    authority_digest="", descriptor="mock", purpose="mock", authority_id="",
+    authority_marker=None, authority_binding=None, authority=None,
+):
+    binding = resolve_authority_binding(authority if authority is not None else authority_binding)
+    if authority is not None and authority_binding is not None \
+            and resolve_authority_binding(authority_binding) != binding:
+        raise LiveStateError("plan authority binding mismatch")
+    p = CommandPlan.__new__(CommandPlan)
+    object.__setattr__(p, "profile", _ident(profile))
+    object.__setattr__(p, "campaign", _ident(campaign))
+    object.__setattr__(p, "cell", _ident(cell))
+    object.__setattr__(p, "reset_token", _ident(token))
+    object.__setattr__(p, "generation", generation)
+    object.__setattr__(p, "commands", tuple(commands))
+    object.__setattr__(p, "acknowledgement", "en_us")
+    object.__setattr__(p, "upstream_digest", upstream_digest)
+    object.__setattr__(p, "authority_digest", authority_digest)
+    object.__setattr__(p, "authority_id", authority_id)
+    object.__setattr__(p, "descriptor", descriptor)
+    object.__setattr__(p, "purpose", purpose)
+    object.__setattr__(p, "authority_binding", binding)
+    object.__setattr__(p, "minting_process_id", os.getpid())
+    object.__setattr__(p, "_authority_marker", authority_marker)
+    object.__setattr__(p, "_authority_owner", authority)
+    object.__setattr__(p, "_marker", _PLAN_MARKER)
+    object.__setattr__(p, "digest", plan_digest(p))
+    CommandPlan.__post_init__(p)
+    return p
 
 class ParentPlanAuthority:
     """Coordinator-owned mint for launch-eligible read-back plans."""
-    def __init__(self,profile:Any,campaign:str):
+    def __init__(self, profile: Any, campaign: str, *,
+                 authority_binding: AuthorityBinding | None = None,
+                 authority: Any = None):
         from .k12_guarded_backend import K12AuthenticatedProfile
         if not isinstance(profile,K12AuthenticatedProfile): raise TypeError("authenticated profile required")
+        binding = resolve_authority_binding(authority if authority is not None else authority_binding)
+        if authority is not None and authority_binding is not None \
+                and resolve_authority_binding(authority_binding) != binding:
+            raise LiveStateError("plan authority binding mismatch")
         self.profile,self.campaign=profile,_ident(campaign); self.__marker=object(); self.authority_id=secrets.token_hex(32)
+        self.authority_binding, self.authority = binding, authority
+
+    @property
+    def binding(self) -> AuthorityBinding:
+        return self.authority_binding
+
+    @property
+    def origin(self) -> str:
+        """Evidence origin carried by this parent authority."""
+        return self.authority_binding.origin
+
+    @property
+    def evidence_origin(self) -> str:
+        return self.origin
+
+    @property
+    def runtime_admissible(self) -> bool:
+        return self.authority_binding.runtime_admissible
+
+    def assert_current(self, binding: AuthorityBinding | None = None) -> None:
+        selected = binding or self.authority_binding
+        if is_mock_authority_binding(selected):
+            return
+        if not authority_binding_is_current(
+            self.authority,
+            selected,
+            profile_digest=self.profile.profile_digest,
+             allow_injected=selected.origin in {INJECTED_FAKE_ORIGIN, INJECTED_TEST_ORIGIN},
+        ):
+            raise LiveStateError("plan authority lifecycle is stale or revoked")
+
     def owns(self,plan:CommandPlan)->bool:
-        return isinstance(plan,CommandPlan) and plan._authority_marker is self.__marker and plan.authority_id==self.authority_id
+        return (
+            isinstance(plan, CommandPlan)
+            and plan.authority_marker is self.__marker
+            and plan.authority_id == self.authority_id
+            and plan.authority_binding == self.authority_binding
+        )
     def owns_state(self,state:Any)->bool:
-        return isinstance(state,LiveState) and state._plan_authority_marker is self.__marker and state.plan_authority_id==self.authority_id
-    def mint(self,commands:Sequence[RconCommand],*,cell:str,reset_token:str,generation:int,descriptor:str,purpose:str,upstream_digest:str="")->CommandPlan:
+        return (
+            isinstance(state, LiveState)
+            and state.plan_authority_marker is self.__marker
+            and state.plan_authority_id == self.authority_id
+            and state.authority_binding == self.authority_binding
+        )
+    def mint(self, commands: Sequence[RconCommand], *, cell: str, reset_token: str,
+              generation: int, descriptor: str, purpose: str, upstream_digest: str = "",
+              authority_binding: AuthorityBinding | None = None,
+              authority: Any = None) -> CommandPlan:
+        # A parent plan authority already owns the binding and the typed
+        # authority.  Omitting both optional arguments must inherit that
+        # graph; resolving ``None`` to a mock binding here would silently
+        # downgrade an injected or runtime plan.
+        inherited = self.authority
+        if authority is None and authority_binding is None and inherited is not None:
+            selected = self.authority_binding
+        else:
+            selected = resolve_authority_binding(
+                authority if authority is not None else authority_binding
+            )
+        if selected != self.authority_binding:
+            raise LiveStateError("plan authority binding mismatch")
+        if authority is not None and authority_binding is not None \
+                and resolve_authority_binding(authority_binding) != selected:
+            raise LiveStateError("plan authority binding mismatch")
+        self.assert_current(selected)
         if descriptor not in {"S1","S2","S3","S4","S5","containment"} or purpose not in {"before","after","census","residual","launch"}: raise LiveStateError("invalid descriptor plan authority")
         commands=tuple(commands); domains={domain for command in commands for domain in command.completeness}
         required={"S1":{"blocks","inventories"},"S2":{"blocks","inventories"},"S3":{"positions"},"S4":{"entities","scoreboard"},"S5":{"positions","inventories","residual"},"containment":set()}[descriptor]
         if purpose in {"before","after"} and not required<=domains: raise LiveStateError("descriptor read-back plan is incomplete")
         if purpose=="census" and (descriptor!="S5" or len(commands)!=1 or commands[0].kind is not CommandKind.RESIDUAL_CENSUS): raise LiveStateError("exact residual census plan required")
-        authority=_sha((self.authority_id,self.profile.profile_digest,self.campaign,cell,reset_token,generation,descriptor,purpose,upstream_digest,tuple(command.raw_digest for command in commands)))
-        return _make_plan(commands,self.profile.profile_digest,self.campaign,cell,reset_token,generation,upstream_digest,authority,descriptor,purpose,self.authority_id,self.__marker)
+        selected_owner = authority if authority is not None else inherited
+        authority_digest = _sha((self.authority_id,self.profile.profile_digest,self.campaign,cell,reset_token,generation,descriptor,purpose,upstream_digest,tuple(command.raw_digest for command in commands)))
+        return _make_plan(
+            commands, self.profile.profile_digest, self.campaign, cell, reset_token,
+            generation, upstream_digest, authority_digest, descriptor, purpose, self.authority_id,
+            self.__marker, selected, selected_owner,
+        )
 
 class MockTransport:
     """Explicit test-only transport marker; it records no real connection."""
@@ -250,8 +462,10 @@ class CommandResult:
     parser_identity: str
     digest: str
     _marker: object=field(default=None,repr=False,compare=False)
+    authority_binding: AuthorityBinding = field(default_factory=mock_authority_binding)
     def __post_init__(self):
         if self._marker is not _RESULT_MARKER: raise LiveStateError("command results are parser-minted")
+        if not isinstance(self.authority_binding, AuthorityBinding): raise LiveStateError("typed command-result authority binding required")
         if (not re.fullmatch(r"r\d{3}_[a-z_]+", self.command_id)
                 or not re.fullmatch(r"[0-9a-f]{64}", self.raw_sha256)):
             raise LiveStateError("invalid command result identity")
@@ -259,7 +473,24 @@ class CommandResult:
                 or not re.fullmatch(r"[0-9a-f]{64}",self.command_digest)
                 or type(self.ordinal) is not int or self.ordinal < 0): raise LiveStateError("invalid command result binding")
         if not re.fullmatch(r"minecraft\.en_us\.[a-z_]+\.v1", self.parser_identity): raise LiveStateError("invalid parser identity")
-        if self.digest != _sha((self.plan_digest,self.ordinal,self.command_digest,self.command_id,self.raw_sha256,self.parser_identity,self.value,self.completeness,self.read_after_write)): raise LiveStateError("invalid command result digest")
+        if self.digest != _sha((self.plan_digest,self.ordinal,self.command_digest,self.command_id,self.raw_sha256,self.parser_identity,self.value,self.completeness,self.read_after_write,self.authority_binding.canonical())): raise LiveStateError("invalid command result digest")
+
+    @property
+    def binding(self) -> AuthorityBinding:
+        return self.authority_binding
+
+    @property
+    def origin(self) -> str:
+        """Evidence origin carried by the authenticated command result."""
+        return self.authority_binding.origin
+
+    @property
+    def evidence_origin(self) -> str:
+        return self.origin
+
+    @property
+    def runtime_admissible(self) -> bool:
+        return self.authority_binding.runtime_admissible
 
 _RESULT_MARKER=object()
 
@@ -370,43 +601,161 @@ def _parse_response(command, raw):
 
 def execute_plan(plan:CommandPlan, transport:MockTransport):
     if type(transport) is not MockTransport: raise LiveStateError("concrete MockTransport required")
+    if not isinstance(plan, CommandPlan): raise LiveStateError("typed command plan required")
+    if plan.minting_process_id != os.getpid():
+        raise LiveStateError("cross-process command plan handle is unsupported")
+    owner = plan.authority
+    if not is_mock_authority_binding(plan.authority_binding):
+        if (owner is None or plan.authority_marker is None
+                or not plan.authority_digest or not plan.authority_id):
+            raise LiveStateError("live command plan owner is required")
+        if isinstance(owner, ParentPlanAuthority):
+            owner.assert_current(plan.authority_binding)
+        elif not authority_binding_is_current(
+            owner,
+            plan.authority_binding,
+            profile_digest=plan.profile,
+             allow_injected=plan.authority_binding.origin in {INJECTED_FAKE_ORIGIN, INJECTED_TEST_ORIGIN},
+        ):
+            raise LiveStateError("live command plan owner is stale or revoked")
     results=[]
     for ordinal,command in enumerate(plan.commands):
+        if owner is not None and not is_mock_authority_binding(plan.authority_binding):
+            if isinstance(owner, ParentPlanAuthority):
+                owner.assert_current(plan.authority_binding)
+            elif not authority_binding_is_current(
+                owner,
+                plan.authority_binding,
+                profile_digest=plan.profile,
+                 allow_injected=plan.authority_binding.origin in {INJECTED_FAKE_ORIGIN, INJECTED_TEST_ORIGIN},
+            ):
+                raise LiveStateError("live command plan owner is stale or revoked")
         raw=transport.send(command.text)
         value = _parse_response(command,raw)
         raw_sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         result_id=f"r{ordinal:03d}_{command.command_id}"
-        digest=_sha((plan.digest,ordinal,command.raw_digest,result_id,raw_sha,command.parser,value,command.completeness,command.read_after_write))
+        digest=_sha((plan.digest,ordinal,command.raw_digest,result_id,raw_sha,command.parser,value,command.completeness,command.read_after_write,plan.authority_binding.canonical()))
         results.append(CommandResult(plan.digest,ordinal,command.raw_digest,result_id,value,raw_sha,command.completeness,
-            command.read_after_write,command.parser,digest,_RESULT_MARKER))
+            command.read_after_write,command.parser,digest,_RESULT_MARKER,plan.authority_binding))
+    if owner is not None and not is_mock_authority_binding(plan.authority_binding):
+        if isinstance(owner, ParentPlanAuthority):
+            owner.assert_current(plan.authority_binding)
+        elif not authority_binding_is_current(
+            owner,
+            plan.authority_binding,
+            profile_digest=plan.profile,
+             allow_injected=plan.authority_binding.origin in {INJECTED_FAKE_ORIGIN, INJECTED_TEST_ORIGIN},
+        ):
+            raise LiveStateError("live command plan owner is stale or revoked")
     return tuple(results)
 
+_RESET_LOCK = RLock()
 _USED_RESET_TOKENS: set[tuple[str, str, str, str]] = set()
 _RESET_GENERATIONS: dict[tuple[str, str, str], int] = {}
-def validate_reset_token(token: str, generation: int, *, profile="0"*64, campaign="k12", cell="cell") -> None:
+
+
+def _validate_reset_token_locked(
+    token: str, generation: int, *, profile="0"*64, campaign="k12", cell="cell",
+) -> tuple[str, tuple[str, str, str]]:
     token = _ident(token, "reset token")
     cell_key=(_ident(profile),_ident(campaign),_ident(cell)); token_key=(*cell_key,token)
     if (type(generation) is not int or generation < 1 or token_key in _USED_RESET_TOKENS
             or generation <= _RESET_GENERATIONS.get(cell_key, 0)):
         raise LiveStateError("stale or reused reset token")
+    return token, cell_key
+
+
+def validate_reset_token(token: str, generation: int, *, profile="0"*64, campaign="k12", cell="cell") -> None:
+    """Validate a reset token against this process's one-shot registry.
+
+    The registry is intentionally process-local.  It is not a cross-process
+    authority; callers that need that contract must use a durable authority
+    handle, while unsupported handles are rejected at the plan boundary.
+    """
+    with _RESET_LOCK:
+        _validate_reset_token_locked(
+            token, generation, profile=profile, campaign=campaign, cell=cell,
+        )
+
+
 def consume_reset_token(token: str, generation: int, *, profile="0"*64, campaign="k12", cell="cell") -> None:
-    validate_reset_token(token, generation, profile=profile, campaign=campaign, cell=cell)
-    cell_key=(_ident(profile),_ident(campaign),_ident(cell))
-    _USED_RESET_TOKENS.add((*cell_key,_ident(token)))
-    _RESET_GENERATIONS[cell_key] = generation
+    """Validate and consume a reset token atomically in this process."""
+    with _RESET_LOCK:
+        token, cell_key = _validate_reset_token_locked(
+            token, generation, profile=profile, campaign=campaign, cell=cell,
+        )
+        _USED_RESET_TOKENS.add((*cell_key,token))
+        _RESET_GENERATIONS[cell_key] = generation
 
 _STATE_TOKEN = object()
 
 @dataclass(frozen=True, slots=True, init=False)
 class LiveState:
-    profile:str; campaign:str; cell:str; reset_token:str; generation:int; plan_digest:str=""; plan_authority_digest:str=""; plan_authority_id:str=""; plan_descriptor:str="mock"; plan_purpose:str="mock"; blocks:tuple=(); positions:tuple=(); inventories:tuple=(); entities:tuple=(); scoreboard:tuple=(); residual:tuple=(); residual_count:int|None=None; complete:tuple=(); provenance:tuple=(); field_provenance:tuple=(); raw_digests:tuple=(); reset_attestation_sha256:str=""; read_after_write:bool=False
+    profile:str; campaign:str; cell:str; reset_token:str; generation:int; plan_digest:str=""; plan_authority_digest:str=""; plan_authority_id:str=""; plan_descriptor:str="mock"; plan_purpose:str="mock"; blocks:tuple=(); positions:tuple=(); inventories:tuple=(); entities:tuple=(); scoreboard:tuple=(); residual:tuple=(); residual_count:int|None=None; complete:tuple=(); provenance:tuple=(); field_provenance:tuple=(); raw_digests:tuple=(); reset_attestation_sha256:str=""; read_after_write:bool=False; authority_binding:AuthorityBinding=field(default_factory=mock_authority_binding); minting_process_id:int=field(default=0,repr=False,compare=False)
     _plan_authority_marker:object=field(default=None,repr=False,compare=False)
-    def __init__(self,profile,campaign,cell,reset_token,generation,*,plan_digest="",plan_authority_digest="",plan_authority_id="",plan_descriptor="mock",plan_purpose="mock",blocks=(),positions=(),inventories=(),entities=(),scoreboard=(),residual=(),residual_count=None,complete=(),provenance=(),field_provenance=(),raw_digests=(),reset_attestation_sha256="",read_after_write=False,_marker=None,_plan_authority_marker=None):
+    _authority_owner:object=field(default=None,repr=False,compare=False)
+    def __init__(self,profile,campaign,cell,reset_token,generation,*,plan_digest="",plan_authority_digest="",plan_authority_id="",plan_descriptor="mock",plan_purpose="mock",blocks=(),positions=(),inventories=(),entities=(),scoreboard=(),residual=(),residual_count=None,complete=(),provenance=(),field_provenance=(),raw_digests=(),reset_attestation_sha256="",read_after_write=False,authority_binding=None,minting_process_id=0,_marker=None,_plan_authority_marker=None,_authority_owner=None):
         if _marker is not _STATE_TOKEN: raise LiveStateError("LiveState is normalizer-minted")
-        for name,value in (("profile",profile),("campaign",campaign),("cell",cell),("reset_token",reset_token),("generation",generation),("plan_digest",plan_digest),("plan_authority_digest",plan_authority_digest),("plan_authority_id",plan_authority_id),("plan_descriptor",plan_descriptor),("plan_purpose",plan_purpose),("blocks",tuple(blocks)),("positions",tuple(positions)),("inventories",tuple(inventories)),("entities",tuple(entities)),("scoreboard",tuple(scoreboard)),("residual",tuple(residual)),("residual_count",residual_count),("complete",tuple(complete)),("provenance",tuple(provenance)),("field_provenance",tuple(field_provenance)),("raw_digests",tuple(raw_digests)),("reset_attestation_sha256",reset_attestation_sha256),("read_after_write",read_after_write)): object.__setattr__(self,name,value)
+        authority_binding = resolve_authority_binding(authority_binding)
+        for name,value in (("profile",profile),("campaign",campaign),("cell",cell),("reset_token",reset_token),("generation",generation),("plan_digest",plan_digest),("plan_authority_digest",plan_authority_digest),("plan_authority_id",plan_authority_id),("plan_descriptor",plan_descriptor),("plan_purpose",plan_purpose),("blocks",tuple(blocks)),("positions",tuple(positions)),("inventories",tuple(inventories)),("entities",tuple(entities)),("scoreboard",tuple(scoreboard)),("residual",tuple(residual)),("residual_count",residual_count),("complete",tuple(complete)),("provenance",tuple(provenance)),("field_provenance",tuple(field_provenance)),("raw_digests",tuple(raw_digests)),("reset_attestation_sha256",reset_attestation_sha256),("read_after_write",read_after_write),("authority_binding",authority_binding)): object.__setattr__(self,name,value)
+        object.__setattr__(self,"minting_process_id",minting_process_id)
         object.__setattr__(self,"_plan_authority_marker",_plan_authority_marker)
+        object.__setattr__(self,"_authority_owner",_authority_owner)
     @property
-    def digest(self): return _sha(self.__dict__ if hasattr(self,"__dict__") else (self.profile,self.campaign,self.cell,self.reset_token,self.generation,self.plan_digest,self.plan_authority_digest,self.plan_authority_id,self.plan_descriptor,self.plan_purpose,self.blocks,self.positions,self.inventories,self.entities,self.scoreboard,self.residual,self.residual_count,self.complete,self.provenance,self.field_provenance,self.raw_digests,self.reset_attestation_sha256,self.read_after_write))
+    def digest(self):
+        return _sha((
+            self.profile,
+            self.campaign,
+            self.cell,
+            self.reset_token,
+            self.generation,
+            self.plan_digest,
+            self.plan_authority_digest,
+            self.plan_authority_id,
+            self.plan_descriptor,
+            self.plan_purpose,
+            self.blocks,
+            self.positions,
+            self.inventories,
+            self.entities,
+            self.scoreboard,
+            self.residual,
+            self.residual_count,
+            self.complete,
+            self.provenance,
+            self.field_provenance,
+            self.raw_digests,
+            self.reset_attestation_sha256,
+            self.read_after_write,
+            self.authority_binding,
+            self.minting_process_id,
+        ))
+    @property
+    def binding(self) -> AuthorityBinding:
+        return self.authority_binding
+
+    @property
+    def authority(self) -> Any:
+        """Parent authority retained by the authenticated state."""
+        return self._authority_owner
+
+    @property
+    def plan_authority_marker(self) -> object:
+        """Opaque plan ownership marker exposed through the state API."""
+        return self._plan_authority_marker
+
+    @property
+    def origin(self) -> str:
+        """Evidence origin carried by the normalized state authority."""
+        return self.authority_binding.origin
+
+    @property
+    def evidence_origin(self) -> str:
+        return self.origin
+
+    @property
+    def runtime_admissible(self) -> bool:
+        return self.authority_binding.runtime_admissible
 @dataclass(frozen=True,slots=True)
 class RawDigestPair:
     command_id:str; raw_sha256:str
@@ -423,6 +772,8 @@ class FieldProvenance:
 def validate_state(state:LiveState)->LiveState:
     domains={"blocks","positions","inventories","entities","scoreboard","residual"}
     if not isinstance(state,LiveState) or type(state.generation) is not int or state.generation<1 or not set(state.complete) or not set(state.complete)<=domains: raise LiveStateError("invalid or partial state")
+    if state.minting_process_id != os.getpid(): raise LiveStateError("cross-process normalized state handle is unsupported")
+    if not isinstance(state.authority_binding, AuthorityBinding): raise LiveStateError("state authority binding mismatch")
     if not re.fullmatch(r"[0-9a-f]{64}",state.profile): raise LiveStateError("state profile digest mismatch")
     if not re.fullmatch(r"[0-9a-f]{64}",state.plan_digest): raise LiveStateError("state plan digest mismatch")
     if state.plan_authority_digest and not re.fullmatch(r"[0-9a-f]{64}",state.plan_authority_digest): raise LiveStateError("state plan authority mismatch")
@@ -435,8 +786,28 @@ def validate_state(state:LiveState)->LiveState:
             or any(not isinstance(x,FieldProvenance) for x in state.field_provenance)
             or len({x.field_key for x in state.field_provenance})!=len(state.field_provenance)
             or any((x.result_id,x.raw_sha256) not in {(r.command_id,r.raw_sha256) for r in state.raw_digests} for x in state.field_provenance)
-            or any(d not in state.complete or not ids for d, ids in state.provenance)):
+             or any(d not in state.complete or not ids for d, ids in state.provenance)):
         raise LiveStateError("raw digest pairs required")
+    if not is_mock_authority_binding(state.authority_binding):
+        owner = state.authority
+        current = False
+        if isinstance(owner, ParentPlanAuthority):
+            try:
+                owner.assert_current(state.authority_binding)
+                current = True
+            except (AttributeError, TypeError, ValueError):
+                current = False
+        elif owner is not None:
+            current = authority_binding_is_current(
+                owner,
+                state.authority_binding,
+                profile_digest=state.profile,
+                 allow_injected=state.authority_binding.origin in {INJECTED_FAKE_ORIGIN, INJECTED_TEST_ORIGIN},
+            )
+        if (owner is None or state.plan_authority_marker is None
+                or not state.plan_authority_digest or not state.plan_authority_id
+                or not current):
+            raise LiveStateError("state authority lifecycle is stale or revoked")
     return state
 def reset_attestation_digest(plan: CommandPlan, results: Sequence[CommandResult]) -> str:
     return _sha((plan.digest, tuple(result.digest for result in results)))
@@ -457,11 +828,28 @@ def normalize_state(plan: CommandPlan, results: Sequence[CommandResult]) -> Live
     """The sole state mint: authenticated plan plus its exact ordered read-back."""
     if not isinstance(plan, CommandPlan) or type(results) not in {tuple, list} or len(results) != len(plan.commands): raise LiveStateError("exact command results required")
     if any(not isinstance(r, CommandResult) for r in results): raise LiveStateError("invalid command result")
+    if plan.minting_process_id != os.getpid():
+        raise LiveStateError("cross-process command plan handle is unsupported")
+    owner = plan.authority
+    if not is_mock_authority_binding(plan.authority_binding):
+        if (owner is None or plan.authority_marker is None
+                or not plan.authority_digest or not plan.authority_id):
+            raise LiveStateError("live normalized state owner is required")
+        if isinstance(owner, ParentPlanAuthority):
+            owner.assert_current(plan.authority_binding)
+        elif not authority_binding_is_current(
+            owner,
+            plan.authority_binding,
+            profile_digest=plan.profile,
+             allow_injected=plan.authority_binding.origin in {INJECTED_FAKE_ORIGIN, INJECTED_TEST_ORIGIN},
+        ):
+            raise LiveStateError("live normalized state owner is stale or revoked")
     for ordinal,(command, result) in enumerate(zip(plan.commands, results)):
         if (result.plan_digest != plan.digest or result.ordinal != ordinal
                 or result.command_digest != command.raw_digest
                 or result.command_id != f"r{ordinal:03d}_{command.command_id}" or result.parser_identity != command.parser
-                or result.completeness != command.completeness or result.read_after_write != command.read_after_write): raise LiveStateError("command result order or identity mismatch")
+                or result.completeness != command.completeness or result.read_after_write != command.read_after_write
+                or result.authority_binding != plan.authority_binding): raise LiveStateError("command result order or identity mismatch")
     blocks:dict[tuple[int,int,int],str]={}; positions:dict[str,tuple[float,float,float]]={}
     inventories:dict[str,dict[str,int]]={}; inventory_snbt:dict[str,dict[str,int]]={}
     entity_parts:dict[str,dict[str,Any]]={}; residual_parts:dict[str,dict[str,Any]]={}; scoreboard:dict[tuple[str,str],int]={}
@@ -530,11 +918,15 @@ def normalize_state(plan: CommandPlan, results: Sequence[CommandResult]) -> Live
     field_provenance=tuple(FieldProvenance(key,result.command_id,result.raw_sha256,result.digest)
         for command,result in zip(plan.commands,results) for key in _field_keys(command))
     state=LiveState(plan.profile,plan.campaign,plan.cell,plan.reset_token,plan.generation,**values,complete=names,
-                     provenance=tuple((d,tuple(domain_ids[d])) for d in names),
-                     plan_digest=plan.digest,plan_authority_digest=plan.authority_digest,plan_authority_id=plan.authority_id,
-                     plan_descriptor=plan.descriptor,plan_purpose=plan.purpose,field_provenance=field_provenance,raw_digests=pairs,
-                     reset_attestation_sha256=reset_attestation_digest(plan,results),read_after_write=True,
-                     _plan_authority_marker=plan._authority_marker,_marker=_STATE_TOKEN)
+                      provenance=tuple((d,tuple(domain_ids[d])) for d in names),
+                      plan_digest=plan.digest,plan_authority_digest=plan.authority_digest,plan_authority_id=plan.authority_id,
+                      plan_descriptor=plan.descriptor,plan_purpose=plan.purpose,field_provenance=field_provenance,raw_digests=pairs,
+                      reset_attestation_sha256=reset_attestation_digest(plan,results),read_after_write=True,
+                      authority_binding=plan.authority_binding,
+                      minting_process_id=plan.minting_process_id,
+                      _plan_authority_marker=plan.authority_marker,
+                      _authority_owner=owner,
+                      _marker=_STATE_TOKEN)
     return validate_state(state)
 def normalize_mock_state(**kwargs):
     raise LiveStateError("arbitrary normalized state construction is unavailable")
@@ -610,4 +1002,4 @@ def parse_snbt(raw:str):
             for y in x: walk(y)
         elif type(x) not in {str,int,float,bool} and x is not None: raise LiveStateError("unsupported SNBT")
     walk(value); return value
-__all__=["LiveStateError","CommandKind","RconCommand","CommandPlan","ParentPlanAuthority","MockTransport","Timeout","CommandResult","LiveState","RawDigestPair","FieldProvenance","validate_state","normalize_state","normalize_mock_state","reset_attestation_digest","make_plan","plan_digest","execute_plan","parse_snbt","detached_artifact_digest","forceload_add","forceload_query","gamerule","actor_exists","teleport","clear_all","clear","give","count_items","setblock","execute_if_block","data_pos","data_inventory","cardinality","entity_uuid","entity_health","kill_score","score_query","residual_census","item_snbt","item_uuid","select_residual","summon_zombie","kill_competing","kill_items","objective_add","objective_remove","validate_reset_token","consume_reset_token","tag_selector","tag_count_selector","zombie_count_selector","bound_uuid","pos","qty"]
+__all__=["AuthorityBinding","LiveStateError","CommandKind","RconCommand","CommandPlan","ParentPlanAuthority","MockTransport","Timeout","CommandResult","LiveState","RawDigestPair","FieldProvenance","canonical_digest_value","validate_state","normalize_state","normalize_mock_state","reset_attestation_digest","make_plan","plan_digest","execute_plan","parse_snbt","detached_artifact_digest","forceload_add","forceload_query","gamerule","actor_exists","teleport","clear_all","clear","give","count_items","setblock","execute_if_block","data_pos","data_inventory","cardinality","entity_uuid","entity_health","kill_score","score_query","residual_census","item_snbt","item_uuid","select_residual","summon_zombie","kill_competing","kill_items","objective_add","objective_remove","validate_reset_token","consume_reset_token","tag_selector","tag_count_selector","zombie_count_selector","bound_uuid","pos","qty"]

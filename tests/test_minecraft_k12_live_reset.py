@@ -1,5 +1,6 @@
 import pytest
-from benchmarks.minecraft.k12_live_reset import reset_plan, residual_readback_plan, load_reset_contract
+import benchmarks.minecraft.k12_live_reset as live_reset
+from benchmarks.minecraft.k12_live_reset import execute_reset, reset_plan, residual_readback_plan, load_reset_contract
 from benchmarks.minecraft.k12_guarded_backend import K12AuthenticatedProfile
 from benchmarks.minecraft.k12_live_state import (LiveStateError, MockTransport, ParentPlanAuthority,
     count_items, data_inventory, data_pos, execute_plan, residual_census)
@@ -16,6 +17,22 @@ def test_s4_requires_no_bound_target_and_summons_tagged_target():
     assert "execute positioned" in text and "minecraft.killed:minecraft.zombie" in text
     assert "distance=..16" in text and "tp agent 0 64 0" in text
 
+
+def test_reset_rejects_a_plan_handle_from_another_process(monkeypatch):
+    plan = reset_plan(
+        "S1",
+        authority=auth(),
+        cell="cross-process-cell",
+        reset_token="cross-process-token",
+    )
+    monkeypatch.setattr(
+        live_reset.os,
+        "getpid",
+        lambda: plan.minting_process_id + 1,
+    )
+    with pytest.raises(LiveStateError, match="cross-process"):
+        execute_reset(plan, MockTransport({}))
+
 def test_s2_and_s5_establish_exact_inventory_and_contract_is_authenticated():
     s2=";".join(c.text for c in reset_plan("S2",authority=auth()).commands)
     assert "clear agent;" in s2 and "give agent stone 1" in s2
@@ -29,6 +46,7 @@ def test_s2_and_s5_establish_exact_inventory_and_contract_is_authenticated():
     census_results=execute_plan(census_plan,MockTransport({census_command.text:"Test passed, count: 2"}))
     after=(data_pos("agent"),count_items("agent","stone"),data_inventory("agent"))
     post=residual_readback_plan(authority=authority,census_plan=census_plan,census_results=census_results,after_commands=after)
+    assert post.authority_binding == authority.authority_binding
     assert sum("data get entity @e[type=item" in command.text for command in post.commands)==4
     assert sum("run tag @s add k12_item_" in command.text for command in post.commands)==2
     assert all("distance=..16" in command.text for command in post.commands[len(after):])

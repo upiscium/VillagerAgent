@@ -1,0 +1,30 @@
+{
+  "artifact_id": "minecraft-k12-live-environment-policy",
+  "artifact_version": 1,
+  "schema_version": "minecraft-k12-live-environment-policy/1",
+  "capsule_identity": "minecraft-k12-live-execution-capsule/1",
+  "python_identity": "CPython/3.10.19",
+  "critical_distributions": {
+    "PyYAML": "6.0.3",
+    "fastapi": "0.136.1",
+    "httpx": "0.25.2",
+    "openai": "1.6.1",
+    "starlette": "1.0.0",
+    "tiktoken": "0.5.1"
+  },
+  "node_identity": "node/22.23.2",
+  "java_identity": "java/17",
+  "locale": "en_us",
+  "seed_support_state": "unsupported",
+  "user_systemd_required": true,
+  "cgroup_v2_required": true,
+  "user_site_allowed": false,
+  "editable_installs_allowed": false,
+  "pth_allowed": false,
+  "sitecustomize_allowed": false,
+  "startup_hooks_allowed": false,
+  "writable_worktree_imports_allowed": false,
+  "secret_policy": "reference-name-and-presence-only",
+  "diagnostic_host_inventory_gates_execution": false,
+  "detached_artifact_sha256": "29ea8d36a73bdee0113755d017f5ed146fb26b4d239edb051619feaf248f54fd"
+}

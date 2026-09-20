@@ -1,4 +1,7 @@
+import threading
+
 import pytest
+import benchmarks.minecraft.k12_live_state as live_state
 from benchmarks.minecraft.k12_live_state import *
 PROFILE="0"*64
 def test_only_typed_factories_render_commands():
@@ -12,6 +15,33 @@ def test_mock_marker_and_bounds():
     assert result.value==(1, 2, 3) and len(result.raw_sha256)==64
     with pytest.raises(LiveStateError): execute_plan(p,lambda x:"bad")
     with pytest.raises(LiveStateError): pos((0,64,"bad"))
+
+def test_mock_authority_binding_propagates_through_plan_result_and_state():
+    command = data_pos("agent")
+    plan = make_plan((command,))
+    results = execute_plan(
+        plan,
+        MockTransport({command.text: 'agent has the following entity data: [0.0d,64.0d,0.0d]'}),
+    )
+    state = normalize_state(plan, results)
+    assert plan.authority_binding.provenance == "mock_only"
+    assert results[0].authority_binding == plan.authority_binding
+    assert state.authority_binding == plan.authority_binding
+
+def test_state_digest_canonicalizes_field_provenance_and_authority_binding():
+    command = data_pos("agent")
+    plan = make_plan((command,))
+    results = execute_plan(
+        plan,
+        MockTransport({command.text: 'agent has the following entity data: [0.0d,64.0d,0.0d]'}),
+    )
+    first = normalize_state(plan, results)
+    second = normalize_state(plan, results)
+    assert first.field_provenance
+    assert all(isinstance(value, FieldProvenance) for value in first.field_provenance)
+    assert canonical_digest_value(first.authority_binding) == first.authority_binding.canonical()
+    assert len(first.digest) == 64
+    assert first.digest == second.digest
 def test_raw_digest_pairs_are_strict():
     with pytest.raises(LiveStateError): RawDigestPair("x","bad")
 
@@ -22,6 +52,61 @@ def test_parsers_timeout_ack_and_reset_freshness_fail_closed():
     with pytest.raises(LiveStateError,match="typed"): execute_plan(p,MockTransport({p.commands[0].text:"Found many matching items on player agent"}))
     consume_reset_token("unique",1,profile=PROFILE,campaign="c",cell="x")
     with pytest.raises(LiveStateError,match="stale"): consume_reset_token("unique",1,profile=PROFILE,campaign="c",cell="x")
+
+
+def test_concurrent_reset_token_consumption_has_exactly_one_winner(monkeypatch):
+    class RecordingLock:
+        def __init__(self):
+            self._lock = threading.RLock()
+            self._stats_lock = threading.Lock()
+            self.entered = 0
+            self.active = 0
+            self.max_active = 0
+
+        def __enter__(self):
+            self._lock.acquire()
+            with self._stats_lock:
+                self.entered += 1
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            with self._stats_lock:
+                self.active -= 1
+            self._lock.release()
+
+    reset_lock = RecordingLock()
+    monkeypatch.setattr(live_state, "_RESET_LOCK", reset_lock)
+    ready = threading.Barrier(2)
+    outcomes = []
+    outcomes_lock = threading.Lock()
+
+    def consume() -> None:
+        ready.wait()
+        try:
+            consume_reset_token(
+                "atomic-concurrent-token",
+                1,
+                profile=PROFILE,
+                campaign="atomic-concurrent-campaign",
+                cell="atomic-concurrent-cell",
+            )
+        except LiveStateError:
+            outcome = "rejected"
+        else:
+            outcome = "consumed"
+        with outcomes_lock:
+            outcomes.append(outcome)
+
+    threads = (threading.Thread(target=consume), threading.Thread(target=consume))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["consumed", "rejected"]
+    assert reset_lock.entered == 2 and reset_lock.max_active == 1
 
 def test_identifier_selector_and_snbt_bounds():
     with pytest.raises(LiveStateError): tag_selector("bad tag")

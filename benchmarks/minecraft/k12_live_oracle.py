@@ -1,18 +1,28 @@
 """Fail-closed parent oracle for the five live mock strata."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from math import dist
 from typing import Any, Sequence
 import json
 from pathlib import Path
 import re
+from benchmarks.common.eac.canonical import canonical_sha256
 from benchmarks.minecraft.k12_live_state import (LiveState, LiveStateError, bound_uuid,
-    detached_artifact_digest, validate_state)
+    canonical_digest_value, detached_artifact_digest, validate_state)
 from benchmarks.minecraft.k12_runtime_profile import strict_json_load
+from benchmarks.minecraft.k12_guarded_backend import authority_binding_is_current
+from benchmarks.minecraft.k12_execution_provenance import (
+    ActiveQualificationAuthority,
+    AuthorityBinding,
+    INJECTED_TEST_ORIGIN,
+)
 
 class Truth(str,Enum): TRUE="true"; FALSE="false"; UNKNOWN="unknown"; NOT_APPLICABLE="not_applicable"
 OracleValue=Truth
+RUNTIME_VERIFIED_ORIGIN = "runtime_verified"
+INJECTED_FAKE_ORIGIN = "injected_fake"
+TEST_ONLY_ORIGIN = "test_only"
 @dataclass(frozen=True,slots=True)
 class LiveBinding:
     profile:str; campaign:str; cell:str; reset_token:str; generation:int; request:str; permit:str; effect:str; authority_id:str; arm:str="A"
@@ -20,13 +30,238 @@ class LiveBinding:
 @dataclass(frozen=True,slots=True)
 class PollSample:
     elapsed_ms:int; state:LiveState
-@dataclass(frozen=True,slots=True)
+
+
+def _rejection_authority_is_current(value: "RejectionEvidence") -> bool:
+    """Revalidate the parent authority at the rejection-consumption boundary."""
+
+    try:
+        authority = value.authority
+        if not isinstance(authority, ActiveQualificationAuthority):
+            return False
+        if authority.binding != value.authority_binding:
+            return False
+        if authority.origin == RUNTIME_VERIFIED_ORIGIN:
+            expected_origin = RUNTIME_VERIFIED_ORIGIN
+            allow_injected = False
+        elif authority.origin == INJECTED_TEST_ORIGIN:
+            expected_origin = INJECTED_FAKE_ORIGIN
+            allow_injected = True
+        else:
+            return False
+        return (
+            value.evidence_origin == expected_origin
+            and authority_binding_is_current(
+                authority,
+                value.authority_binding,
+                profile_digest=authority.profile_digest,
+                namespace="live_qualification",
+                allow_injected=allow_injected,
+            )
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
+_REJECTION_TOKEN = object()
+
+
+@dataclass(frozen=True,slots=True,init=False)
 class RejectionEvidence:
     binding: LiveBinding; current_inadmissible: bool; native_entries: int; evidence_digest: str
-    def __post_init__(self):
-        if (self.current_inadmissible is not True or self.native_entries != 0
-                or not re.fullmatch(r"[0-9a-f]{64}",self.evidence_digest)):
+    before: LiveState
+    after: LiveState
+    authority_binding: AuthorityBinding
+    evidence_origin: str
+    identity: str = field(init=False)
+    _authority: Any = field(default=None, repr=False, compare=False)
+    _marker: object = field(default=None, repr=False, compare=False)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("rejection evidence is parent-minted")
+
+    @classmethod
+    def mint(
+        cls,
+        authority: ActiveQualificationAuthority,
+        binding: LiveBinding,
+        before: LiveState,
+        after: LiveState,
+        *,
+        evidence_digest: str,
+        current_inadmissible: bool = True,
+        native_entries: int = 0,
+    ) -> "RejectionEvidence":
+        """Mint authenticated stale-rejection evidence from the parent graph.
+
+        The evidence origin is derived from the active parent authority; it is
+        never a caller-controlled field.  Both normalized read-backs are
+        retained and must carry the same cell/binding identity.
+        """
+
+        if not isinstance(authority, ActiveQualificationAuthority):
+            raise LiveStateError("active parent qualification authority required")
+        if not isinstance(binding, LiveBinding) or binding.arm != "S":
+            raise LiveStateError("stale-rejection binding is invalid")
+        if not isinstance(before, LiveState) or not isinstance(after, LiveState):
+            raise LiveStateError("before and after normalized states are required")
+        if current_inadmissible is not True or native_entries != 0:
             raise LiveStateError("invalid stale-rejection evidence")
+        if not isinstance(evidence_digest, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", evidence_digest
+        ):
+            raise LiveStateError("invalid stale-rejection evidence")
+        expected_origin = (
+            INJECTED_FAKE_ORIGIN
+            if authority.origin == INJECTED_TEST_ORIGIN
+            else RUNTIME_VERIFIED_ORIGIN
+        )
+        if authority.origin not in {RUNTIME_VERIFIED_ORIGIN, INJECTED_TEST_ORIGIN}:
+            raise LiveStateError("authority origin is invalid")
+        try:
+            validate_state(before)
+            validate_state(after)
+        except (TypeError, ValueError) as exc:
+            raise LiveStateError("before and after normalized states are required") from exc
+        if before.plan_purpose != "before" or after.plan_purpose != "after":
+            raise LiveStateError("before and after normalized states are required")
+        if not authority_binding_is_current(
+            authority,
+            authority.binding,
+            profile_digest=authority.profile_digest,
+            namespace="live_qualification",
+            allow_injected=authority.origin == INJECTED_TEST_ORIGIN,
+        ):
+            raise LiveStateError("qualification authority is stale or revoked")
+        for state in (before, after):
+            if (
+                state.profile != binding.profile
+                or state.campaign != binding.campaign
+                or state.cell != binding.cell
+                or state.reset_token != binding.reset_token
+                or state.generation != binding.generation
+                or state.plan_authority_id != binding.authority_id
+                or state.authority_binding != authority.binding
+            ):
+                raise LiveStateError("rejection evidence does not match state binding")
+        value = object.__new__(cls)
+        object.__setattr__(value, "binding", binding)
+        object.__setattr__(value, "current_inadmissible", current_inadmissible)
+        object.__setattr__(value, "native_entries", native_entries)
+        object.__setattr__(value, "evidence_digest", evidence_digest)
+        object.__setattr__(value, "before", before)
+        object.__setattr__(value, "after", after)
+        object.__setattr__(value, "authority_binding", authority.binding)
+        object.__setattr__(value, "evidence_origin", expected_origin)
+        object.__setattr__(value, "_authority", authority)
+        object.__setattr__(value, "_marker", _REJECTION_TOKEN)
+        object.__setattr__(
+            value,
+            "identity",
+            canonical_sha256(
+                {
+                    "artifact": "minecraft-k12-live-rejection-evidence/2",
+                    "binding": canonical_digest_value(binding),
+                    "before": before.digest,
+                    "after": after.digest,
+                    "authority_binding": authority.binding.canonical(),
+                    "evidence_digest": evidence_digest,
+                    "evidence_origin": expected_origin,
+                }
+            ),
+        )
+        return value
+
+    from_parent = mint
+    parent_mint = mint
+
+    @property
+    def before_state(self) -> LiveState:
+        return self.before
+
+    @property
+    def after_state(self) -> LiveState:
+        return self.after
+
+    @property
+    def authority(self) -> ActiveQualificationAuthority:
+        return self._authority
+
+    @property
+    def parent_authority(self) -> ActiveQualificationAuthority:
+        return self._authority
+
+    def matches(
+        self,
+        binding: LiveBinding,
+        before: LiveState,
+        after: LiveState,
+    ) -> bool:
+        return (
+            self._marker is _REJECTION_TOKEN
+            and self.binding == binding
+            and isinstance(before, LiveState)
+            and isinstance(after, LiveState)
+            and self.before.digest == before.digest
+            and self.after.digest == after.digest
+            and self.authority_binding == before.authority_binding == after.authority_binding
+        )
+
+    @property
+    def runtime_admissible(self) -> bool:
+        if self.evidence_origin != RUNTIME_VERIFIED_ORIGIN:
+            return False
+        return authority_binding_is_current(
+            self._authority,
+            self.authority_binding,
+            profile_digest=getattr(self._authority, "profile_digest", None),
+            namespace="live_qualification",
+        )
+
+
+def mint_rejection_evidence(
+    authority: ActiveQualificationAuthority,
+    binding: LiveBinding,
+    before: LiveState,
+    after: LiveState,
+    *,
+    evidence_digest: str,
+    current_inadmissible: bool = True,
+    native_entries: int = 0,
+) -> RejectionEvidence:
+    """Public parent mint boundary for stale-rejection evidence."""
+
+    return RejectionEvidence.mint(
+        authority,
+        binding,
+        before,
+        after,
+        evidence_digest=evidence_digest,
+        current_inadmissible=current_inadmissible,
+        native_entries=native_entries,
+    )
+
+
+def qualification_truth(arm: str, value: Truth, *, rejection_verified: bool = False) -> bool:
+    """Map the A/R/S oracle result to qualification success.
+
+    A and R require a known successful objective.  S is the deliberate
+    stale-rejection control: ``NOT_APPLICABLE`` is a valid terminal control
+    outcome only with typed rejection evidence, and is never task success.
+    This helper keeps that distinction explicit for aggregate builders.
+    """
+
+    if arm in {"A", "R"}:
+        return value is Truth.TRUE
+    if arm == "S":
+        return value is Truth.NOT_APPLICABLE and rejection_verified
+    return False
+
+
+def expected_rejection_is_not_success(arm: str, value: Truth) -> bool:
+    """Return whether an oracle value is a rejection/control outcome."""
+
+    return arm == "S" and value is Truth.NOT_APPLICABLE
 def _bound(a:LiveBinding|None,b:LiveBinding|None,before,after):
     return a is not None and a.matches(b) and before is not None and after is not None and before.profile==a.profile and after.profile==a.profile and before.campaign==a.campaign and after.campaign==a.campaign and before.cell==a.cell and after.cell==a.cell and before.reset_token==a.reset_token and after.reset_token==a.reset_token and before.generation==a.generation and after.generation==a.generation and before.plan_authority_id==a.authority_id and after.plan_authority_id==a.authority_id
 def _ready(s, required, descriptor, purpose):
@@ -72,7 +307,12 @@ def evaluate(stratum:str,before:LiveState|None,after:LiveState|None,*,binding:Li
     if not _has_objective(stratum,before,after,position,item,sender,recipient,target_uuid): return Truth.UNKNOWN
     if arm == "S":
         return Truth.NOT_APPLICABLE if (isinstance(rejection,RejectionEvidence)
-            and rejection.binding==binding and _unchanged(stratum,before,after,position,sender,recipient)) else Truth.UNKNOWN
+            and rejection.matches(binding, before, after)
+            and _rejection_authority_is_current(rejection)
+            and rejection.current_inadmissible is True
+            and rejection.native_entries == 0
+            and rejection.evidence_origin in {RUNTIME_VERIFIED_ORIGIN, INJECTED_FAKE_ORIGIN}
+            and _unchanged(stratum,before,after,position,sender,recipient)) else Truth.UNKNOWN
     if stratum=="S3":
         if position is None:return Truth.UNKNOWN
         p=dict(after.positions).get(sender)
@@ -133,4 +373,8 @@ def load_oracle_contract(path=None):
         raise LiveStateError("invalid detached artifact digest")
     if data.get("schema")!="minecraft-k12-live-oracle/1" or data.get("acknowledgement")!="en_us": raise LiveStateError("invalid oracle contract")
     return data
-__all__=["Truth","OracleValue","LiveBinding","PollSample","RejectionEvidence","evaluate","load_oracle_contract"]
+__all__=["Truth","OracleValue","RUNTIME_VERIFIED_ORIGIN","INJECTED_FAKE_ORIGIN",
+          "TEST_ONLY_ORIGIN","LiveBinding","PollSample","RejectionEvidence",
+          "mint_rejection_evidence",
+         "qualification_truth","expected_rejection_is_not_success","evaluate",
+         "load_oracle_contract"]

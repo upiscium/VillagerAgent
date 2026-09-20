@@ -1,4 +1,10 @@
-"""Authenticated, deeply immutable identities used by the K12 live path."""
+"""Authenticated, deeply immutable identities used by the K12 live path.
+
+``LiveArtifact`` is a generic diagnostic container, not an execution
+capability.  It remains permanently non-promotable even when its contents
+look complete; only the authority-bound aggregate/admission types in the live
+qualification and validation modules can cross a runtime gate.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -59,8 +65,14 @@ class LiveArtifact:
     identity: DomainIdentity | None = None
     rejected_by_final_gates: bool = True
     digest: str = field(init=False)
+    execution_provenance: str = field(init=False, default="mock_only")
+    evidence_origin: str = field(init=False, default="test_only")
 
     def __post_init__(self) -> None:
+        # This flag is a permanent invariant, not caller-controlled metadata.
+        # Accepting ``False`` here would create a misleading generic promotion
+        # artifact even though the final gate never accepts this type.
+        object.__setattr__(self, "rejected_by_final_gates", True)
         frozen = tuple(freeze(cell) for cell in self.cells)
         object.__setattr__(self, "cells", frozen)
         object.__setattr__(self, "digest", canonical_sha256({
@@ -72,6 +84,18 @@ class LiveArtifact:
 
     def final_launch_ready(self) -> bool:
         return False  # Only FinalGateInput is accepted by the final gate.
+
+    @property
+    def promotable(self) -> bool:
+        return False
+
+    @property
+    def runtime_admissible(self) -> bool:
+        return False
+
+    @property
+    def authority_binding(self) -> None:
+        return None
 
 
 __all__ = ["DomainIdentity", "FrozenMapping", "LiveArtifact", "freeze", "thaw"]

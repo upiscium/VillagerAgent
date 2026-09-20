@@ -6,6 +6,18 @@ from typing import Any, TypeVar
 
 from benchmarks.common.eac.canonical import FrozenJSONArray, FrozenJSONObject
 from benchmarks.common.eac.canonical import canonical_argument, canonical_sha256
+from benchmarks.minecraft.k12_execution_provenance import (
+    AuthorityBinding,
+    INJECTED_FAKE_ORIGIN,
+    INJECTED_TEST_ORIGIN,
+    RUNTIME_VERIFIED_ORIGIN,
+)
+from benchmarks.minecraft.k12_guarded_backend import (
+    authority_binding_is_current,
+    is_mock_authority_binding,
+    mock_authority_binding,
+    resolve_authority_binding,
+)
 
 _ID_DOMAIN = "minecraft-k12-evidence-id/1"
 _RECORD_DOMAIN = "minecraft-k12-evidence-record/1"
@@ -36,6 +48,8 @@ class CellBinding:
     reset_token: str
     generation: int
     attestation: str
+    authority_binding: AuthorityBinding = field(default_factory=mock_authority_binding)
+    authority: Any = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         for name in ("protocol", "campaign", "cohort", "cell", "triplet", "arm",
@@ -45,9 +59,44 @@ class CellBinding:
             raise ValueError("seed must be a non-negative integer")
         if type(self.generation) is not int or self.generation < 0:
             raise ValueError("generation must be a non-negative integer")
+        if self.authority is not None:
+            derived = resolve_authority_binding(self.authority)
+            owner_cell = getattr(self.authority, "cell_id", None)
+            if owner_cell is not None and owner_cell != self.cell:
+                raise ValueError("evidence cell/authority binding mismatch")
+            if is_mock_authority_binding(self.authority_binding):
+                object.__setattr__(self, "authority_binding", derived)
+            elif self.authority_binding != derived:
+                raise ValueError("evidence authority binding does not match owner")
+        if not isinstance(self.authority_binding, AuthorityBinding):
+            raise TypeError("authority_binding must be an AuthorityBinding")
 
     def canonical(self) -> dict[str, Any]:
-        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+        return {
+            name: (
+                self.authority_binding.canonical()
+                if name == "authority_binding"
+                else getattr(self, name)
+            )
+            for name in self.__dataclass_fields__
+            if name != "authority"
+        }
+
+    @property
+    def binding(self) -> AuthorityBinding:
+        return self.authority_binding
+
+    @property
+    def origin(self) -> str:
+        return self.authority_binding.origin
+
+    @property
+    def evidence_origin(self) -> str:
+        return self.origin
+
+    @property
+    def runtime_admissible(self) -> bool:
+        return self.authority_binding.runtime_admissible
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -82,6 +131,22 @@ class EvidenceRecord:
         return (self.id == _evidence_id(self.kind, self.binding, self.payload)
                 and self.digest == canonical_sha256(self._unsigned()))
 
+    @property
+    def authority_binding(self) -> AuthorityBinding:
+        return self.binding.authority_binding
+
+    @property
+    def binding_authority(self) -> AuthorityBinding:
+        return self.authority_binding
+
+    @property
+    def origin(self) -> str:
+        return self.authority_binding.origin
+
+    @property
+    def evidence_origin(self) -> str:
+        return self.origin
+
 
 def _evidence_id(kind: str, binding: CellBinding, payload: Any) -> str:
     return canonical_sha256({"domain": _ID_DOMAIN, "kind": kind,
@@ -92,8 +157,9 @@ def _evidence_id(kind: str, binding: CellBinding, payload: Any) -> str:
 class EvidenceSnapshot:
     records: tuple[EvidenceRecord, ...]
     digest: str = field(init=False)
+    _authority: Any = field(default=None, repr=False, compare=False)
 
-    def __init__(self, records: tuple[EvidenceRecord, ...]) -> None:
+    def __init__(self, records: tuple[EvidenceRecord, ...], authority: Any = None) -> None:
         records = tuple(records)
         if any(not isinstance(record, EvidenceRecord) for record in records):
             raise TypeError("snapshot records must be EvidenceRecord instances")
@@ -103,13 +169,48 @@ class EvidenceSnapshot:
             raise ValueError("snapshot contains mixed cell bindings")
         object.__setattr__(self, "records", records)
         object.__setattr__(self, "digest", canonical_sha256(self._unsigned()))
+        object.__setattr__(self, "_authority", authority)
 
     def _unsigned(self) -> dict[str, Any]:
         return {"domain": _SNAPSHOT_DOMAIN,
                 "records": [{"id": record.id, "digest": record.digest}
-                            for record in sorted(self.records, key=lambda item: item.id)]}
+                             for record in sorted(self.records, key=lambda item: item.id)]}
+
+    @property
+    def authority_binding(self) -> AuthorityBinding | None:
+        return self.records[0].authority_binding if self.records else None
+
+    @property
+    def origin(self) -> str | None:
+        return self.records[0].origin if self.records else None
+
+    @property
+    def evidence_origin(self) -> str | None:
+        return self.origin
+
+    @property
+    def runtime_admissible(self) -> bool:
+        if self.origin != RUNTIME_VERIFIED_ORIGIN:
+            return False
+        try:
+            self._assert_current()
+        except ValueError:
+            return False
+        return True
+
+    def _assert_current(self) -> None:
+        binding = self.authority_binding
+        if binding is None or is_mock_authority_binding(binding):
+            return
+        if self._authority is None or not authority_binding_is_current(
+            self._authority, binding,
+            profile_digest=getattr(self._authority, "profile_digest", None),
+            allow_injected=binding.origin in {INJECTED_FAKE_ORIGIN, INJECTED_TEST_ORIGIN},
+        ):
+            raise ValueError("evidence authority lifecycle is stale or revoked")
 
     def require(self, kind: str, evidence_id: str, expected_type: type[EvidenceRecord] = EvidenceRecord) -> EvidenceRecord:
+        self._assert_current()
         if not isinstance(expected_type, type) or not issubclass(expected_type, EvidenceRecord):
             raise TypeError("expected_type must be an EvidenceRecord type")
         for record in self.records:
@@ -122,6 +223,10 @@ class EvidenceSnapshot:
         raise KeyError(evidence_id)
 
     def verify(self) -> bool:
+        try:
+            self._assert_current()
+        except ValueError:
+            return False
         return all(record.verify() for record in self.records) and self.digest == canonical_sha256(self._unsigned())
 
 
@@ -131,10 +236,22 @@ T = TypeVar("T", bound=EvidenceRecord)
 class EvidenceRegistry:
     """Mutable during collection; ``freeze`` produces the immutable boundary."""
 
-    def __init__(self, binding: CellBinding) -> None:
+    def __init__(self, binding: CellBinding, *, authority: Any = None) -> None:
         if not isinstance(binding, CellBinding):
             raise TypeError("binding must be a CellBinding")
+        if authority is not None:
+            derived = resolve_authority_binding(authority)
+            if is_mock_authority_binding(binding.authority_binding):
+                binding = CellBinding(
+                    binding.protocol, binding.campaign, binding.cohort, binding.cell,
+                    binding.triplet, binding.arm, binding.fixture, binding.template,
+                    binding.seed, binding.reset_token, binding.generation,
+                    binding.attestation, derived, authority,
+                )
+            elif binding.authority_binding != derived:
+                raise ValueError("evidence authority binding does not match owner")
         self.binding = binding
+        self.authority = authority if authority is not None else binding.authority
         self._records: dict[str, EvidenceRecord] = {}
         self._frozen = False
 
@@ -142,10 +259,28 @@ class EvidenceRegistry:
     def records(self) -> tuple[EvidenceRecord, ...]:
         return tuple(self._records.values())
 
+    @property
+    def authority_binding(self) -> AuthorityBinding:
+        return self.binding.authority_binding
+
+    def _assert_current(self) -> None:
+        if is_mock_authority_binding(self.authority_binding):
+            return
+        if self.authority is None or not authority_binding_is_current(
+            self.authority,
+            self.authority_binding,
+            profile_digest=getattr(self.authority, "profile_digest", None),
+            allow_injected=self.authority_binding.origin in {
+                INJECTED_FAKE_ORIGIN, INJECTED_TEST_ORIGIN,
+            },
+        ):
+            raise ValueError("evidence authority lifecycle is stale or revoked")
+
     def register(self, kind: str | EvidenceRecord, payload: Any = None, *,
                  binding: CellBinding | None = None, evidence_id: str | None = None) -> EvidenceRecord:
         if self._frozen:
             raise RuntimeError("evidence registry is frozen")
+        self._assert_current()
         if isinstance(kind, EvidenceRecord):
             if payload is not None or binding is not None or evidence_id is not None:
                 raise TypeError("record registration accepts no additional arguments")
@@ -173,14 +308,16 @@ class EvidenceRegistry:
         return self.freeze_preview().require(kind, evidence_id, expected_type)  # type: ignore[return-value]
 
     def freeze_preview(self) -> EvidenceSnapshot:
-        return EvidenceSnapshot(tuple(self._records.values()))
+        self._assert_current()
+        return EvidenceSnapshot(tuple(self._records.values()), self.authority)
 
     def freeze(self) -> EvidenceSnapshot:
         if self._frozen:
             raise RuntimeError("evidence registry is already frozen")
+        self._assert_current()
         snapshot = self.freeze_preview()
         self._frozen = True
         return snapshot
 
 
-__all__ = ["CellBinding", "EvidenceRecord", "EvidenceRegistry", "EvidenceSnapshot", "EVIDENCE_KINDS"]
+__all__ = ["AuthorityBinding", "CellBinding", "EvidenceRecord", "EvidenceRegistry", "EvidenceSnapshot", "EVIDENCE_KINDS"]

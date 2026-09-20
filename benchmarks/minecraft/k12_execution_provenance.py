@@ -1,0 +1,3470 @@
+"""Parent-owned K12 authority, provenance, and first-consume contracts.
+
+The module is intentionally non-circular.  It consumes typed observations and
+protocol-shaped qualification evidence; it does not import the later
+qualification aggregate implementation and it never talks to Git, GitHub,
+Minecraft, RCON, providers, systemd, or a process recorder.
+
+Operational namespaces/provenance remain ``live_qualification``,
+``qualification_probe``, and ``live_final``.  Authorization/evidence origin is
+separate: runtime chains use ``runtime_verified`` and deterministic chains use
+``injected_test``/``injected_fake``.
+"""
+from __future__ import annotations
+
+import hashlib
+import math
+import os
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import threading
+import time
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+from types import MappingProxyType
+from typing import Any, Protocol, runtime_checkable
+
+from benchmarks.common.eac.canonical import canonical_bytes, canonical_sha256
+
+
+QUALIFICATION_AUTHORITY = "minecraft-k12-live-qualification-execution-authority/1"
+FINAL_AUTHORITY = "minecraft-k12-live-final-execution-authority/1"
+QUALIFICATION_RUN_AUTHORIZATION = "minecraft-k12-live-qualification-run-authorization/1"
+FINAL_RUN_AUTHORIZATION = "minecraft-k12-live-final-run-authorization/1"
+PROFILE_V2 = "minecraft-k12-live-runtime-profile/2"
+RUNTIME_VERIFIED_ORIGIN = "runtime_verified"
+INJECTED_TEST_ORIGIN = "injected_test"
+INJECTED_FAKE_ORIGIN = "injected_fake"
+LIVE_QUALIFICATION_NAMESPACE = "live_qualification"
+QUALIFICATION_PROBE_NAMESPACE = "qualification_probe"
+LIVE_FINAL_NAMESPACE = "live_final"
+AUTHORIZATION_ORIGINS = frozenset({
+    RUNTIME_VERIFIED_ORIGIN, INJECTED_TEST_ORIGIN, INJECTED_FAKE_ORIGIN,
+})
+OPERATIONAL_PROVENANCES = frozenset({
+    "mock_only", LIVE_QUALIFICATION_NAMESPACE, QUALIFICATION_PROBE_NAMESPACE,
+    LIVE_FINAL_NAMESPACE,
+})
+EXPECTED_BRANCH = "refs/heads/experiment/k11-k12-ecological-validation"
+EXPECTED_PR = 524
+EXPECTED_REPOSITORY = "upiscium/VillagerAgent"
+EXPECTED_BASE_REF = "main"
+EXPECTED_BASE_SHA = "66a904de8af2b0bbaf79071628f06bed91a40078"
+EXPECTED_HEAD = "36a145338ae839eaf145b879d0317b24ae852300"
+MAX_PR_AGE_SECONDS = 300
+
+_SHA1 = re.compile(r"[0-9a-f]{40}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_CANONICAL_SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
+_AUTHORITY_TOKEN = object()
+_BINDING_TOKEN = object()
+_RUN_AUTH_TOKEN = object()
+_ACTIVE_TOKEN = object()
+_LEASE_TOKEN = object()
+_INJECTED_CONTROLLER_TOKEN = object()
+_SOURCE_CLOSURE_TOKEN = object()
+_MISSING_TREE_ENTRY = object()
+
+_LEDGER_ROOT_ARTIFACT = "minecraft-k12-live-execution-ledger-root/1"
+
+SOURCE_SEMANTIC_CLASSES = frozenset({
+    "python", "config", "contract", "documentation", "dependency", "javascript",
+})
+
+
+class ProvenanceError(ValueError):
+    """A provenance observation or authority violates the frozen contract."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class MismatchClass:
+    PRELAUNCH_STOP = "prelaunch_stop"
+    TARGET_QUARANTINE = "target_quarantine"
+    DIAGNOSTIC_ONLY = "diagnostic_only"
+
+
+MISMATCH_CLASSIFICATION = MappingProxyType({
+    "git_repository_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "git_worktree_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "git_environment_override": MismatchClass.PRELAUNCH_STOP,
+    "git_head_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "git_tree_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "git_dirty_staged": MismatchClass.PRELAUNCH_STOP,
+    "git_dirty_tracked": MismatchClass.PRELAUNCH_STOP,
+    "git_dirty_untracked": MismatchClass.PRELAUNCH_STOP,
+    "git_remote_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "git_upstream_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "git_submodule_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "pr_observation_missing": MismatchClass.PRELAUNCH_STOP,
+    "pr_observation_stale": MismatchClass.PRELAUNCH_STOP,
+    "pr_semantic_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "source_closure_incomplete": MismatchClass.PRELAUNCH_STOP,
+    "source_content_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "source_mode_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "source_semantic_class_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "profile_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "contract_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "environment_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "capsule_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "authority_namespace_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "authority_digest_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "authority_capability_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "authority_origin_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "parent_controller_required": MismatchClass.PRELAUNCH_STOP,
+    "ledger_corrupt": MismatchClass.PRELAUNCH_STOP,
+    "final_prerequisite_mismatch": MismatchClass.PRELAUNCH_STOP,
+    "fresh_root_violation": MismatchClass.PRELAUNCH_STOP,
+    "authority_replay": MismatchClass.PRELAUNCH_STOP,
+    "first_consume_mismatch": MismatchClass.TARGET_QUARANTINE,
+    "target_lock_busy": MismatchClass.PRELAUNCH_STOP,
+    "target_lock_loss": MismatchClass.TARGET_QUARANTINE,
+    "target_identity_mismatch": MismatchClass.TARGET_QUARANTINE,
+    "containment_unknown": MismatchClass.TARGET_QUARANTINE,
+    "host_inventory_drift": MismatchClass.DIAGNOSTIC_ONLY,
+})
+
+
+def raw_sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _require_sha1(value: str, reason: str) -> str:
+    if not isinstance(value, str) or _SHA1.fullmatch(value) is None:
+        raise ProvenanceError(reason)
+    return value
+
+
+def _require_sha256(value: str, reason: str) -> str:
+    if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+        raise ProvenanceError(reason)
+    return value
+
+
+def _require_canonical_digest(value: str, reason: str) -> str:
+    if not isinstance(value, str) or _CANONICAL_SHA256.fullmatch(value) is None:
+        raise ProvenanceError(reason)
+    return value
+
+
+def _require_identity(value: str, reason: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 256:
+        raise ProvenanceError(reason)
+    return value
+
+
+def _normalize_origin(value: Any, reason: str = "authority_origin_mismatch") -> str:
+    """Accept only explicit authorization origins, never namespace aliases."""
+    if not isinstance(value, str):
+        raise ProvenanceError(reason)
+    if value not in AUTHORIZATION_ORIGINS:
+        raise ProvenanceError(reason)
+    return value
+
+
+def _deep_freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(item) for item in value)
+    return value
+
+
+def _deep_thaw(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _deep_thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_deep_thaw(item) for item in value]
+    return value
+
+
+def _normalize_source_path(value: str) -> str:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise ProvenanceError("source_closure_incomplete")
+    path = PurePosixPath(value)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ProvenanceError("source_closure_incomplete")
+    normalized = path.as_posix()
+    if normalized != value:
+        raise ProvenanceError("source_closure_incomplete")
+    return normalized
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRecord:
+    path: str
+    git_mode: str
+    git_blob_oid: str
+    sha256: str
+    semantic_class: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", _normalize_source_path(self.path))
+        if type(self.git_mode) is not str or self.git_mode not in {"100644", "100755"}:
+            raise ProvenanceError("source_mode_mismatch")
+        if type(self.semantic_class) is not str or self.semantic_class not in SOURCE_SEMANTIC_CLASSES:
+            raise ProvenanceError("source_semantic_class_mismatch")
+        _require_sha1(self.git_blob_oid, "source_content_mismatch")
+        _require_sha256(self.sha256, "source_content_mismatch")
+
+    def canonical(self) -> dict[str, Any]:
+        return {"path": self.path, "git_mode": self.git_mode,
+                "git_blob_oid": self.git_blob_oid, "sha256": self.sha256,
+                "semantic_class": self.semantic_class}
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class SourceClosure:
+    policy_identity: str
+    policy_digest: str
+    records: tuple[SourceRecord, ...]
+    head_commit: str
+    head_tree: str
+    aggregate_sha256: str = field(init=False)
+    _collector_marker: object = field(repr=False, compare=False)
+    _origin: str = field(repr=False, compare=False)
+    _collector_owner: Any = field(repr=False, compare=False)
+
+    def __init__(self, policy_identity: str, policy_digest: str,
+                  records: Sequence[SourceRecord], token: object = None,
+                  marker: object = None, origin: str = RUNTIME_VERIFIED_ORIGIN,
+                  owner: Any = None, head_commit: str = "", head_tree: str = "") -> None:
+        if token is not _SOURCE_CLOSURE_TOKEN or marker is None or owner is None:
+            raise TypeError("source closures are parent-collected")
+        _require_identity(policy_identity, "source_closure_incomplete")
+        _require_sha256(policy_digest, "source_closure_incomplete")
+        if not isinstance(records, Sequence) or any(
+                not isinstance(item, SourceRecord) for item in records):
+            raise ProvenanceError("source_closure_incomplete")
+        try:
+            normalized_origin = _normalize_origin(origin)
+        except ProvenanceError as exc:
+            raise ProvenanceError("source_closure_incomplete") from exc
+        if normalized_origin not in {RUNTIME_VERIFIED_ORIGIN, INJECTED_TEST_ORIGIN}:
+            raise ProvenanceError("source_closure_incomplete")
+        if normalized_origin == RUNTIME_VERIFIED_ORIGIN:
+            _require_sha1(head_commit, "git_head_mismatch")
+            _require_sha1(head_tree, "git_tree_mismatch")
+        elif head_commit or head_tree:
+            raise ProvenanceError("source_closure_incomplete")
+        ordered = tuple(sorted(tuple(records), key=lambda item: item.path))
+        names = tuple(item.path for item in ordered)
+        if (not ordered or len(names) != len(set(names))
+                or len(names) != len({name.casefold() for name in names})):
+            raise ProvenanceError("source_closure_incomplete")
+        object.__setattr__(self, "policy_identity", policy_identity)
+        object.__setattr__(self, "policy_digest", policy_digest)
+        object.__setattr__(self, "records", ordered)
+        object.__setattr__(self, "head_commit", head_commit)
+        object.__setattr__(self, "head_tree", head_tree)
+        object.__setattr__(self, "aggregate_sha256",
+                           raw_sha256(canonical_bytes({
+                               "head_commit": head_commit,
+                               "head_tree": head_tree,
+                               "records": [item.canonical() for item in ordered],
+                           })))
+        object.__setattr__(self, "_collector_marker", marker)
+        object.__setattr__(self, "_origin", normalized_origin)
+        object.__setattr__(self, "_collector_owner", owner)
+
+    @property
+    def origin(self) -> str:
+        return self._origin
+
+    @property
+    def evidence_origin(self) -> str:
+        return self._origin
+
+    @property
+    def runtime_admissible(self) -> bool:
+        return self._origin == RUNTIME_VERIFIED_ORIGIN
+
+    def owned_by(self, owner: Any) -> bool:
+        return self._collector_owner is owner and bool(
+            getattr(owner, "owns_source_closure", lambda _closure: False)(self)
+        )
+
+    def _owned_by(self, marker: object) -> bool:
+        """Compatibility view for older in-module callers."""
+        return self._collector_marker is marker
+
+    def canonical(self) -> dict[str, Any]:
+        return {"policy_identity": self.policy_identity,
+                "policy_digest": self.policy_digest,
+                "head_commit": self.head_commit,
+                "head_tree": self.head_tree,
+                "records": [item.canonical() for item in self.records],
+                "aggregate_sha256": self.aggregate_sha256}
+
+
+def source_closure_from_observations(
+    *, policy: Any, observations: Mapping[str, Mapping[str, Any]],
+) -> SourceClosure:
+    """Reject the removed caller-supplied source DTO path.
+
+    Source closure values are authority inputs.  Accepting strings supplied in
+    an observation mapping would let a caller mint a closure without opening
+    the corresponding files.  The parent-side ``collect_source_closure`` API
+    is the only constructor path now.
+    """
+    del policy, observations
+    raise TypeError("parent-side source collector required")
+
+
+def git_blob_oid(data: bytes) -> str:
+    """Return the SHA-1 OID Git assigns to a blob containing ``data``."""
+    if type(data) is not bytes:
+        raise TypeError("Git blob data must be bytes")
+    header = f"blob {len(data)}\0".encode("ascii")
+    return hashlib.sha1(header + data, usedforsecurity=False).hexdigest()
+
+
+def _open_trusted_source_root(root: str | Path) -> int:
+    try:
+        supplied = Path(root)
+    except (TypeError, ValueError) as exc:
+        raise ProvenanceError("source_closure_incomplete") from exc
+    try:
+        absolute = Path(os.path.abspath(os.fspath(supplied)))
+        current = Path(absolute.anchor)
+        for component in absolute.parts[1:]:
+            current /= component
+            if current.is_symlink():
+                raise ProvenanceError("source_closure_incomplete")
+    except ProvenanceError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise ProvenanceError("source_closure_incomplete") from exc
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    fd: int | None = None
+    try:
+        fd = os.open(os.fspath(supplied), flags)
+        metadata = os.fstat(fd)
+    except (OSError, ValueError) as exc:
+        if fd is not None:
+            os.close(fd)
+        raise ProvenanceError("source_closure_incomplete") from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(fd)
+        raise ProvenanceError("source_closure_incomplete")
+    return fd
+
+
+def _open_source_path(root_fd: int, path: str) -> int:
+    """Open one policy path below ``root_fd`` without following symlinks."""
+    parts = PurePosixPath(path).parts
+    if not parts:
+        raise ProvenanceError("source_closure_incomplete")
+    current = os.dup(root_fd)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        for part in parts[:-1]:
+            try:
+                child = os.open(part, directory_flags, dir_fd=current)
+            except (OSError, ValueError) as exc:
+                raise ProvenanceError("source_closure_incomplete") from exc
+            os.close(current)
+            current = child
+        try:
+            fd = os.open(parts[-1], file_flags, dir_fd=current)
+        except (OSError, ValueError) as exc:
+            raise ProvenanceError("source_closure_incomplete") from exc
+        try:
+            metadata = os.fstat(fd)
+        except (OSError, ValueError) as exc:
+            os.close(fd)
+            raise ProvenanceError("source_closure_incomplete") from exc
+        if not stat.S_ISREG(metadata.st_mode):
+            os.close(fd)
+            raise ProvenanceError("source_closure_incomplete")
+        return fd
+    finally:
+        os.close(current)
+
+
+def _read_source_fd(fd: int) -> tuple[bytes, os.stat_result]:
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ProvenanceError("source_closure_incomplete")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(fd)
+    except ProvenanceError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise ProvenanceError("source_content_mismatch") from exc
+    if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
+        raise ProvenanceError("source_content_mismatch")
+    return b"".join(chunks), after
+
+
+def _expected_tree_entry(value: Any) -> tuple[str, str]:
+    if isinstance(value, Mapping):
+        mode = value.get("git_mode", value.get("mode"))
+        blob = None
+        for name in ("git_blob_oid", "blob_oid", "oid", "object_id", "sha1", "blob"):
+            if name in value:
+                blob = value[name]
+                break
+        if value.get("type", "blob") != "blob":
+            raise ProvenanceError("git_tree_mismatch")
+    elif isinstance(value, (tuple, list)) and len(value) == 2:
+        mode, blob = value
+    else:
+        mode = getattr(value, "git_mode", getattr(value, "mode", None))
+        blob = getattr(value, "git_blob_oid",
+                       getattr(value, "blob_oid",
+                               getattr(value, "oid", getattr(value, "object_id", None))))
+    if mode not in {"100644", "100755"}:
+        raise ProvenanceError("git_tree_mismatch")
+    try:
+        _require_sha1(blob, "source_content_mismatch")
+    except ProvenanceError as exc:
+        raise ProvenanceError("git_tree_mismatch") from exc
+    return mode, blob
+
+
+def _lookup_expected_tree_entry(expected_tree: Any, path: str) -> Any:
+    if expected_tree is None:
+        return _MISSING_TREE_ENTRY
+    if isinstance(expected_tree, Mapping):
+        entries = expected_tree
+        nested = expected_tree.get("entries")
+        if not isinstance(nested, Mapping):
+            nested = expected_tree.get("tree")
+        if isinstance(nested, Mapping):
+            entries = nested
+        if path not in entries or entries[path] is None:
+            return _MISSING_TREE_ENTRY
+        return _expected_tree_entry(entries[path])
+    for method_name in ("entry_for", "get_entry", "lookup"):
+        method = getattr(expected_tree, method_name, None)
+        if callable(method):
+            try:
+                value = method(path)
+            except KeyError:
+                return _MISSING_TREE_ENTRY
+            if value is None:
+                return _MISSING_TREE_ENTRY
+            return _expected_tree_entry(value)
+    entries = getattr(expected_tree, "entries", None)
+    if isinstance(entries, Mapping):
+        if path not in entries or entries[path] is None:
+            return _MISSING_TREE_ENTRY
+        return _expected_tree_entry(entries[path])
+    if callable(expected_tree):
+        try:
+            value = expected_tree(path)
+        except KeyError:
+            return _MISSING_TREE_ENTRY
+        if value is None:
+            return _MISSING_TREE_ENTRY
+        return _expected_tree_entry(value)
+    try:
+        candidates = tuple(expected_tree)
+    except TypeError as exc:
+        raise ProvenanceError("git_tree_mismatch") from exc
+    found: Any = _MISSING_TREE_ENTRY
+    for candidate in candidates:
+        if isinstance(candidate, Mapping):
+            candidate_path = candidate.get("path")
+        else:
+            candidate_path = getattr(candidate, "path", None)
+        if candidate_path == path:
+            if found is not _MISSING_TREE_ENTRY:
+                raise ProvenanceError("git_tree_mismatch")
+            found = _expected_tree_entry(candidate)
+    return found
+
+
+def _git_mode_from_fd(metadata: os.stat_result) -> str:
+    return "100755" if stat.S_IMODE(metadata.st_mode) & 0o111 else "100644"
+
+
+def _authenticated_git_tree(root: str | Path, checkout: Any, policy: Any) -> Mapping[str, Any]:
+    """Read exact blob identities from the checkout's authenticated commit tree."""
+    if not isinstance(checkout, CheckoutObservation):
+        raise TypeError("typed checkout observation required for runtime source collection")
+    checkout.validate(checkout.head_commit)
+    candidate = shutil.which("git")
+    if not candidate:
+        raise ProvenanceError("git_tree_mismatch")
+    try:
+        git_executable = Path(candidate).resolve(strict=True)
+        executable_stat = git_executable.stat()
+        if (not stat.S_ISREG(executable_stat.st_mode)
+                or executable_stat.st_uid != 0
+                or executable_stat.st_mode & 0o022
+                or os.access(git_executable, os.W_OK)):
+            raise ProvenanceError("git_tree_mismatch")
+        for parent in git_executable.parents:
+            if os.access(parent, os.W_OK):
+                raise ProvenanceError("git_tree_mismatch")
+    except (OSError, ValueError) as exc:
+        raise ProvenanceError("git_tree_mismatch") from exc
+    env = {
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+    }
+
+    def run(*arguments: str) -> bytes:
+        try:
+            return subprocess.run(
+                (os.fspath(git_executable), "-c", "core.fsmonitor=false", "-C", os.fspath(root), *arguments),
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=env, timeout=30,
+            ).stdout
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ProvenanceError("git_tree_mismatch") from exc
+
+    try:
+        trusted_root = Path(root).resolve(strict=True)
+        observed_root = Path(run("rev-parse", "--show-toplevel").decode("utf-8").strip()).resolve(strict=True)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ProvenanceError("git_tree_mismatch") from exc
+    if observed_root != trusted_root:
+        raise ProvenanceError("git_tree_mismatch")
+    commit = run("rev-parse", "--verify", f"{checkout.head_commit}^{{commit}}").decode("ascii").strip()
+    tree = run("rev-parse", f"{commit}^{{tree}}").decode("ascii").strip()
+    if commit != checkout.head_commit or tree != checkout.head_tree:
+        raise ProvenanceError("git_tree_mismatch")
+    output = run("ls-tree", "-rz", tree, "--", *(entry.path for entry in policy.entries))
+    entries: dict[str, dict[str, str]] = {}
+    try:
+        for raw in output.split(b"\0"):
+            if not raw:
+                continue
+            metadata, raw_path = raw.split(b"\t", 1)
+            mode, object_type, oid = metadata.decode("ascii").split(" ", 2)
+            path = raw_path.decode("utf-8")
+            if object_type != "blob" or path in entries:
+                raise ProvenanceError("git_tree_mismatch")
+            entries[path] = {"git_mode": mode, "git_blob_oid": oid}
+    except (UnicodeError, ValueError) as exc:
+        raise ProvenanceError("git_tree_mismatch") from exc
+    if set(entries) != {entry.path for entry in policy.entries}:
+        raise ProvenanceError("source_closure_incomplete")
+    return MappingProxyType(entries)
+
+
+def _collect_source_closure(*, policy: Any, root: str | Path,
+                            expected_tree: Any, injected_only: bool,
+                            marker: object, origin: str, owner: Any,
+                            head_commit: str = "", head_tree: str = "") -> SourceClosure:
+    from .k12_runtime_profile import K12SourcePolicy
+
+    if not isinstance(policy, K12SourcePolicy):
+        raise TypeError("loader-issued source policy required")
+    if origin == RUNTIME_VERIFIED_ORIGIN:
+        if injected_only or expected_tree is None:
+            raise ProvenanceError("source_closure_incomplete")
+    elif origin == INJECTED_TEST_ORIGIN:
+        if not injected_only:
+            raise ProvenanceError("source_closure_incomplete")
+    else:
+        raise ProvenanceError("authority_origin_mismatch")
+
+    root_fd = _open_trusted_source_root(root)
+    records: list[SourceRecord] = []
+    try:
+        for entry in policy.entries:
+            path = _normalize_source_path(entry.path)
+            fd = _open_source_path(root_fd, path)
+            try:
+                data, metadata = _read_source_fd(fd)
+            finally:
+                os.close(fd)
+            observed_sha256 = raw_sha256(data)
+            observed_blob = git_blob_oid(data)
+            tree_entry = _lookup_expected_tree_entry(expected_tree, path)
+            if tree_entry is _MISSING_TREE_ENTRY:
+                if not injected_only:
+                    raise ProvenanceError("source_closure_incomplete")
+                git_mode = _git_mode_from_fd(metadata)
+                if git_mode != entry.git_mode:
+                    raise ProvenanceError("source_mode_mismatch")
+            else:
+                tree_mode, tree_blob = tree_entry
+                if tree_mode != entry.git_mode:
+                    raise ProvenanceError("source_mode_mismatch")
+                if tree_blob != observed_blob:
+                    raise ProvenanceError("source_content_mismatch")
+                git_mode = tree_mode
+            records.append(SourceRecord(path, git_mode, observed_blob, observed_sha256,
+                                        entry.semantic_class))
+    finally:
+        os.close(root_fd)
+    return SourceClosure(policy.identity, policy.digest, tuple(records),
+                         _SOURCE_CLOSURE_TOKEN, marker, origin, owner,
+                         head_commit, head_tree)
+
+
+@dataclass(frozen=True, slots=True)
+class SubmoduleObservation:
+    path: str
+    gitlink_commit: str
+    observed_commit: str
+    clean: bool
+
+    def __post_init__(self) -> None:
+        _normalize_source_path(self.path)
+        _require_sha1(self.gitlink_commit, "git_submodule_mismatch")
+        _require_sha1(self.observed_commit, "git_submodule_mismatch")
+        if self.clean is not True or self.gitlink_commit != self.observed_commit:
+            raise ProvenanceError("git_submodule_mismatch")
+
+    def canonical(self) -> dict[str, Any]:
+        return {"path": self.path, "gitlink_commit": self.gitlink_commit,
+                "observed_commit": self.observed_commit, "clean": self.clean}
+
+
+@dataclass(frozen=True, slots=True)
+class CheckoutObservation:
+    repository_identity: str
+    worktree_identity: str
+    git_dir_identity: str
+    common_dir_identity: str
+    symbolic_head_ref: str
+    head_commit: str
+    head_tree: str
+    index_tree: str
+    upstream_ref: str
+    upstream_commit: str
+    remote_repository: str
+    remote_ref: str
+    remote_commit: str
+    staged_clean: bool
+    tracked_clean: bool
+    untracked_clean: bool
+    generated_artifacts_absent: bool
+    git_environment_overrides: tuple[str, ...] = ()
+    submodules: tuple[SubmoduleObservation, ...] = ()
+
+    def validate(self, expected_head: str = EXPECTED_HEAD) -> None:
+        _require_sha1(expected_head, "git_head_mismatch")
+        for value in (self.worktree_identity, self.git_dir_identity, self.common_dir_identity):
+            _require_sha256(value, "git_worktree_mismatch")
+        for value in (self.head_commit, self.head_tree, self.index_tree,
+                      self.upstream_commit, self.remote_commit):
+            _require_sha1(value, "git_head_mismatch")
+        if self.git_environment_overrides:
+            raise ProvenanceError("git_environment_override")
+        if self.symbolic_head_ref != EXPECTED_BRANCH or self.upstream_ref != EXPECTED_BRANCH:
+            raise ProvenanceError("git_head_mismatch")
+        if self.repository_identity != EXPECTED_REPOSITORY:
+            raise ProvenanceError("git_repository_mismatch")
+        if self.remote_repository != EXPECTED_REPOSITORY or self.remote_ref != EXPECTED_BRANCH:
+            raise ProvenanceError("git_remote_mismatch")
+        if self.head_commit != expected_head:
+            raise ProvenanceError("git_head_mismatch")
+        if self.index_tree != self.head_tree:
+            raise ProvenanceError("git_tree_mismatch")
+        if self.upstream_commit != self.head_commit or self.remote_commit != self.head_commit:
+            raise ProvenanceError("git_upstream_mismatch")
+        if self.staged_clean is not True:
+            raise ProvenanceError("git_dirty_staged")
+        if self.tracked_clean is not True:
+            raise ProvenanceError("git_dirty_tracked")
+        if self.untracked_clean is not True or self.generated_artifacts_absent is not True:
+            raise ProvenanceError("git_dirty_untracked")
+        if any(not isinstance(item, SubmoduleObservation) for item in self.submodules):
+            raise ProvenanceError("git_submodule_mismatch")
+
+    def canonical(self) -> dict[str, Any]:
+        return {
+            "repository_identity": self.repository_identity,
+            "worktree_identity": self.worktree_identity,
+            "git_dir_identity": self.git_dir_identity,
+            "common_dir_identity": self.common_dir_identity,
+            "symbolic_head_ref": self.symbolic_head_ref,
+            "head_commit": self.head_commit, "head_tree": self.head_tree,
+            "index_tree": self.index_tree, "upstream_ref": self.upstream_ref,
+            "upstream_commit": self.upstream_commit,
+            "remote_repository": self.remote_repository,
+            "remote_ref": self.remote_ref, "remote_commit": self.remote_commit,
+            "staged_clean": self.staged_clean, "tracked_clean": self.tracked_clean,
+            "untracked_clean": self.untracked_clean,
+            "generated_artifacts_absent": self.generated_artifacts_absent,
+            "git_environment_overrides": list(self.git_environment_overrides),
+            "submodules": [item.canonical() for item in self.submodules],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PullRequestObservation:
+    repository: str
+    number: int
+    state: str
+    is_draft: bool
+    head_repository: str
+    head_ref: str
+    head_sha: str
+    base_ref: str
+    base_sha: str
+    observed_at: int
+    observer: str
+    receipt_digest: str
+
+    def semantic_tuple(self) -> tuple[Any, ...]:
+        return (self.repository, self.number, self.state, self.is_draft,
+                self.head_repository, self.head_ref, self.head_sha,
+                self.base_ref, self.base_sha)
+
+    def validate(self, *, expected_head: str = EXPECTED_HEAD, now: int) -> None:
+        _require_sha1(self.head_sha, "pr_semantic_mismatch")
+        _require_sha1(self.base_sha, "pr_semantic_mismatch")
+        _require_sha256(self.receipt_digest, "pr_observation_missing")
+        if (self.number != EXPECTED_PR or self.state != "OPEN" or self.is_draft is not True
+                or self.repository != EXPECTED_REPOSITORY
+                or self.head_repository != EXPECTED_REPOSITORY
+                or self.head_ref != EXPECTED_BRANCH.removeprefix("refs/heads/")
+                or self.head_sha != expected_head or self.base_ref != EXPECTED_BASE_REF
+                or self.base_sha != EXPECTED_BASE_SHA):
+            raise ProvenanceError("pr_semantic_mismatch")
+        if (type(now) is not int or type(self.observed_at) is not int
+                or now < self.observed_at or now - self.observed_at > MAX_PR_AGE_SECONDS):
+            raise ProvenanceError("pr_observation_stale")
+
+    def canonical(self) -> dict[str, Any]:
+        return {"repository": self.repository, "number": self.number,
+                "state": self.state, "is_draft": self.is_draft,
+                "head_repository": self.head_repository, "head_ref": self.head_ref,
+                "head_sha": self.head_sha, "base_ref": self.base_ref,
+                "base_sha": self.base_sha, "observed_at": self.observed_at,
+                "observer": self.observer, "receipt_digest": self.receipt_digest}
+
+
+@dataclass(frozen=True, slots=True)
+class EnvironmentObservation:
+    policy_identity: str
+    policy_digest: str
+    python_implementation: str
+    python_version: str
+    distributions_digest: str
+    native_runtime_digest: str
+    node_identity: str
+    java_identity: str
+    bridge_sha256: str
+    server_jar_sha256: str
+    model_id: str
+    endpoint_hash: str
+    seed_support_state: str
+    locale: str
+    user_systemd_capability_digest: str
+    cgroup_v2_capability_digest: str
+    diagnostics_digest: str
+
+    def validate(self) -> None:
+        for value in (self.policy_digest, self.distributions_digest,
+                      self.native_runtime_digest, self.bridge_sha256,
+                      self.server_jar_sha256, self.endpoint_hash,
+                      self.user_systemd_capability_digest,
+                      self.cgroup_v2_capability_digest, self.diagnostics_digest):
+            _require_sha256(value, "environment_mismatch")
+        if (self.policy_identity != "minecraft-k12-live-environment-policy/1"
+                or self.python_implementation != "CPython"
+                or self.python_version != "3.10.19"
+                or self.locale != "en_us" or self.seed_support_state != "unsupported"
+                or not all((self.node_identity, self.java_identity, self.model_id))):
+            raise ProvenanceError("environment_mismatch")
+
+    def canonical(self) -> dict[str, Any]:
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+
+@dataclass(frozen=True, slots=True)
+class TargetLockObservation:
+    target_identity: str
+    host_hash: str
+    port: int
+    rcon_target_identity: str
+    server_identity: str
+    minecraft_version: str
+    data_version: str
+    world_id: str
+    actor_identities: tuple[str, ...]
+    region_identity: str
+    lock_schema: int
+    lock_key: str
+    lock_attempt_id: str
+    lock_object_identity: str
+    fd_open: bool
+    regular_file: bool
+    device_inode_digest: str
+    owner_metadata_digest: str
+    continuously_owned: bool
+
+    def validate(self, reservation_id: str) -> None:
+        for value in (self.host_hash, self.lock_key, self.lock_object_identity,
+                      self.device_inode_digest, self.owner_metadata_digest):
+            _require_sha256(value, "target_lock_loss")
+        _require_sha256(reservation_id, "authority_replay")
+        if (not self.target_identity or self.lock_attempt_id != reservation_id
+                or self.lock_schema != 2 or type(self.port) is not int
+                or not 1 <= self.port <= 65535 or self.fd_open is not True
+                or self.regular_file is not True or self.continuously_owned is not True):
+            raise ProvenanceError("target_lock_loss")
+        if (self.server_identity != "minecraft-server/1.19.2"
+                or self.minecraft_version != "1.19.2"
+                or not self.actor_identities or not all(self.actor_identities)):
+            raise ProvenanceError("target_identity_mismatch")
+
+    def locale_or_none(self) -> str:
+        """Compatibility view for the profile-fixed target locale."""
+        return "en_us" if self.server_identity else ""
+
+    def canonical(self) -> dict[str, Any]:
+        return {name: (list(value) if isinstance(value := getattr(self, name), tuple) else value)
+                for name in self.__dataclass_fields__}
+
+
+_TARGET_LOCK_INSTANCE_FIELDS = frozenset({
+    "lock_attempt_id", "lock_object_identity", "fd_open", "regular_file",
+    "device_inode_digest", "owner_metadata_digest", "continuously_owned",
+})
+_AUTHENTICATED_TARGET_FIELDS = (
+    "rcon_target_identity", "server_identity", "minecraft_version",
+    "data_version", "actor_identities", "region_identity",
+)
+
+
+def _target_semantics(value: TargetLockObservation | Mapping[str, Any]) -> dict[str, Any]:
+    """Return target fields that cannot change across qualification/final scope."""
+    canonical = (value.canonical()
+                 if isinstance(value, TargetLockObservation)
+                 else _deep_thaw(value))
+    if not isinstance(canonical, Mapping):
+        raise ProvenanceError("target_identity_mismatch")
+    return {
+        name: canonical[name]
+        for name in canonical
+        if name not in _TARGET_LOCK_INSTANCE_FIELDS
+    }
+
+
+def _authenticated_target_semantics(profile: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the profile's authenticated endpoint semantics for later scopes."""
+    try:
+        return {
+            "rcon_target_identity": profile["rcon_identity"],
+            "server_identity": profile["server_identity"],
+            "minecraft_version": profile["minecraft_version"],
+            "data_version": profile["data_identity"],
+            "actor_identities": list(profile["actors"]),
+            "region_identity": profile["region"]["name"],
+        }
+    except (KeyError, TypeError) as exc:
+        raise ProvenanceError("target_identity_mismatch") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class OutputRootObservation:
+    root_identity: str
+    realpath_digest: str
+    device_inode_digest: str
+    fresh_root_token: str
+    outside_all_worktrees: bool
+    outside_ledger_root: bool
+    existed_before_reservation: bool
+
+    def validate(self) -> None:
+        for value in (self.realpath_digest, self.device_inode_digest):
+            _require_sha256(value, "fresh_root_violation")
+        if (not self.root_identity or not self.fresh_root_token
+                or self.outside_all_worktrees is not True
+                or self.outside_ledger_root is not True
+                or self.existed_before_reservation is not False):
+            raise ProvenanceError("fresh_root_violation")
+
+    def canonical(self) -> dict[str, Any]:
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+
+def _scalar(value: Any) -> bool:
+    return value is None or type(value) in {bool, int, float, str}
+
+
+def _lease_scalar(value: Any) -> Any:
+    """Keep the public lease receipt inside the canonical JSON value domain."""
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ProvenanceError("target_lock_loss")
+        return repr(value)
+    return value
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class K12RetainedTargetLease:
+    """Parent-retained MinecraftTargetLock lease with a narrow public view.
+
+    The retained lock is intentionally opaque.  Revalidation calls only the
+    public ``retained_lease_snapshot`` API; no descriptor or private lock
+    implementation detail is inspected here.
+    """
+
+    lock: Any
+    reservation_id: str
+    _evidence: Mapping[str, Any]
+    identity: str
+    _ownership_token: object = field(repr=False, compare=False)
+    _owner: Any = field(repr=False, compare=False)
+
+    _SCALARS = frozenset({
+        "fd", "fd_dev", "fd_ino", "path_dev", "path_ino", "attempt_id",
+        "lock_key", "owner_pid", "owner_alive", "acquired", "quarantined",
+    })
+    _METADATA_SCALARS = frozenset({
+        "schema_version", "status", "attempt_id", "pid", "host", "port", "world_id",
+        "lock_key", "acquired_at", "stale_owner_detected", "migrated_from_schema_version",
+        "previous_status",
+    })
+
+    def __init__(self, lock: Any, reservation_id: str, ownership_token: object = None,
+                 token: object = None, owner: Any = None) -> None:
+        if token is not _LEASE_TOKEN or ownership_token is None or owner is None:
+            raise TypeError("retained target leases are parent-minted")
+        if not isinstance(reservation_id, str) or not reservation_id:
+            raise ProvenanceError("target_lock_loss")
+        from .run_lock import MinecraftTargetLock
+        if not isinstance(lock, MinecraftTargetLock):
+            raise TypeError("MinecraftTargetLock is required")
+        snapshot_method = getattr(lock, "retained_lease_snapshot", None)
+        if not callable(snapshot_method):
+            raise TypeError("public retained_lease_snapshot is required")
+        try:
+            snapshot = snapshot_method()
+        except Exception as exc:
+            raise ProvenanceError("target_lock_loss") from exc
+        evidence = self._read_allowlisted(snapshot)
+        if evidence["attempt_id"] != reservation_id or evidence["acquired"] is not True \
+                or evidence["owner_alive"] is not True or evidence["quarantined"] is True \
+                or evidence["metadata"].get("status") != "acquired":
+            raise ProvenanceError("target_lock_loss")
+        object.__setattr__(self, "lock", lock)
+        object.__setattr__(self, "reservation_id", reservation_id)
+        object.__setattr__(self, "_evidence", _deep_freeze(evidence))
+        object.__setattr__(self, "identity", canonical_sha256({
+            "artifact": "minecraft-k12-retained-target-lease/1",
+            "reservation_id": reservation_id, "evidence": evidence,
+        }))
+        object.__setattr__(self, "_ownership_token", ownership_token)
+        object.__setattr__(self, "_owner", owner)
+
+    @classmethod
+    def _read_allowlisted(cls, snapshot: Any) -> dict[str, Any]:
+        if snapshot is None:
+            raise ProvenanceError("target_lock_loss")
+        values: dict[str, Any] = {}
+        for name in cls._SCALARS:
+            if not hasattr(snapshot, name):
+                raise ProvenanceError("target_lock_loss")
+            value = getattr(snapshot, name)
+            if not _scalar(value):
+                raise ProvenanceError("target_lock_loss")
+            values[name] = _lease_scalar(value)
+        if (values["fd_dev"], values["fd_ino"]) != (values["path_dev"], values["path_ino"]):
+            raise ProvenanceError("target_lock_loss")
+        metadata = getattr(snapshot, "metadata", None)
+        if not isinstance(metadata, Mapping):
+            raise ProvenanceError("target_lock_loss")
+        selected: dict[str, Any] = {}
+        for name, value in metadata.items():
+            if name not in cls._METADATA_SCALARS or not _scalar(value):
+                raise ProvenanceError("target_lock_loss")
+            selected[name] = _lease_scalar(value)
+        values["metadata"] = selected
+        if values["metadata"].get("attempt_id") != values["attempt_id"] \
+                or values["metadata"].get("lock_key") != values["lock_key"]:
+            raise ProvenanceError("target_lock_loss")
+        return values
+
+    @property
+    def evidence(self) -> Mapping[str, Any]:
+        return self._evidence
+
+    @property
+    def owner(self) -> Any:
+        """The parent controller that retained this lease."""
+        return self._owner
+
+    def owned_by(self, owner: Any) -> bool:
+        """Authenticate ownership without exposing the parent's token."""
+        return self._owner is owner and owner is not None and bool(
+            getattr(owner, "owns_target_lease", lambda _lease: False)(self)
+        )
+
+    def canonical(self) -> dict[str, Any]:
+        return {"reservation_id": self.reservation_id, "identity": self.identity,
+                "evidence": _deep_thaw(self._evidence)}
+
+    def revalidate(self) -> Mapping[str, Any]:
+        """Re-read and compare only the public retained-lease snapshot."""
+        method = getattr(self.lock, "retained_lease_snapshot", None)
+        if not callable(method):
+            raise ProvenanceError("target_lock_loss")
+        try:
+            snapshot = method()
+        except Exception as exc:
+            raise ProvenanceError("target_lock_loss") from exc
+        current = self._read_allowlisted(snapshot)
+        if current != _deep_thaw(self._evidence):
+            raise ProvenanceError("target_lock_loss")
+        return self._evidence
+
+
+def retained_target_binding(lease: K12RetainedTargetLease) -> Mapping[str, Any]:
+    """Return the exact target-lock fields authenticated by a retained lease.
+
+    The target observation deliberately contains no lock object.  These
+    content-addressed fields are the public bridge between that observation
+    and the parent-retained descriptor, so a target with the same reservation
+    but a different lock cannot be spliced into an authority.
+    """
+
+    if not isinstance(lease, K12RetainedTargetLease):
+        raise TypeError("typed retained target lease required")
+    evidence = lease.evidence
+    metadata = evidence["metadata"]
+    inode_digest = raw_sha256(canonical_bytes({
+        "fd_dev": evidence["fd_dev"],
+        "fd_ino": evidence["fd_ino"],
+        "path_dev": evidence["path_dev"],
+        "path_ino": evidence["path_ino"],
+    }))
+    return MappingProxyType({
+        "host_hash": raw_sha256(canonical_bytes(metadata.get("host", ""))),
+        "port": metadata.get("port"),
+        "world_id": metadata.get("world_id"),
+        "lock_schema": metadata.get("schema_version"),
+        "lock_key": evidence["lock_key"],
+        "lock_attempt_id": evidence["attempt_id"],
+        "lock_object_identity": raw_sha256(canonical_bytes(lease.canonical())),
+        "fd_open": evidence["fd"] is not None,
+        "regular_file": True,
+        "device_inode_digest": inode_digest,
+        "owner_metadata_digest": raw_sha256(canonical_bytes(dict(metadata))),
+        "continuously_owned": evidence["owner_alive"] is True
+        and evidence["acquired"] is True
+        and evidence["quarantined"] is False,
+    })
+
+
+def _target_matches_retained_lease(
+        target: TargetLockObservation, lease: K12RetainedTargetLease,
+        reservation_id: str,
+) -> bool:
+    if not isinstance(target, TargetLockObservation) or not isinstance(
+        lease, K12RetainedTargetLease
+    ):
+        return False
+    if lease.reservation_id != reservation_id:
+        return False
+    expected = retained_target_binding(lease)
+    return all(getattr(target, name) == value for name, value in expected.items())
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class AuthorityBinding:
+    """An unforgeable operational binding with a separate evidence origin."""
+
+    authority_type: str
+    namespace: str
+    authority_digest: str
+    provenance: str
+    lifecycle: str
+    reservation: str
+    activation: str
+    origin: str
+    _ownership_token: object = field(repr=False, compare=False)
+
+    def __init__(self, authority_type: str | None = None, namespace: str | None = None,
+                  authority_digest: str | None = None, provenance: str | None = None,
+                  token: object = None, ownership_token: object = None, *, authority: str | None = None,
+                  lifecycle: str = "authorized", reservation: str = "",
+                  activation: str = "", origin: str | None = None) -> None:
+        authority_type = authority if authority_type is None else authority_type
+        if token is not _BINDING_TOKEN:
+            raise TypeError("live authority bindings are parent-minted")
+        if authority_type not in {QUALIFICATION_AUTHORITY, FINAL_AUTHORITY, "mock-only/1"}:
+            raise ProvenanceError("authority_namespace_mismatch")
+        if provenance not in OPERATIONAL_PROVENANCES:
+            raise ProvenanceError("authority_namespace_mismatch")
+        origin = _normalize_origin(
+            origin if origin is not None else (
+                RUNTIME_VERIFIED_ORIGIN
+                if provenance != "mock_only" else INJECTED_TEST_ORIGIN
+            )
+        )
+        if _CANONICAL_SHA256.fullmatch(authority_digest or "") is None:
+            raise ProvenanceError("authority_namespace_mismatch")
+        if lifecycle not in {"authorized", "consumed", "active", "terminal", "quarantined"}:
+            raise ProvenanceError("authority_namespace_mismatch")
+        _require_identity(namespace or "", "authority_namespace_mismatch")
+        if reservation and _SHA256.fullmatch(reservation) is None:
+            raise ProvenanceError("authority_namespace_mismatch")
+        if activation and _CANONICAL_SHA256.fullmatch(activation) is None:
+            raise ProvenanceError("authority_namespace_mismatch")
+        object.__setattr__(self, "authority_type", authority_type)
+        object.__setattr__(self, "namespace", namespace)
+        object.__setattr__(self, "authority_digest", authority_digest)
+        object.__setattr__(self, "provenance", provenance)
+        object.__setattr__(self, "lifecycle", lifecycle)
+        object.__setattr__(self, "reservation", reservation)
+        object.__setattr__(self, "activation", activation)
+        object.__setattr__(self, "origin", origin)
+        object.__setattr__(self, "_ownership_token", ownership_token)
+
+    @classmethod
+    def mock_only(cls, namespace: str = "mock") -> "AuthorityBinding":
+        return cls("mock-only/1", namespace, canonical_sha256({"mock": namespace}),
+                    "mock_only", _BINDING_TOKEN, None, lifecycle="authorized",
+                    origin=INJECTED_TEST_ORIGIN)
+
+    @property
+    def authority(self) -> str:
+        return self.authority_type
+
+    @property
+    def reservation_id(self) -> str:
+        return self.reservation
+
+    @property
+    def activation_digest(self) -> str:
+        return self.activation
+
+    @property
+    def runtime_admissible(self) -> bool:
+        return self.origin == RUNTIME_VERIFIED_ORIGIN
+
+    @property
+    def evidence_origin(self) -> str:
+        return self.origin
+
+    def canonical(self) -> dict[str, Any]:
+        return {
+            "authority": self.authority_type,
+            "authority_type": self.authority_type,
+            "namespace": self.namespace,
+            "authority_digest": self.authority_digest,
+            "provenance": self.provenance,
+            "origin": self.origin,
+            "runtime_admissible": self.runtime_admissible,
+            "lifecycle": self.lifecycle,
+            "reservation": self.reservation,
+            "activation": self.activation,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class QualificationPreflight:
+    reservation_id: str
+    run_authorization_digest: str
+    expected_head: str
+    checkout: CheckoutObservation
+    pull_request: PullRequestObservation
+    source: SourceClosure
+    capsule: Any
+    authenticated_profile: Any
+    authenticated_source_policy: Any
+    profile_identity: str
+    profile_digest: str
+    contracts: Mapping[str, str]
+    schedule_digest: str
+    environment: EnvironmentObservation
+    target: TargetLockObservation
+    output: OutputRootObservation
+    ledger_identity: str
+    ledger_root_digest: str
+    run_authorization: K12QualificationRunAuthorization
+    target_lease: K12RetainedTargetLease
+
+    def validate(self, *, now: int) -> None:
+        from .k12_runtime_profile import K12RuntimeProfile, K12SourcePolicy
+        from .k12_execution_capsule import ExecutionCapsule
+
+        _require_sha256(self.reservation_id, "authority_replay")
+        _require_sha256(self.ledger_root_digest, "authority_replay")
+        if self.expected_head != EXPECTED_HEAD:
+            raise ProvenanceError("git_head_mismatch")
+        if self.ledger_identity != "minecraft-k12-live-execution-ledger/1":
+            raise ProvenanceError("authority_replay")
+        if not isinstance(self.source, SourceClosure):
+            raise ProvenanceError("source_closure_incomplete")
+        self.checkout.validate(self.expected_head)
+        if self.source.runtime_admissible and (
+            self.source.head_commit != self.checkout.head_commit
+            or self.source.head_tree != self.checkout.head_tree
+        ):
+            raise ProvenanceError("git_tree_mismatch")
+        self.pull_request.validate(expected_head=self.expected_head, now=now)
+        if (not isinstance(self.authenticated_profile, K12RuntimeProfile)
+                or not isinstance(self.authenticated_source_policy, K12SourcePolicy)
+                or self.authenticated_profile.profile_id != PROFILE_V2
+                or self.profile_identity != self.authenticated_profile.profile_id
+                or self.profile_digest != self.authenticated_profile.profile_digest):
+            raise ProvenanceError("profile_mismatch")
+        _require_sha256(self.profile_digest, "profile_mismatch")
+        _require_sha256(self.schedule_digest, "contract_mismatch")
+        if (not self.contracts
+                or any(not isinstance(name, str) or not isinstance(value, str)
+                       or _SHA256.fullmatch(value) is None
+                       for name, value in self.contracts.items())):
+            raise ProvenanceError("contract_mismatch")
+        if (dict(self.contracts) != dict(self.authenticated_profile["contract_digests"])
+                or self.schedule_digest != raw_sha256(canonical_bytes(
+                    list(self.authenticated_profile["schedule"])) )):
+            raise ProvenanceError("contract_mismatch")
+        if (self.source.policy_identity != self.authenticated_profile["source_policy_identity"]
+                or self.source.policy_digest != self.authenticated_profile["source_policy_digest"]
+                or self.source.policy_identity != self.authenticated_source_policy.identity
+                or self.source.policy_digest != self.authenticated_source_policy.digest):
+            raise ProvenanceError("source_closure_incomplete")
+        expected_records = tuple(
+            (entry.path, entry.git_mode, entry.semantic_class)
+            for entry in self.authenticated_source_policy.entries
+        )
+        observed_records = tuple(
+            (record.path, record.git_mode, record.semantic_class)
+            for record in self.source.records
+        )
+        if tuple(record[0] for record in observed_records) != tuple(record[0] for record in expected_records):
+            raise ProvenanceError("source_closure_incomplete")
+        if tuple(record[1] for record in observed_records) != tuple(record[1] for record in expected_records):
+            raise ProvenanceError("source_mode_mismatch")
+        if tuple(record[2] for record in observed_records) != tuple(record[2] for record in expected_records):
+            raise ProvenanceError("source_semantic_class_mismatch")
+        if (self.environment.policy_identity
+                != self.authenticated_profile["environment_policy_identity"]
+                or self.environment.policy_digest
+                != self.authenticated_profile["environment_policy_digest"]):
+            raise ProvenanceError("environment_mismatch")
+        if (self.environment.node_identity != self.authenticated_profile["node_identity"]
+                or self.environment.java_identity != self.authenticated_profile["java_identity"]
+                or self.environment.bridge_sha256 != self.authenticated_profile["bridge_content_sha256"]
+                or self.environment.server_jar_sha256 != self.authenticated_profile["server_jar_sha256"]
+                or self.environment.model_id != self.authenticated_profile["model_identity"]
+                or self.environment.endpoint_hash != self.authenticated_profile["endpoint_hash"]):
+            raise ProvenanceError("environment_mismatch")
+        if (not isinstance(self.capsule, ExecutionCapsule)
+                or self.capsule.identity != self.authenticated_profile["execution_capsule_policy_identity"]
+                or not self.capsule.verify()):
+            raise ProvenanceError("capsule_mismatch")
+        if not {"node", "java"} <= self.capsule.categories:
+            raise ProvenanceError("capsule_mismatch")
+        self.environment.validate()
+        self.target.validate(self.reservation_id)
+        if (self.target.server_identity != self.authenticated_profile["server_identity"]
+                or self.target.minecraft_version != self.authenticated_profile["minecraft_version"]
+                or self.target.data_version != self.authenticated_profile["data_identity"]
+                or self.target.rcon_target_identity != self.authenticated_profile["rcon_identity"]
+                or self.target.actor_identities != tuple(self.authenticated_profile["actors"])
+                or self.target.region_identity != self.authenticated_profile["region"]["name"]):
+            raise ProvenanceError("target_identity_mismatch")
+        self.output.validate()
+        if not isinstance(self.target_lease, K12RetainedTargetLease):
+            raise TypeError("typed retained target lease required")
+        self.target_lease.revalidate()
+        if (self.target_lease.reservation_id != self.reservation_id
+                or not _target_matches_retained_lease(
+                    self.target, self.target_lease, self.reservation_id
+                )):
+            raise ProvenanceError("target_lock_loss")
+        if not isinstance(self.run_authorization, K12QualificationRunAuthorization):
+            raise TypeError("typed qualification run authorization required")
+        if (self.run_authorization.reservation_id != self.reservation_id
+                or self.run_authorization.profile_digest != self.profile_digest
+                or self.run_authorization.body.get("profile_identity") != PROFILE_V2
+                or self.run_authorization.output_root_identity != self.output.root_identity
+                or self.run_authorization.body.get("namespace") != "qualification"
+                or not isinstance(self.run_authorization.body.get("ledger"), Mapping)):
+            raise ProvenanceError("authority_replay")
+        auth_ledger = self.run_authorization.body["ledger"]
+        if (auth_ledger.get("identity") != self.ledger_identity
+                or auth_ledger.get("root_digest") != self.ledger_root_digest
+                or auth_ledger.get("namespace") != "qualification"
+                or auth_ledger.get("reservation_id") != self.reservation_id
+                or auth_ledger.get("output_root_identity") != self.output.root_identity
+                or auth_ledger.get("nonce") != self.run_authorization.nonce
+                or auth_ledger.get("state") != "reserved"):
+            raise ProvenanceError("authority_replay")
+        if not self.run_authorization.current_at(now):
+            raise ProvenanceError("authority_replay")
+        if self.run_authorization_digest != self.run_authorization.identity:
+            raise ProvenanceError("authority_replay")
+        if getattr(self.capsule, "source_aggregate", None) != self.source.aggregate_sha256:
+            raise ProvenanceError("capsule_mismatch")
+
+
+@dataclass(frozen=True, slots=True)
+class FirstConsumeObservation:
+    checkout: CheckoutObservation
+    pull_request: PullRequestObservation
+    source: SourceClosure
+    capsule: Any
+    environment: EnvironmentObservation
+    target: TargetLockObservation
+    output: OutputRootObservation
+    target_lease: K12RetainedTargetLease
+
+    def __post_init__(self) -> None:
+        from .k12_execution_capsule import ExecutionCapsule
+        expected = (CheckoutObservation, PullRequestObservation, SourceClosure,
+                    ExecutionCapsule, EnvironmentObservation, TargetLockObservation,
+                    OutputRootObservation)
+        values = (self.checkout, self.pull_request, self.source, self.capsule,
+                  self.environment, self.target, self.output)
+        if any(not isinstance(value, kind) for value, kind in zip(values, expected)):
+            raise TypeError("typed first-consume components required")
+        if not isinstance(self.target_lease, K12RetainedTargetLease):
+            raise TypeError("typed retained target lease required")
+
+    def canonical(self) -> dict[str, Any]:
+        result = {
+            "checkout": self.checkout.canonical(),
+            "pull_request": self.pull_request.canonical(),
+            "source_closure": self.source.canonical(),
+            "execution_capsule": self.capsule.canonical(),
+            "environment": self.environment.canonical(),
+            "target": self.target.canonical(),
+            "output": self.output.canonical(),
+        }
+        result["target_lease"] = self.target_lease.canonical()
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class FinalExecutionPrerequisites:
+    qualification_authority_digest: str
+    qualification_aggregate_digest: str
+    probe_aggregate_digest: str
+    qualification_terminal_ledger_digest: str
+    head_commit: str
+    head_tree: str
+    source_aggregate: str
+    profile_digest: str
+    contract_set_digest: str
+    capsule_digest: str
+    qualification_evidence: Any
+    qualification_ownership_receipt: Any
+    qualification_terminal_receipt: Any
+
+    def __post_init__(self) -> None:
+        _require_canonical_digest(self.qualification_authority_digest, "final_prerequisite_mismatch")
+        for value in (self.qualification_aggregate_digest, self.probe_aggregate_digest,
+                      self.qualification_terminal_ledger_digest):
+            _require_canonical_digest(value, "final_prerequisite_mismatch")
+        _require_sha1(self.head_commit, "final_prerequisite_mismatch")
+        _require_sha1(self.head_tree, "final_prerequisite_mismatch")
+        _require_sha256(self.source_aggregate, "final_prerequisite_mismatch")
+        _require_sha256(self.profile_digest, "final_prerequisite_mismatch")
+        if _SHA256.fullmatch(self.contract_set_digest or "") is not None:
+            object.__setattr__(self, "contract_set_digest", "sha256:" + self.contract_set_digest)
+        _require_canonical_digest(self.contract_set_digest, "final_prerequisite_mismatch")
+        _require_sha256(self.capsule_digest, "final_prerequisite_mismatch")
+        try:
+            from .k12_live_qualification import (
+                LiveQualificationAggregate,
+                QualificationAggregateOwnershipReceipt,
+                QualificationTerminalEvidence,
+            )
+            evidence = self.qualification_evidence
+            receipt = self.qualification_ownership_receipt
+            terminal = self.qualification_terminal_receipt
+            if (type(evidence) is not LiveQualificationAggregate
+                    or type(receipt) is not QualificationAggregateOwnershipReceipt
+                    or type(terminal) is not QualificationTerminalEvidence
+                    or evidence.terminal is not terminal
+                    or evidence.ownership_receipt is not receipt
+                    or evidence.qualifies() is not True
+                    or not receipt.authenticates(evidence)):
+                raise ProvenanceError("final_prerequisite_mismatch")
+            _live_evidence_values(evidence)
+        except (AttributeError, KeyError, IndexError, TypeError, ValueError,
+                ProvenanceError) as exc:
+            if isinstance(exc, ProvenanceError):
+                raise
+            raise ProvenanceError("final_prerequisite_mismatch") from exc
+
+    @classmethod
+    def from_live_qualification(cls, authority: "QualificationExecutionAuthority",
+                                 evidence: Any) -> "FinalExecutionPrerequisites":
+        from .k12_live_qualification import (
+            LiveQualificationAggregate,
+            QualificationAggregateOwnershipReceipt,
+            QualificationTerminalEvidence,
+        )
+
+        if not isinstance(evidence, LiveQualificationAggregate):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        if isinstance(authority, ActiveQualificationAuthority):
+            active_authority = authority
+        elif isinstance(authority, QualificationExecutionAuthority):
+            active_authority = evidence.authority
+            if (not isinstance(active_authority, ActiveQualificationAuthority)
+                    or active_authority.authority is not authority):
+                raise TypeError("active parent qualification authority required")
+        else:
+            raise TypeError("typed qualification authority required")
+        receipt = evidence.ownership_receipt
+        terminal = evidence.terminal_evidence
+        if (type(receipt) is not QualificationAggregateOwnershipReceipt
+                or type(terminal) is not QualificationTerminalEvidence):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        owner = active_authority.owner
+        try:
+            authenticated = receipt.authenticates(
+                evidence, authority=active_authority, controller=owner,
+            )
+        except (AttributeError, KeyError, IndexError, TypeError, ValueError,
+                ProvenanceError):
+            authenticated = False
+        if (not authenticated or evidence.authority is not active_authority
+                or evidence.authority_binding != active_authority.binding
+                or evidence.terminal is not terminal
+                or evidence.qualifies() is not True):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        values = _live_evidence_values(evidence)
+        _validate_evidence_ownership(active_authority, evidence, values)
+        qualification = active_authority.authority
+        body = qualification.body
+        if (values["profile_digest"] != body["profile"]["detached_digest"]
+                or values["authority_binding"].lifecycle != "active"
+                or not qualification.owns(values["authority_binding"])
+                or terminal.ledger_digest != values["qualification_terminal_ledger_digest"]):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        return cls(
+            qualification.identity, values["qualification_aggregate_digest"],
+            values["probe_aggregate_digest"], values["qualification_terminal_ledger_digest"],
+            body["checkout"]["head_commit"], body["checkout"]["head_tree"],
+            body["source_closure"]["aggregate_sha256"], body["profile"]["detached_digest"],
+            canonical_sha256(_deep_thaw(body["contracts"])),
+            body["execution_capsule"]["capsule_digest"], evidence, receipt, terminal,
+        )
+
+    @property
+    def origin(self) -> str:
+        return _normalize_origin(self.qualification_evidence.evidence_origin)
+
+    @property
+    def runtime_admissible(self) -> bool:
+        return self.origin == RUNTIME_VERIFIED_ORIGIN
+
+    @property
+    def evidence_origin(self) -> str:
+        return self.origin
+
+    @property
+    def qualification_ownership_receipt_digest(self) -> str:
+        receipt = self.qualification_ownership_receipt
+        if receipt is None:
+            raise ProvenanceError("final_prerequisite_mismatch")
+        return receipt.identity
+
+    @property
+    def qualification_terminal_receipt_digest(self) -> str:
+        receipt = self.qualification_terminal_receipt
+        if receipt is None:
+            raise ProvenanceError("final_prerequisite_mismatch")
+        return receipt.identity
+
+    def matches(self, authority: "QualificationExecutionAuthority") -> bool:
+        if not isinstance(authority, QualificationExecutionAuthority):
+            return False
+        body = authority.body
+        expected_origin = (
+            RUNTIME_VERIFIED_ORIGIN
+            if authority.origin == RUNTIME_VERIFIED_ORIGIN else INJECTED_FAKE_ORIGIN
+        )
+        return (self.qualification_authority_digest == authority.identity
+                and self.origin == expected_origin
+                and self.head_commit == body["checkout"]["head_commit"]
+                and self.head_tree == body["checkout"]["head_tree"]
+                and self.source_aggregate == body["source_closure"]["aggregate_sha256"]
+                and self.profile_digest == body["profile"]["detached_digest"]
+                and self.contract_set_digest == canonical_sha256(_deep_thaw(body["contracts"]))
+                and self.capsule_digest == body["execution_capsule"]["capsule_digest"]
+                and self.qualification_ownership_receipt is not None
+                and self.qualification_terminal_receipt is not None)
+
+
+@dataclass(frozen=True, slots=True)
+class FinalFirstConsumeObservation:
+    prerequisites: FinalExecutionPrerequisites
+    checkout: CheckoutObservation
+    source: SourceClosure
+    capsule: Any
+    environment: EnvironmentObservation
+    target: TargetLockObservation
+    output: OutputRootObservation
+    target_lease: K12RetainedTargetLease
+    pull_request: PullRequestObservation
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.prerequisites, FinalExecutionPrerequisites):
+            raise TypeError("typed final prerequisites required")
+        values = (
+            self.checkout, self.source, self.environment, self.target, self.output,
+            self.target_lease, self.pull_request,
+        )
+        kinds = (
+            CheckoutObservation, SourceClosure, EnvironmentObservation,
+            TargetLockObservation, OutputRootObservation, K12RetainedTargetLease,
+            PullRequestObservation,
+        )
+        if any(value is None or not isinstance(value, kind)
+               for value, kind in zip(values, kinds)):
+            raise TypeError("typed final first-consume components required")
+        from .k12_execution_capsule import ExecutionCapsule
+        if not isinstance(self.capsule, ExecutionCapsule):
+            raise TypeError("typed final execution capsule required")
+
+    def canonical(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"prerequisites": {
+            name: getattr(self.prerequisites, name)
+            for name in self.prerequisites.__dataclass_fields__
+            if name not in {
+                "qualification_evidence", "qualification_ownership_receipt",
+                "qualification_terminal_receipt",
+            }
+        }}
+        result.update({
+            "checkout": self.checkout.canonical(),
+            "source_closure": self.source.canonical(),
+            "execution_capsule": self.capsule.canonical(),
+            "environment": self.environment.canonical(),
+            "target": self.target.canonical(),
+            "output": self.output.canonical(),
+            "target_lease": self.target_lease.canonical(),
+            "pull_request": self.pull_request.canonical(),
+        })
+        return result
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class _RunAuthorizationBase:
+    body: Mapping[str, Any]
+    detached_artifact_sha256: str
+    identity: str
+    capabilities: tuple[str, ...]
+    evidence_origin: str
+    reservation_id: str
+    nonce: str
+    output_root_identity: str
+    ownership_token: object = field(repr=False, compare=False)
+
+    def __init__(self, body: Mapping[str, Any], ownership_token: object, token: object,
+                 schema: str, expected_capability: str) -> None:
+        if token is not _RUN_AUTH_TOKEN or ownership_token is None:
+            raise TypeError("run authorizations are parent-minted")
+        if not isinstance(body, Mapping) or "detached_artifact_sha256" in body:
+            raise ProvenanceError("authority_digest_mismatch")
+        canonical = dict(body)
+        capabilities = tuple(canonical.get("capabilities", ()))
+        if capabilities != (expected_capability,):
+            raise ProvenanceError("authority_capability_mismatch")
+        origin = _normalize_origin(canonical.get("evidence_origin"))
+        canonical["evidence_origin"] = origin
+        reservation_id = canonical.get("reservation_id")
+        if _SHA256.fullmatch(reservation_id or "") is None:
+            raise ProvenanceError("authority_replay")
+        nonce = canonical.get("nonce")
+        root = canonical.get("output_root_identity")
+        if not isinstance(nonce, str) or not nonce or not isinstance(root, str) or not root:
+            raise ProvenanceError("authority_replay")
+        detached = raw_sha256(canonical_bytes(canonical))
+        object.__setattr__(self, "body", _deep_freeze(canonical))
+        object.__setattr__(self, "detached_artifact_sha256", detached)
+        object.__setattr__(self, "identity", canonical_sha256({"schema": schema, "digest": detached}))
+        object.__setattr__(self, "capabilities", capabilities)
+        object.__setattr__(self, "evidence_origin", origin)
+        object.__setattr__(self, "reservation_id", reservation_id)
+        object.__setattr__(self, "nonce", nonce)
+        object.__setattr__(self, "output_root_identity", root)
+        object.__setattr__(self, "ownership_token", ownership_token)
+
+    def receipt(self) -> dict[str, Any]:
+        return {**_deep_thaw(self.body), "detached_artifact_sha256": self.detached_artifact_sha256}
+
+    @property
+    def capability(self) -> str:
+        return self.capabilities[0]
+
+    @property
+    def authorization_digest(self) -> str:
+        return self.identity
+
+    @property
+    def digest(self) -> str:
+        return self.detached_artifact_sha256
+
+    @property
+    def namespace(self) -> str:
+        return self.body["namespace"]
+
+    @property
+    def origin(self) -> str:
+        return self.evidence_origin
+
+    @property
+    def runtime_admissible(self) -> bool:
+        return self.origin == RUNTIME_VERIFIED_ORIGIN
+
+    def current_at(self, now: int) -> bool:
+        issued_at = self.body.get("issued_at")
+        return (type(now) is int and type(issued_at) is int
+                and issued_at <= now <= issued_at + MAX_PR_AGE_SECONDS)
+
+    def binding(self, namespace: str | None = None) -> AuthorityBinding:
+        if isinstance(self, K12QualificationRunAuthorization):
+            selected = namespace or "live_qualification"
+            if selected not in {"live_qualification", "qualification_probe"}:
+                raise ProvenanceError("authority_namespace_mismatch")
+            authority_type = QUALIFICATION_AUTHORITY
+            provenance = selected
+        else:
+            selected = namespace or "live_final"
+            if selected != "live_final":
+                raise ProvenanceError("authority_namespace_mismatch")
+            authority_type = FINAL_AUTHORITY
+            provenance = "live_final"
+        return AuthorityBinding(authority_type, selected, self.identity, provenance,
+                                _BINDING_TOKEN, self.ownership_token,
+                                lifecycle="authorized", reservation=self.reservation_id,
+                                origin=self.origin)
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class K12QualificationRunAuthorization(_RunAuthorizationBase):
+    def __init__(self, body: Mapping[str, Any], ownership_token: object,
+                 token: object = None) -> None:
+        _RunAuthorizationBase.__init__(
+            self, body, ownership_token, token, QUALIFICATION_RUN_AUTHORIZATION,
+            "qualification_execute",
+        )
+        if self.evidence_origin not in {RUNTIME_VERIFIED_ORIGIN, INJECTED_TEST_ORIGIN}:
+            raise ProvenanceError("authority_origin_mismatch")
+
+    @property
+    def profile_digest(self) -> str:
+        return self.body.get("profile_digest", "")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class K12FinalRunAuthorization(_RunAuthorizationBase):
+    def __init__(self, body: Mapping[str, Any], ownership_token: object,
+                 token: object = None) -> None:
+        _RunAuthorizationBase.__init__(
+            self, body, ownership_token, token, FINAL_RUN_AUTHORIZATION, "final_execute",
+        )
+        if self.evidence_origin not in AUTHORIZATION_ORIGINS:
+            raise ProvenanceError("authority_origin_mismatch")
+
+    @property
+    def profile_digest(self) -> str:
+        return self.body.get("profile_digest", "")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class QualificationExecutionAuthority:
+    body: Mapping[str, Any]
+    detached_artifact_sha256: str
+    identity: str
+    run_authorization: K12QualificationRunAuthorization
+    ownership_token: object = field(repr=False, compare=False)
+    ledger: Any = field(repr=False, compare=False)
+    owner: Any = field(repr=False, compare=False)
+
+    def __init__(self, body: Mapping[str, Any], ownership_token: object, ledger: Any = None,
+                 token: object = None, run_authorization: K12QualificationRunAuthorization = None,
+                 parent: Any = None) -> None:
+        if token is not _AUTHORITY_TOKEN or ownership_token is None \
+                or not isinstance(run_authorization, K12QualificationRunAuthorization):
+            raise TypeError("qualification execution authority is parent-minted")
+        canonical = dict(body)
+        if "detached_artifact_sha256" in canonical:
+            raise ProvenanceError("authority_digest_mismatch")
+        canonical["evidence_origin"] = _normalize_origin(canonical.get("evidence_origin"))
+        if run_authorization.evidence_origin != canonical["evidence_origin"]:
+            raise ProvenanceError("authority_origin_mismatch")
+        detached = raw_sha256(canonical_bytes(canonical))
+        object.__setattr__(self, "body", _deep_freeze(canonical))
+        object.__setattr__(self, "detached_artifact_sha256", detached)
+        object.__setattr__(self, "identity", canonical_sha256({"schema": QUALIFICATION_AUTHORITY,
+                                                               "digest": detached}))
+        object.__setattr__(self, "run_authorization", run_authorization)
+        object.__setattr__(self, "ownership_token", ownership_token)
+        object.__setattr__(self, "ledger", ledger)
+        object.__setattr__(self, "owner", parent)
+
+    def receipt(self) -> dict[str, Any]:
+        return {**_deep_thaw(self.body), "detached_artifact_sha256": self.detached_artifact_sha256}
+
+    @property
+    def lifecycle(self) -> str:
+        return self.owner.lifecycle_for(self.ledger)[0]
+
+    @property
+    def reservation_id(self) -> str:
+        return self.body["reservation_id"]
+
+    @property
+    def profile_digest(self) -> str:
+        return self.body["profile"]["detached_digest"]
+
+    @property
+    def origin(self) -> str:
+        return _normalize_origin(self.body.get("evidence_origin"))
+
+    @property
+    def runtime_admissible(self) -> bool:
+        return self.origin == RUNTIME_VERIFIED_ORIGIN
+
+    @property
+    def evidence_origin(self) -> str:
+        return self.origin
+
+    @property
+    def activation(self) -> str:
+        return self.owner.lifecycle_for(self.ledger)[1]
+
+    def current_at(self, now: int | None = None) -> bool:
+        return self.owner.authority_is_current(self, now=now)
+
+    def binding(self, namespace: str = "live_qualification") -> AuthorityBinding:
+        if namespace not in {"live_qualification", "qualification_probe"}:
+            raise ProvenanceError("authority_namespace_mismatch")
+        lifecycle, activation = self.owner.lifecycle_for(self.ledger)
+        return AuthorityBinding(QUALIFICATION_AUTHORITY, namespace, self.identity,
+                                namespace, _BINDING_TOKEN, self.ownership_token,
+                                lifecycle=lifecycle, reservation=self.body["reservation_id"],
+                                activation=activation, origin=self.origin)
+
+    @property
+    def authority_binding(self) -> AuthorityBinding:
+        return self.binding()
+
+    def owns(self, binding: AuthorityBinding) -> bool:
+        return (isinstance(binding, AuthorityBinding)
+                and binding._ownership_token is self.ownership_token
+                and binding.authority_type == QUALIFICATION_AUTHORITY
+                and binding.authority_digest == self.identity
+                and binding.reservation == self.body["reservation_id"]
+                and binding.origin == self.origin
+                and binding.namespace in {"live_qualification", "qualification_probe"})
+
+    def refresh_pull_request(self, observation: PullRequestObservation, *, now: int) -> None:
+        observation.validate(expected_head=self.body["checkout"]["head_commit"], now=now)
+        if tuple(observation.semantic_tuple()) != tuple(self.body["pull_request_semantic_tuple"]):
+            raise ProvenanceError("pr_semantic_mismatch")
+
+    # Compatibility views for qualification code outside this scoped change.
+    # New authority code uses the public ``ledger``, ``owner``, and lifecycle
+    # APIs above.
+    @property
+    def _ledger(self) -> Any:
+        return self.ledger
+
+    @property
+    def _parent(self) -> Any:
+        return self.owner
+
+    @property
+    def _marker(self) -> object:
+        return self.ownership_token
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class FinalExecutionAuthority:
+    body: Mapping[str, Any]
+    detached_artifact_sha256: str
+    identity: str
+    run_authorization: K12FinalRunAuthorization
+    ownership_token: object = field(repr=False, compare=False)
+    ledger: Any = field(repr=False, compare=False)
+    owner: Any = field(repr=False, compare=False)
+
+    def __init__(self, body: Mapping[str, Any], ownership_token: object, ledger: Any = None,
+                 token: object = None, run_authorization: K12FinalRunAuthorization = None,
+                 parent: Any = None) -> None:
+        if token is not _AUTHORITY_TOKEN or ownership_token is None \
+                or not isinstance(run_authorization, K12FinalRunAuthorization):
+            raise TypeError("final execution authority is parent-minted")
+        canonical = dict(body)
+        if "detached_artifact_sha256" in canonical:
+            raise ProvenanceError("authority_digest_mismatch")
+        canonical["evidence_origin"] = _normalize_origin(canonical.get("evidence_origin"))
+        if run_authorization.evidence_origin != canonical["evidence_origin"]:
+            raise ProvenanceError("authority_origin_mismatch")
+        detached = raw_sha256(canonical_bytes(canonical))
+        object.__setattr__(self, "body", _deep_freeze(canonical))
+        object.__setattr__(self, "detached_artifact_sha256", detached)
+        object.__setattr__(self, "identity", canonical_sha256({"schema": FINAL_AUTHORITY,
+                                                               "digest": detached}))
+        object.__setattr__(self, "run_authorization", run_authorization)
+        object.__setattr__(self, "ownership_token", ownership_token)
+        object.__setattr__(self, "ledger", ledger)
+        object.__setattr__(self, "owner", parent)
+
+    def receipt(self) -> dict[str, Any]:
+        return {**_deep_thaw(self.body), "detached_artifact_sha256": self.detached_artifact_sha256}
+
+    @property
+    def lifecycle(self) -> str:
+        return self.owner.lifecycle_for(self.ledger)[0]
+
+    @property
+    def reservation_id(self) -> str:
+        return self.body["reservation_id"]
+
+    @property
+    def profile_digest(self) -> str:
+        return self.body["profile_digest"]
+
+    @property
+    def origin(self) -> str:
+        return _normalize_origin(self.body.get("evidence_origin"))
+
+    @property
+    def runtime_admissible(self) -> bool:
+        return self.origin == RUNTIME_VERIFIED_ORIGIN
+
+    @property
+    def evidence_origin(self) -> str:
+        return self.origin
+
+    @property
+    def activation(self) -> str:
+        return self.owner.lifecycle_for(self.ledger)[1]
+
+    def current_at(self, now: int | None = None) -> bool:
+        return self.owner.authority_is_current(self, now=now)
+
+    def binding(self) -> AuthorityBinding:
+        lifecycle, activation = self.owner.lifecycle_for(self.ledger)
+        return AuthorityBinding(FINAL_AUTHORITY, "live_final", self.identity, "live_final",
+                                _BINDING_TOKEN, self.ownership_token, lifecycle=lifecycle,
+                                reservation=self.body["reservation_id"], activation=activation,
+                                origin=self.origin)
+
+    @property
+    def authority_binding(self) -> AuthorityBinding:
+        return self.binding()
+
+    def owns(self, binding: AuthorityBinding) -> bool:
+        return (isinstance(binding, AuthorityBinding)
+                and binding._ownership_token is self.ownership_token
+                and binding.authority_type == FINAL_AUTHORITY
+                and binding.authority_digest == self.identity
+                and binding.namespace == "live_final"
+                and binding.origin == self.origin
+                and binding.reservation == self.body["reservation_id"])
+
+    def refresh_pull_request(self, observation: PullRequestObservation, *, now: int) -> None:
+        semantic = self.body.get("pull_request_semantic_tuple")
+        if semantic is None:
+            raise ProvenanceError("pr_observation_missing")
+        observation.validate(expected_head=semantic[6], now=now)
+        if tuple(observation.semantic_tuple()) != tuple(semantic):
+            raise ProvenanceError("pr_semantic_mismatch")
+
+    @property
+    def _ledger(self) -> Any:
+        return self.ledger
+
+    @property
+    def _parent(self) -> Any:
+        return self.owner
+
+    @property
+    def _marker(self) -> object:
+        return self.ownership_token
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ActiveQualificationAuthority:
+    authority: QualificationExecutionAuthority
+    activation_digest: str
+    binding: AuthorityBinding
+    ownership_token: object = field(repr=False, compare=False)
+
+    def __init__(self, authority: QualificationExecutionAuthority, activation_digest: str,
+                 ownership_token: object, token: object = None) -> None:
+        if token is not _ACTIVE_TOKEN or ownership_token is None or not isinstance(authority, QualificationExecutionAuthority):
+            raise TypeError("active qualification authority is parent-minted")
+        _require_canonical_digest(activation_digest, "authority_replay")
+        binding = AuthorityBinding(QUALIFICATION_AUTHORITY, "live_qualification", authority.identity,
+                                   "live_qualification", _BINDING_TOKEN, ownership_token,
+                                   lifecycle="active", reservation=authority.body["reservation_id"],
+                                   activation=activation_digest, origin=authority.origin)
+        object.__setattr__(self, "authority", authority)
+        object.__setattr__(self, "activation_digest", activation_digest)
+        object.__setattr__(self, "binding", binding)
+        object.__setattr__(self, "ownership_token", ownership_token)
+
+    @property
+    def identity(self) -> str:
+        return self.authority.identity
+
+    @property
+    def lifecycle(self) -> str:
+        return "active"
+
+    @property
+    def reservation_id(self) -> str:
+        return self.authority.reservation_id
+
+    @property
+    def activation(self) -> str:
+        return self.activation_digest
+
+    @property
+    def owner(self) -> Any:
+        return self.authority.owner
+
+    def current_at(self, now: int | None = None) -> bool:
+        return self.authority.current_at(now)
+
+    @property
+    def origin(self) -> str:
+        return self.authority.origin
+
+    @property
+    def runtime_admissible(self) -> bool:
+        return self.origin == RUNTIME_VERIFIED_ORIGIN
+
+    @property
+    def evidence_origin(self) -> str:
+        return self.origin
+
+    @property
+    def body(self) -> Mapping[str, Any]:
+        return self.authority.body
+
+    @property
+    def profile_digest(self) -> str:
+        return self.authority.body["profile"]["detached_digest"]
+
+    @property
+    def authority_binding(self) -> AuthorityBinding:
+        return self.binding
+
+    def owns(self, binding: AuthorityBinding) -> bool:
+        return self.authority.owns(binding) and binding.lifecycle == "active" \
+            and binding.activation == self.activation_digest
+
+    def refresh_pull_request(self, observation: PullRequestObservation, *, now: int) -> None:
+        self.authority.refresh_pull_request(observation, now=now)
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ActiveFinalAuthority:
+    authority: FinalExecutionAuthority
+    activation_digest: str
+    binding: AuthorityBinding
+    ownership_token: object = field(repr=False, compare=False)
+
+    def __init__(self, authority: FinalExecutionAuthority, activation_digest: str,
+                 ownership_token: object, token: object = None) -> None:
+        if token is not _ACTIVE_TOKEN or ownership_token is None or not isinstance(authority, FinalExecutionAuthority):
+            raise TypeError("active final authority is parent-minted")
+        _require_canonical_digest(activation_digest, "authority_replay")
+        binding = AuthorityBinding(FINAL_AUTHORITY, "live_final", authority.identity, "live_final",
+                                   _BINDING_TOKEN, ownership_token, lifecycle="active",
+                                   reservation=authority.body["reservation_id"],
+                                   activation=activation_digest, origin=authority.origin)
+        object.__setattr__(self, "authority", authority)
+        object.__setattr__(self, "activation_digest", activation_digest)
+        object.__setattr__(self, "binding", binding)
+        object.__setattr__(self, "ownership_token", ownership_token)
+
+    @property
+    def identity(self) -> str:
+        return self.authority.identity
+
+    @property
+    def lifecycle(self) -> str:
+        return "active"
+
+    @property
+    def reservation_id(self) -> str:
+        return self.authority.reservation_id
+
+    @property
+    def activation(self) -> str:
+        return self.activation_digest
+
+    @property
+    def owner(self) -> Any:
+        return self.authority.owner
+
+    def current_at(self, now: int | None = None) -> bool:
+        return self.authority.current_at(now)
+
+    @property
+    def origin(self) -> str:
+        return self.authority.origin
+
+    @property
+    def runtime_admissible(self) -> bool:
+        return self.origin == RUNTIME_VERIFIED_ORIGIN
+
+    @property
+    def evidence_origin(self) -> str:
+        return self.origin
+
+    @property
+    def body(self) -> Mapping[str, Any]:
+        return self.authority.body
+
+    @property
+    def profile_digest(self) -> str:
+        return self.authority.body["profile_digest"]
+
+    @property
+    def authority_binding(self) -> AuthorityBinding:
+        return self.binding
+
+    def owns(self, binding: AuthorityBinding) -> bool:
+        return self.authority.owns(binding) and binding.lifecycle == "active" \
+            and binding.activation == self.activation_digest
+
+    def refresh_pull_request(self, observation: PullRequestObservation, *, now: int) -> None:
+        self.authority.refresh_pull_request(observation, now=now)
+
+
+@runtime_checkable
+class LiveQualificationEvidence(Protocol):
+    """Protocol supplied by the later qualification scope.
+
+    The authority layer depends only on these public values, not on a future
+    aggregate module.  ``qualifies`` may be a method or ``passed`` may be a
+    boolean property; the validator accepts either form for aggregate-like
+    evidence while keeping operational provenance separate from origin.
+    """
+
+    profile_digest: str
+    authority_binding: AuthorityBinding
+
+
+# Stable spelling for the later qualification scope; both names refer to the
+# same structural protocol and neither imports its future aggregate module.
+K12LiveQualificationEvidence = LiveQualificationEvidence
+QualificationEvidenceProtocol = LiveQualificationEvidence
+
+
+def _live_evidence_values(evidence: Any) -> dict[str, Any]:
+    # This is intentionally a nominal check.  A protocol or a namespace with
+    # the same attributes is not an authenticated qualification aggregate.
+    from .k12_live_qualification import (
+        LiveQualificationAggregate,
+        QualificationAggregateOwnershipReceipt,
+        QualificationTerminalEvidence,
+    )
+
+    if type(evidence) is not LiveQualificationAggregate:
+        raise ProvenanceError("final_prerequisite_mismatch")
+    try:
+        origin = _normalize_origin(evidence.evidence_origin)
+        binding = evidence.authority_binding
+        passed = evidence.qualifies()
+        receipt = evidence.ownership_receipt
+        terminal = evidence.terminal_evidence
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError,
+            ProvenanceError) as exc:
+        raise ProvenanceError("final_prerequisite_mismatch") from exc
+    if (evidence.execution_provenance != "live_qualification"
+            or origin not in {RUNTIME_VERIFIED_ORIGIN, INJECTED_FAKE_ORIGIN}
+            or passed is not True
+            or not isinstance(binding, AuthorityBinding)
+            or binding.namespace != "live_qualification"):
+        raise ProvenanceError("final_prerequisite_mismatch")
+    if (type(receipt) is not QualificationAggregateOwnershipReceipt
+            or type(terminal) is not QualificationTerminalEvidence):
+        raise ProvenanceError("final_prerequisite_mismatch")
+
+    values = {
+        "qualification_aggregate_digest": evidence.identity,
+        "probe_aggregate_digest": evidence.probes.identity,
+        "qualification_terminal_ledger_digest": terminal.ledger_digest,
+        "profile_digest": evidence.profile_digest,
+        "authority_binding": binding,
+        "evidence_origin": origin,
+        "authority": evidence.authority,
+        "controller": evidence.controller,
+        "ownership_receipt": receipt,
+        "terminal_receipt": terminal,
+    }
+    for name in ("qualification_aggregate_digest", "probe_aggregate_digest",
+                 "qualification_terminal_ledger_digest"):
+        _require_canonical_digest(values[name], "final_prerequisite_mismatch")
+    _require_sha256(values["profile_digest"], "final_prerequisite_mismatch")
+    return values
+
+
+def _qualification_execution(authority: Any) -> QualificationExecutionAuthority:
+    if isinstance(authority, ActiveQualificationAuthority):
+        authority = authority.authority
+    if not isinstance(authority, QualificationExecutionAuthority):
+        raise TypeError("typed qualification authority required")
+    return authority
+
+
+def _validate_evidence_ownership(
+        authority: Any, evidence: Any, values: Mapping[str, Any], *,
+        controller: Any = None,
+) -> None:
+    """Require runtime evidence or a controller-owned injected fake graph."""
+    execution = _qualification_execution(authority)
+    binding = values["authority_binding"]
+    origin = values["evidence_origin"]
+    owner = execution.owner
+    if (not execution.owns(binding)
+            or owner is None
+            or not owner.owns_authority(execution)):
+        raise ProvenanceError("final_prerequisite_mismatch")
+    if origin == RUNTIME_VERIFIED_ORIGIN:
+        if (execution.origin != RUNTIME_VERIFIED_ORIGIN
+                or values.get("authority") is not authority
+                or (values.get("controller") is not None
+                    and values.get("controller") is not owner)):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        return
+    if origin != INJECTED_FAKE_ORIGIN:
+        raise ProvenanceError("final_prerequisite_mismatch")
+    if (owner.origin != INJECTED_TEST_ORIGIN
+            or not owner.is_injected_test_controller):
+        raise ProvenanceError("final_prerequisite_mismatch")
+    if controller is not None and controller is not owner:
+        raise ProvenanceError("final_prerequisite_mismatch")
+    evidence_authority = values.get("authority")
+    if (not isinstance(evidence_authority, ActiveQualificationAuthority)
+            or evidence_authority.authority is not execution
+            or evidence_authority.owner is not owner):
+        raise ProvenanceError("final_prerequisite_mismatch")
+    claimed_controller = values.get("controller")
+    if claimed_controller is not None and claimed_controller is not owner:
+        raise ProvenanceError("final_prerequisite_mismatch")
+
+
+def _ledger_binding_state(ledger: Any) -> tuple[str, str]:
+    state = getattr(ledger, "state", None)
+    if state == "active":
+        return "active", getattr(ledger, "head_digest", "")
+    if state == "first_consume_verified":
+        return "consumed", ""
+    if state == "terminal":
+        return "terminal", ""
+    if state == "quarantined":
+        return "quarantined", ""
+    return "authorized", ""
+
+
+def durable_ledger_root_digest(ledger: Any) -> str:
+    """Return the content-addressed identity of a durable ledger root."""
+    root = getattr(ledger, "root", None)
+    if not isinstance(root, Path):
+        try:
+            root = Path(root)
+        except (TypeError, ValueError) as exc:
+            raise ProvenanceError("authority_replay") from exc
+    return raw_sha256(canonical_bytes({
+        "artifact": _LEDGER_ROOT_ARTIFACT,
+        "root": str(root.resolve(strict=True)),
+    }))
+
+
+def durable_ledger_snapshot(ledger: Any) -> Mapping[str, Any]:
+    """Read the public immutable ledger identity used by authority binding."""
+    from .k12_execution_capsule import DurableLedger
+
+    if not isinstance(ledger, DurableLedger):
+        raise TypeError("typed durable ledger required")
+    try:
+        if not ledger.verify_chain():
+            raise ProvenanceError("ledger_corrupt")
+        root = ledger.root.resolve(strict=True)
+        snapshot = {
+            "identity": ledger.identity,
+            "root": str(root),
+            "root_digest": durable_ledger_root_digest(ledger),
+            "namespace": ledger.namespace,
+            "reservation_id": ledger.reservation_id,
+            "output_root_identity": ledger.output_root_identity,
+            "nonce": ledger.nonce,
+            "state": ledger.state,
+            "head_digest": ledger.head_digest,
+            "reservation_record_digest": ledger.events[0].digest,
+        }
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ProvenanceError("ledger_corrupt") from exc
+    return MappingProxyType(snapshot)
+
+
+def authority_owns_profile(authority: Any, binding: AuthorityBinding, *,
+                           profile_id: str, profile_digest: str) -> bool:
+    """Bind a downstream capability to an active parent authority/profile."""
+    if not isinstance(binding, AuthorityBinding) or profile_id != PROFILE_V2:
+        return False
+    execution = authority.authority if isinstance(authority, (ActiveQualificationAuthority,
+                                                               ActiveFinalAuthority)) else authority
+    owner = getattr(execution, "owner", None)
+    if (owner is None or not owner.owns_authority(execution)
+            or execution.lifecycle != "active"):
+        return False
+    validator = getattr(owner, "validate_current_authority", None)
+    if not callable(validator):
+        return False
+    try:
+        if validator(execution) is not True:
+            return False
+    except (AttributeError, TypeError, ValueError, ProvenanceError):
+        return False
+    if getattr(binding, "origin", None) != getattr(execution, "origin", None):
+        return False
+    if isinstance(authority, ActiveQualificationAuthority):
+        return (authority.owns(binding) and execution.body["profile"]["identity"] == profile_id
+                and execution.body["profile"]["detached_digest"] == profile_digest)
+    if isinstance(authority, QualificationExecutionAuthority):
+        return (authority.owns(binding) and binding.lifecycle == "active"
+                and execution.body["profile"]["identity"] == profile_id
+                and execution.body["profile"]["detached_digest"] == profile_digest)
+    if isinstance(authority, ActiveFinalAuthority):
+        return authority.owns(binding) and execution.body["profile_digest"] == profile_digest
+    if isinstance(authority, FinalExecutionAuthority):
+        return (authority.owns(binding) and binding.lifecycle == "active"
+                and execution.body["profile_digest"] == profile_digest)
+    return False
+
+
+def refresh_pull_request_observation(authority: Any, observation: PullRequestObservation,
+                                     *, now: int) -> None:
+    """Revalidate the frozen semantic PR tuple at a live authority boundary."""
+    if not isinstance(authority, (QualificationExecutionAuthority, FinalExecutionAuthority,
+                                   ActiveQualificationAuthority, ActiveFinalAuthority)):
+        raise TypeError("typed execution authority required")
+    authority.refresh_pull_request(observation, now=now)
+
+
+def _ledger_is(ledger: Any, *, namespace: str, state: str, reservation: str | None = None) -> bool:
+    return (getattr(ledger, "identity", None) == "minecraft-k12-live-execution-ledger/1"
+            and getattr(ledger, "namespace", None) == namespace
+            and getattr(ledger, "state", None) == state
+            and (reservation is None or getattr(ledger, "reservation_id", None) == reservation)
+            and getattr(ledger, "verify_chain", lambda: False)())
+
+
+class _TrustedClock:
+    """Parent-owned clock used at live authority consumption boundaries.
+
+    Runtime parents read wall-clock seconds for every observation.  Injected
+    controllers instead hold a deterministic logical value; the value can
+    only move through an explicit timestamp supplied to an authority API or
+    through the controller's test-only advance method.
+    """
+
+    def __init__(self, *, injected: bool) -> None:
+        self._injected = injected
+        self._lock = threading.RLock()
+        self._value = 0
+
+    def now(self) -> int:
+        if not self._injected:
+            return int(time.time())
+        with self._lock:
+            return self._value
+
+    def observe_explicit(self, value: int) -> int:
+        if type(value) is not int:
+            raise TypeError("integer trusted time is required")
+        if self._injected:
+            with self._lock:
+                if value > self._value:
+                    self._value = value
+        return value
+
+    def advance(self, seconds: int) -> int:
+        if type(seconds) is not int or seconds < 0:
+            raise ValueError("non-negative integer trusted-time advance is required")
+        if not self._injected:
+            raise ProvenanceError("injected clock is required")
+        with self._lock:
+            self._value += seconds
+            return self._value
+
+
+class ParentExecutionAuthority:
+    """The only parent mint for run authorizations and live capabilities."""
+
+    def __init__(self, *, _origin: str = RUNTIME_VERIFIED_ORIGIN,
+                 _owner: Any = None, _token: object = None) -> None:
+        if _origin != RUNTIME_VERIFIED_ORIGIN and _token is not _INJECTED_CONTROLLER_TOKEN:
+            raise TypeError("injected-test controller is parent-minted")
+        if _origin not in {RUNTIME_VERIFIED_ORIGIN, INJECTED_TEST_ORIGIN}:
+            raise ProvenanceError("authority_origin_mismatch")
+        self.__ownership_token = object()
+        self.__qualification_mint_lock = threading.RLock()
+        self.__final_mint_lock = threading.RLock()
+        self.__run_auth_lock = threading.RLock()
+        self.__minted = False
+        self.__final_minted = False
+        self.__qualification_claimed = False
+        self.__final_claimed = False
+        self.__run_auths: set[str] = set()
+        self.__ledgers: dict[int, Any] = {}
+        self.__ledger_keys: dict[int, bytes] = {}
+        self.__ledger_keys_by_root: dict[str, bytes] = {}
+        self.__authorities: dict[int, Any] = {}
+        self.__leases: dict[int, K12RetainedTargetLease] = {}
+        self.__source_closures: dict[int, SourceClosure] = {}
+        self.__capsules: dict[int, Any] = {}
+        self.__origin = _origin
+        self.__owner = _owner
+        self.__trusted_clock = _TrustedClock(
+            injected=_origin == INJECTED_TEST_ORIGIN,
+        )
+
+    @property
+    def origin(self) -> str:
+        return self.__origin
+
+    @property
+    def runtime_admissible(self) -> bool:
+        return self.origin == RUNTIME_VERIFIED_ORIGIN
+
+    @property
+    def is_injected_test_controller(self) -> bool:
+        return self.origin == INJECTED_TEST_ORIGIN and self.__owner is not None
+
+    @property
+    def owner(self) -> Any:
+        return self.__owner
+
+    def current_time(self) -> int:
+        """Return the parent-owned trusted time for a live boundary."""
+        return self.__trusted_clock.now()
+
+    trusted_now = current_time
+
+    def _resolve_time(self, now: int | None) -> int:
+        if now is None:
+            return self.current_time()
+        return self.__trusted_clock.observe_explicit(now)
+
+    def validate_current_authority(
+            self, authority: Any, *, now: int | None = None,
+    ) -> bool:
+        """Validate a parent-owned authority against trusted current time."""
+        return self.authority_is_current(authority, now=now)
+
+    def owns_ledger(self, ledger: Any) -> bool:
+        """Authenticate a ledger through the public parent ownership surface."""
+        owned = self.__ledgers.get(id(ledger))
+        return owned is ledger and _ledger_is(
+            ledger, namespace=getattr(ledger, "namespace", ""),
+            state=getattr(ledger, "state", None),
+        )
+
+    def owns_authority(self, authority: Any) -> bool:
+        return self.__authorities.get(id(authority)) is authority
+
+    def owns_target_lease(self, lease: Any) -> bool:
+        return self.__leases.get(id(lease)) is lease
+
+    def owns_source_closure(self, closure: Any) -> bool:
+        return self.__source_closures.get(id(closure)) is closure
+
+    def owns_capsule(self, capsule: Any) -> bool:
+        return self.__capsules.get(id(capsule)) is capsule
+
+    def lifecycle_for(self, ledger: Any) -> tuple[str, str]:
+        if not self.owns_ledger(ledger):
+            raise ProvenanceError("authority_replay")
+        return _ledger_binding_state(ledger)
+
+    def authority_is_current(self, authority: Any, *, now: int | None = None) -> bool:
+        if isinstance(authority, (ActiveQualificationAuthority, ActiveFinalAuthority)):
+            authority = authority.authority
+        now = self._resolve_time(now)
+        if not self.owns_authority(authority):
+            return False
+        lifecycle = self.lifecycle_for(authority.ledger)[0]
+        if lifecycle == "terminal":
+            events = getattr(authority.ledger, "events", ())
+            terminal = dict(events[-1].payload) if events else {}
+            if (getattr(authority.ledger, "namespace", None) != "qualification"
+                    or terminal.get("result") != "passed"
+                    or terminal.get("authority_digest") != authority.identity):
+                return False
+        elif lifecycle not in {"authorized", "consumed", "active"}:
+            return False
+        issued_at = authority.body.get("issued_at")
+        expires_at = authority.body.get("expires_at")
+        return (type(issued_at) is int and type(expires_at) is int
+                and issued_at <= now <= expires_at)
+
+    def advance_trusted_time(self, seconds: int = 1) -> int:
+        """Advance only an injected controller's deterministic trusted clock."""
+        if not self.is_injected_test_controller:
+            raise ProvenanceError("injected clock is required")
+        return self.__trusted_clock.advance(seconds)
+
+    advance_test_time = advance_trusted_time
+    advance_logical_time = advance_trusted_time
+
+    def injected_test_controller(self) -> "InjectedTestController":
+        return InjectedTestController(self, _INJECTED_CONTROLLER_TOKEN)
+
+    create_injected_test_controller = injected_test_controller
+    injected_test_verifier = injected_test_controller
+    create_injected_test_verifier = injected_test_controller
+
+    def create_ledger(self, *, root: str | Path, namespace: str, reservation_id: str,
+                      output_root_identity: str, nonce: str | None = None,
+                      worktree_roots: Sequence[str | Path] = ()) -> Any:
+        from .k12_execution_capsule import DurableLedger
+        controller_key = secrets.token_bytes(32)
+        ledger = DurableLedger.create_parent_owned(
+            controller_key=controller_key, root=root, namespace=namespace,
+            reservation_id=reservation_id, output_root_identity=output_root_identity,
+            nonce=nonce, worktree_roots=worktree_roots,
+        )
+        self.__ledgers[id(ledger)] = ledger
+        self.__ledger_keys[id(ledger)] = controller_key
+        self.__ledger_keys_by_root[str(ledger.root.resolve())] = controller_key
+        return ledger
+
+    reserve_ledger = create_ledger
+
+    def open_ledger(self, *, root: str | Path, namespace: str, reservation_id: str,
+                    output_root_identity: str, nonce: str,
+                    worktree_roots: Sequence[str | Path] = ()) -> Any:
+        from .k12_execution_capsule import DurableLedger
+        try:
+            root_key = str(Path(root).resolve(strict=True))
+        except (OSError, ValueError) as exc:
+            raise ProvenanceError("authority_replay") from exc
+        controller_key = self.__ledger_keys_by_root.get(root_key)
+        if controller_key is None:
+            raise ProvenanceError("parent ledger capability is unavailable")
+        ledger = DurableLedger.open_parent_owned(
+            controller_key=controller_key,
+            root=root, namespace=namespace, reservation_id=reservation_id,
+            output_root_identity=output_root_identity, nonce=nonce,
+            worktree_roots=worktree_roots,
+        )
+        self.__ledgers[id(ledger)] = ledger
+        self.__ledger_keys[id(ledger)] = controller_key
+        self.__ledger_keys_by_root[root_key] = controller_key
+        return ledger
+
+    def _ledger_controller(self, ledger: Any) -> Any:
+        if not self.owns_ledger(ledger):
+            raise TypeError("parent-owned durable ledger required")
+        key = self.__ledger_keys.get(id(ledger))
+        if key is None:
+            raise TypeError("parent-owned durable ledger required")
+        return ledger.acquire_parent_controller(key)
+
+    def ledger_authority_minted(self, ledger: Any, authority_digest: str) -> str:
+        return self._ledger_controller(ledger).authority_minted(authority_digest)
+
+    def ledger_first_consume_verified(
+            self, ledger: Any, authority_digest: str, observation_digest: str) -> str:
+        return self._ledger_controller(ledger).first_consume_verified(
+            authority_digest, observation_digest,
+        )
+
+    def ledger_activate(self, ledger: Any, authority_digest: str) -> str:
+        return self._ledger_controller(ledger).activate(authority_digest)
+
+    def ledger_terminal(self, ledger: Any, payload: Mapping[str, Any]) -> str:
+        return self._ledger_controller(ledger).terminal(payload)
+
+    def quarantine_ledger(self, ledger: Any, payload: Mapping[str, Any]) -> str:
+        return self._ledger_controller(ledger).quarantine(payload)
+
+    def attest_execution_capsule(self, **values: Any) -> Any:
+        from .k12_execution_capsule import _CAPSULE_MINT_TOKEN, mint_capsule
+
+        capsule = mint_capsule(
+            token=_CAPSULE_MINT_TOKEN,
+            owner=self,
+            **values,
+        )
+        self.__capsules[id(capsule)] = capsule
+        return capsule
+
+    def collect_source_closure(
+            self, root: str | Path | None = None, policy: Any = None, *,
+            trusted_root: str | Path | None = None,
+            checkout: CheckoutObservation | None = None,
+            injected_only: bool = False,
+    ) -> SourceClosure:
+        """Collect policy source bytes through parent-owned file descriptors.
+
+        Runtime collection derives every expected blob from the typed
+        checkout's commit tree.  Injected-only collection may cover prospective
+        files not present in Git; all record values still come from file FDs.
+        """
+        if root is None:
+            root = trusted_root
+        if root is None:
+            raise TypeError("trusted source root is required")
+        collection_origin = INJECTED_TEST_ORIGIN if injected_only else self.origin
+        if injected_only:
+            if checkout is not None:
+                raise TypeError("injected source collection does not assert a Git tree")
+            tree = None
+            head_commit = head_tree = ""
+        else:
+            tree = _authenticated_git_tree(root, checkout, policy)
+            head_commit = checkout.head_commit
+            head_tree = checkout.head_tree
+        closure = _collect_source_closure(
+            policy=policy,
+            root=root,
+            expected_tree=tree,
+            injected_only=injected_only,
+            marker=self.__ownership_token,
+            origin=collection_origin,
+            owner=self,
+            head_commit=head_commit,
+            head_tree=head_tree,
+        )
+        self.__source_closures[id(closure)] = closure
+        return closure
+
+    def mint_qualification_run_authorization(
+        self, preflight: QualificationPreflight | None = None, *,
+        reservation_id: str | None = None, output_root_identity: str = "",
+        nonce: str | None = None, profile_digest: str = "",
+         profile_identity: str = PROFILE_V2, evidence_origin: str | None = None,
+         now: int | None = None, ledger: Any = None,
+    ) -> K12QualificationRunAuthorization:
+        now = self._resolve_time(now)
+        requested_origin = _normalize_origin(
+            self.origin if evidence_origin is None else evidence_origin
+        )
+        if requested_origin != self.origin:
+            raise ProvenanceError("authority_origin_mismatch")
+        if preflight is not None:
+            if not isinstance(preflight, QualificationPreflight):
+                raise TypeError("typed qualification preflight required")
+            if reservation_id is not None and reservation_id != preflight.reservation_id:
+                raise ProvenanceError("authority_replay")
+            if output_root_identity and output_root_identity != preflight.output.root_identity:
+                raise ProvenanceError("authority_replay")
+            if profile_digest and profile_digest != preflight.profile_digest:
+                raise ProvenanceError("authority_replay")
+            reservation_id = preflight.reservation_id
+            output_root_identity = preflight.output.root_identity
+            profile_digest = profile_digest or preflight.profile_digest
+        if reservation_id is None:
+            raise TypeError("reservation identity is required")
+        if type(now) is not int:
+            raise TypeError("integer issuance time is required")
+        supplied_nonce = nonce
+        nonce = nonce or secrets.token_hex(32)
+        ledger_snapshot: Mapping[str, Any] | None = None
+        if ledger is not None:
+            if (not self.owns_ledger(ledger)
+                    or ledger.namespace != "qualification"
+                    or ledger.reservation_id != reservation_id):
+                raise ProvenanceError("authority_replay")
+            if output_root_identity != ledger.output_root_identity:
+                raise ProvenanceError("authority_replay")
+            if supplied_nonce is not None and supplied_nonce != ledger.nonce:
+                raise ProvenanceError("authority_replay")
+            ledger_snapshot = durable_ledger_snapshot(ledger)
+            output_root_identity = ledger.output_root_identity
+            nonce = ledger.nonce
+        if not profile_digest:
+            try:
+                from .k12_runtime_profile import load_k12_live_runtime_profile
+                profile_digest = load_k12_live_runtime_profile().profile_digest
+            except Exception:
+                profile_digest = ""
+        _require_sha256(profile_digest, "profile_mismatch")
+        body = {
+            "artifact_id": "minecraft-k12-live-qualification-run-authorization",
+            "artifact_version": 1,
+            "schema_version": QUALIFICATION_RUN_AUTHORIZATION,
+            "namespace": "qualification",
+            "reservation_id": reservation_id,
+            "output_root_identity": output_root_identity,
+            "nonce": nonce,
+            "profile_identity": profile_identity,
+            "profile_digest": profile_digest,
+            "capabilities": ["qualification_execute"],
+            "evidence_origin": requested_origin,
+            "issued_at": now,
+        }
+        if ledger_snapshot is not None:
+            body["ledger"] = dict(ledger_snapshot)
+        auth = K12QualificationRunAuthorization(
+            body, self.__ownership_token, _RUN_AUTH_TOKEN,
+        )
+        with self.__run_auth_lock:
+            if auth.identity in self.__run_auths:
+                raise ProvenanceError("authority_replay")
+            self.__run_auths.add(auth.identity)
+        return auth
+
+    authorize_qualification_run = mint_qualification_run_authorization
+    issue_qualification_run_authorization = mint_qualification_run_authorization
+    mint_qualification_authorization = mint_qualification_run_authorization
+    authorize_qualification = mint_qualification_run_authorization
+
+    def mint_final_run_authorization(
+        self, *, reservation_id: str, output_root_identity: str,
+        nonce: str | None = None, profile_digest: str, qualification_authority_digest: str,
+         evidence_origin: str | None = None, now: int | None = None, ledger: Any = None,
+    ) -> K12FinalRunAuthorization:
+        now = self._resolve_time(now)
+        requested_origin = _normalize_origin(
+            evidence_origin if evidence_origin is not None else self.origin
+        )
+        if self.origin == RUNTIME_VERIFIED_ORIGIN:
+            if requested_origin != RUNTIME_VERIFIED_ORIGIN:
+                raise ProvenanceError("authority_origin_mismatch")
+        elif requested_origin not in {INJECTED_TEST_ORIGIN, INJECTED_FAKE_ORIGIN}:
+            raise ProvenanceError("authority_origin_mismatch")
+        if type(now) is not int:
+            raise TypeError("integer issuance time is required")
+        _require_canonical_digest(
+            qualification_authority_digest, "authority_replay",
+        )
+        _require_sha256(profile_digest, "profile_mismatch")
+        supplied_nonce = nonce
+        nonce = nonce or secrets.token_hex(32)
+        ledger_snapshot: Mapping[str, Any] | None = None
+        if ledger is not None:
+            if (not self.owns_ledger(ledger)
+                    or ledger.namespace != "final"
+                    or ledger.reservation_id != reservation_id):
+                raise ProvenanceError("authority_replay")
+            if output_root_identity != ledger.output_root_identity:
+                raise ProvenanceError("authority_replay")
+            if supplied_nonce is not None and supplied_nonce != ledger.nonce:
+                raise ProvenanceError("authority_replay")
+            ledger_snapshot = durable_ledger_snapshot(ledger)
+            output_root_identity = ledger.output_root_identity
+            nonce = ledger.nonce
+        body = {
+            "artifact_id": "minecraft-k12-live-final-run-authorization",
+            "artifact_version": 1,
+            "schema_version": FINAL_RUN_AUTHORIZATION,
+            "namespace": "final",
+            "reservation_id": reservation_id,
+            "output_root_identity": output_root_identity,
+            "nonce": nonce,
+            "profile_digest": profile_digest,
+            "qualification_authority_digest": qualification_authority_digest,
+            "capabilities": ["final_execute"],
+            "evidence_origin": requested_origin,
+            "issued_at": now,
+        }
+        if ledger_snapshot is not None:
+            body["ledger"] = dict(ledger_snapshot)
+        auth = K12FinalRunAuthorization(body, self.__ownership_token, _RUN_AUTH_TOKEN)
+        with self.__run_auth_lock:
+            if auth.identity in self.__run_auths:
+                raise ProvenanceError("authority_replay")
+            self.__run_auths.add(auth.identity)
+        return auth
+
+    authorize_final_run = mint_final_run_authorization
+    issue_final_run_authorization = mint_final_run_authorization
+    mint_final_authorization = mint_final_run_authorization
+    authorize_final = mint_final_run_authorization
+
+    def retain_target_lease(self, lock: Any, reservation_id: str) -> K12RetainedTargetLease:
+        lease = K12RetainedTargetLease(
+            lock, reservation_id, self.__ownership_token, _LEASE_TOKEN, self,
+        )
+        self.__leases[id(lease)] = lease
+        return lease
+
+    retain_minecraft_target_lease = retain_target_lease
+    retain_target_lock = retain_target_lease
+
+    def _coerce_run_authorization(self, preflight: QualificationPreflight,
+                                   ledger: Any) -> K12QualificationRunAuthorization:
+        auth = preflight.run_authorization
+        if not isinstance(auth, K12QualificationRunAuthorization):
+            raise TypeError("typed qualification run authorization required")
+        if (auth.ownership_token is not self.__ownership_token
+                or auth.evidence_origin != self.origin
+                or auth.reservation_id != ledger.reservation_id
+                or auth.output_root_identity != ledger.output_root_identity
+                or auth.nonce != ledger.nonce):
+            raise ProvenanceError("authority_replay")
+        return auth
+
+    def _mint_qualification_impl(
+            self, preflight: QualificationPreflight, *, now: int | None, ledger: Any,
+            run_authorization: K12QualificationRunAuthorization | None = None,
+    ) -> QualificationExecutionAuthority:
+        now = self._resolve_time(now)
+        from .k12_execution_capsule import DurableLedger
+        if not isinstance(preflight, QualificationPreflight):
+            raise TypeError("typed qualification preflight required")
+        if not isinstance(ledger, DurableLedger):
+            raise TypeError("typed durable ledger required")
+        if not self.owns_ledger(ledger):
+            raise ProvenanceError("authority_replay")
+        if (not isinstance(preflight.source, SourceClosure)
+                or not preflight.source.owned_by(self)
+                or preflight.source.origin != self.origin):
+            raise ProvenanceError("source_closure_incomplete")
+        if not preflight.capsule.owned_by(self):
+            raise ProvenanceError("capsule_mismatch")
+        if (not isinstance(preflight.target_lease, K12RetainedTargetLease)
+                or not preflight.target_lease.owned_by(self)
+                or preflight.target_lease.reservation_id != ledger.reservation_id
+                or not _target_matches_retained_lease(
+                    preflight.target, preflight.target_lease, ledger.reservation_id
+                )):
+            raise ProvenanceError("target_lock_loss")
+        if run_authorization is not None:
+            if not isinstance(run_authorization, K12QualificationRunAuthorization):
+                raise TypeError("typed qualification run authorization required")
+            preflight = _replace_preflight(preflight, run_authorization=run_authorization,
+                                           run_authorization_digest=run_authorization.identity)
+        run_auth = self._coerce_run_authorization(preflight, ledger)
+        if (run_auth.reservation_id != preflight.reservation_id
+                or run_auth.evidence_origin != self.origin
+                or run_auth.ownership_token is not self.__ownership_token):
+            raise ProvenanceError("authority_replay")
+        snapshot = durable_ledger_snapshot(ledger)
+        if (ledger.namespace != "qualification"
+                or ledger.reservation_id != preflight.reservation_id
+                or ledger.state != "reserved"
+                or snapshot["identity"] != preflight.ledger_identity
+                or snapshot["root_digest"] != preflight.ledger_root_digest
+                or snapshot["output_root_identity"] != preflight.output.root_identity
+                or run_auth.body.get("ledger") != dict(snapshot)):
+            raise ProvenanceError("authority_replay")
+        # Validate with the typed auth in place, while retaining the old field
+        # as a detached compatibility receipt.
+        if (preflight.run_authorization is None
+                or preflight.run_authorization is not run_auth):
+            preflight = _replace_preflight(preflight, run_authorization=run_auth,
+                                           run_authorization_digest=run_auth.identity)
+        else:
+            if preflight.run_authorization_digest != run_auth.identity:
+                raise ProvenanceError("authority_replay")
+        preflight.validate(now=now)
+        target_profile = _authenticated_target_semantics(preflight.authenticated_profile)
+        observed_target = preflight.target.canonical()
+        if any(observed_target[name] != value for name, value in target_profile.items()):
+            raise ProvenanceError("target_identity_mismatch")
+        body = {
+            "artifact_id": "minecraft-k12-live-qualification-execution-authority",
+            "artifact_version": 1,
+            "schema_version": QUALIFICATION_AUTHORITY,
+            "namespace": "qualification",
+            "reservation_id": preflight.reservation_id,
+            "run_authorization_digest": run_auth.identity,
+            "run_authorization": run_auth.receipt(),
+            "capabilities": list(run_auth.capabilities),
+            "evidence_origin": run_auth.evidence_origin,
+            "checkout": preflight.checkout.canonical(),
+            "pull_request": preflight.pull_request.canonical(),
+            "pull_request_semantic_tuple": list(preflight.pull_request.semantic_tuple()),
+            "source_closure": preflight.source.canonical(),
+            "execution_capsule": preflight.capsule.canonical(),
+            "profile": {"identity": preflight.profile_identity,
+                         "detached_digest": preflight.profile_digest},
+            "contracts": dict(sorted(preflight.contracts.items())),
+            "schedule_digest": preflight.schedule_digest,
+            "environment": preflight.environment.canonical(),
+            "target": preflight.target.canonical(),
+            "target_profile": target_profile,
+            "output": preflight.output.canonical(),
+            "ledger": {"identity": preflight.ledger_identity,
+                       "root": snapshot["root"],
+                       "root_digest": preflight.ledger_root_digest,
+                       "namespace": snapshot["namespace"],
+                       "reservation_id": snapshot["reservation_id"],
+                       "output_root_identity": snapshot["output_root_identity"],
+                       "nonce": snapshot["nonce"],
+                       "reservation_record_digest": ledger.head_digest},
+            "issued_at": now, "expires_at": now + MAX_PR_AGE_SECONDS,
+        }
+        body["target_lease"] = preflight.target_lease.canonical()
+        authority = QualificationExecutionAuthority(
+            body, self.__ownership_token, ledger, _AUTHORITY_TOKEN, run_auth, self,
+        )
+        self.ledger_authority_minted(ledger, authority.identity)
+        self.__authorities[id(authority)] = authority
+        self.__minted = True
+        return authority
+
+    def _safe_quarantine(self, ledger: Any, reason: str) -> None:
+        try:
+            if self.owns_ledger(ledger) and ledger.state not in {"terminal", "quarantined"}:
+                self.quarantine_ledger(ledger, {"reason": reason})
+        except Exception:
+            # A failed quarantine is still a fail-closed mint failure.  Do not
+            # turn a caller-visible provenance error into an implementation leak.
+            pass
+
+    def mint_qualification(self, preflight: QualificationPreflight, *, now: int | None = None,
+                            ledger: Any,
+                            run_authorization: K12QualificationRunAuthorization | None = None
+                            ) -> QualificationExecutionAuthority:
+        with self.__qualification_mint_lock:
+            if self.__qualification_claimed:
+                raise ProvenanceError("authority_replay")
+            self.__qualification_claimed = True
+            try:
+                return self._mint_qualification_impl(
+                    preflight, now=now, ledger=ledger,
+                    run_authorization=run_authorization,
+                )
+            except Exception as exc:
+                self._safe_quarantine(ledger, getattr(exc, "reason", "authority_replay"))
+                raise
+
+    issue_qualification_authority = mint_qualification
+    mint_qualification_authority = mint_qualification
+
+    def activate_qualification(self, authority: QualificationExecutionAuthority, *,
+                               ledger: Any = None) -> ActiveQualificationAuthority:
+        if (not isinstance(authority, QualificationExecutionAuthority)
+                or not self.owns_authority(authority)):
+            raise TypeError("parent-owned qualification authority required")
+        ledger = ledger or authority.ledger
+        if (not self.owns_ledger(ledger)
+                or not _ledger_is(ledger, namespace="qualification", state="first_consume_verified",
+                                  reservation=authority.body["reservation_id"])):
+            raise ProvenanceError("authority_replay")
+        activation = self.ledger_activate(ledger, authority.identity)
+        return ActiveQualificationAuthority(
+            authority, activation, self.__ownership_token, _ACTIVE_TOKEN,
+        )
+
+    def _mint_final_impl(
+        self, prerequisites: FinalExecutionPrerequisites,
+        qualification_authority: QualificationExecutionAuthority | ActiveQualificationAuthority,
+        *, now: int | None, qualification_evidence: Any = None,
+        qualification_aggregate: Any = None, probe_aggregate: Any = None,
+        qualification_ledger: Any = None, final_ledger: Any,
+        target: TargetLockObservation,
+        output: OutputRootObservation,
+        target_lease: K12RetainedTargetLease,
+    ) -> FinalExecutionAuthority:
+        now = self._resolve_time(now)
+        from .k12_execution_capsule import DurableLedger
+        if not isinstance(prerequisites, FinalExecutionPrerequisites):
+            raise TypeError("typed final prerequisites required")
+        if not isinstance(qualification_authority, ActiveQualificationAuthority):
+            raise TypeError("active parent qualification authority required")
+        qualification_execution = qualification_authority.authority
+        if (qualification_authority.owner is not self
+                or not self.owns_authority(qualification_execution)
+                or not isinstance(final_ledger, DurableLedger)
+                or not self.owns_ledger(final_ledger)):
+            raise TypeError("parent-owned qualification authority and final ledger required")
+        if qualification_ledger is None:
+            qualification_ledger = qualification_execution.ledger
+        if not self.owns_ledger(qualification_ledger):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        qualification_snapshot = durable_ledger_snapshot(qualification_ledger)
+        qualification_bound_ledger = qualification_execution.body["ledger"]
+        if any(qualification_snapshot[name] != qualification_bound_ledger[name] for name in (
+            "identity", "root", "root_digest", "namespace", "reservation_id",
+            "output_root_identity", "nonce",
+        )):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        if (not qualification_ledger.events
+                or qualification_bound_ledger.get("reservation_record_digest")
+                != qualification_ledger.events[0].digest):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        if not prerequisites.matches(qualification_execution):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        evidence = qualification_evidence or prerequisites.qualification_evidence
+        if evidence is None and qualification_aggregate is not None:
+            evidence = qualification_aggregate
+            if probe_aggregate is not None and getattr(evidence, "probes", None) is not probe_aggregate:
+                raise ProvenanceError("final_prerequisite_mismatch")
+        values = _live_evidence_values(evidence)
+        _validate_evidence_ownership(
+            qualification_authority, evidence, values, controller=self,
+        )
+        if not qualification_authority.current_at(now):
+            raise ProvenanceError("authority_replay")
+        if (evidence is not prerequisites.qualification_evidence
+                or values["ownership_receipt"] is not prerequisites.qualification_ownership_receipt
+                or values["terminal_receipt"] is not prerequisites.qualification_terminal_receipt):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        if values["evidence_origin"] == RUNTIME_VERIFIED_ORIGIN:
+            final_origin = RUNTIME_VERIFIED_ORIGIN
+        elif values["evidence_origin"] == INJECTED_FAKE_ORIGIN:
+            if self.origin != INJECTED_TEST_ORIGIN:
+                raise ProvenanceError("final_prerequisite_mismatch")
+            final_origin = INJECTED_FAKE_ORIGIN
+        else:
+            raise ProvenanceError("final_prerequisite_mismatch")
+        if (values["profile_digest"] != qualification_execution.body["profile"]["detached_digest"]
+                or qualification_execution.origin != (
+                    RUNTIME_VERIFIED_ORIGIN
+                    if final_origin == RUNTIME_VERIFIED_ORIGIN else INJECTED_TEST_ORIGIN
+                )
+                or values["qualification_aggregate_digest"] != prerequisites.qualification_aggregate_digest
+                or values["probe_aggregate_digest"] != prerequisites.probe_aggregate_digest
+                or values["qualification_terminal_ledger_digest"]
+                    != prerequisites.qualification_terminal_ledger_digest
+                or values["ownership_receipt"].identity
+                    != prerequisites.qualification_ownership_receipt.identity
+                or values["terminal_receipt"].identity
+                    != prerequisites.qualification_terminal_receipt.identity
+                or not qualification_execution.owns(values["authority_binding"])):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        if values["authority_binding"].lifecycle != "active":
+            raise ProvenanceError("final_prerequisite_mismatch")
+        if not _ledger_is(qualification_ledger, namespace="qualification", state="terminal",
+                          reservation=qualification_execution.body["reservation_id"]):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        if qualification_ledger.head_digest != prerequisites.qualification_terminal_ledger_digest:
+            raise ProvenanceError("final_prerequisite_mismatch")
+        terminal = qualification_ledger.events[-1].payload
+        if (terminal.get("result") != "passed"
+                or terminal.get("qualification_aggregate_digest")
+                    != prerequisites.qualification_aggregate_digest
+                or terminal.get("probe_aggregate_digest") != prerequisites.probe_aggregate_digest):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        if (target is None or output is None
+                or not isinstance(target, TargetLockObservation)
+                or not isinstance(output, OutputRootObservation)
+                or not isinstance(target_lease, K12RetainedTargetLease)
+                or not target_lease.owned_by(self)):
+            raise TypeError("typed final target, output, and retained lease required")
+        qualification_target = qualification_execution.body.get("target")
+        authenticated_target = qualification_execution.body.get("target_profile")
+        final_target_semantics = _target_semantics(target)
+        final_target_canonical = target.canonical()
+        if (not isinstance(qualification_target, Mapping)
+                or not isinstance(authenticated_target, Mapping)
+                or final_target_semantics != _target_semantics(qualification_target)
+                or _deep_thaw(authenticated_target) != {
+                    name: final_target_canonical[name]
+                    for name in _AUTHENTICATED_TARGET_FIELDS
+                }):
+            raise ProvenanceError("target_identity_mismatch")
+        target.validate(final_ledger.reservation_id)
+        output.validate()
+        target_lease.revalidate()
+        if (target_lease.reservation_id != final_ledger.reservation_id
+                or not _target_matches_retained_lease(
+                    target, target_lease, final_ledger.reservation_id
+                )
+                or output.root_identity != final_ledger.output_root_identity):
+            raise ProvenanceError("target_lock_loss")
+        final_snapshot = durable_ledger_snapshot(final_ledger)
+        if (final_ledger.namespace != "final" or final_ledger.state != "reserved"
+                or not final_ledger.reservation_id
+                or final_snapshot["identity"] != qualification_snapshot["identity"]
+                or final_snapshot["reservation_id"] == qualification_snapshot["reservation_id"]
+                or final_snapshot["root"] == qualification_snapshot["root"]
+                or final_snapshot["root_digest"] == qualification_snapshot["root_digest"]
+                or final_snapshot["nonce"] == qualification_snapshot["nonce"]
+                or final_snapshot["output_root_identity"]
+                    == qualification_snapshot["output_root_identity"]):
+            raise ProvenanceError("authority_replay")
+        final_run = self.mint_final_run_authorization(
+            reservation_id=final_ledger.reservation_id,
+            output_root_identity=final_snapshot["output_root_identity"],
+            nonce=final_snapshot["nonce"],
+            profile_digest=prerequisites.profile_digest,
+            qualification_authority_digest=qualification_execution.identity,
+            evidence_origin=final_origin,
+            ledger=final_ledger, now=now,
+        )
+        if final_run.identity == qualification_execution.run_authorization.identity:
+            raise ProvenanceError("authority_replay")
+        body = {
+            "artifact_id": "minecraft-k12-live-final-execution-authority",
+            "artifact_version": 1,
+            "schema_version": FINAL_AUTHORITY,
+            "namespace": "final",
+            "reservation_id": final_ledger.reservation_id,
+            "run_authorization_digest": final_run.identity,
+            "run_authorization": final_run.receipt(),
+            "capabilities": list(final_run.capabilities),
+            "evidence_origin": final_origin,
+            "qualification_authority_digest": qualification_execution.identity,
+            "qualification_aggregate_digest": prerequisites.qualification_aggregate_digest,
+            "probe_aggregate_digest": prerequisites.probe_aggregate_digest,
+            "qualification_terminal_ledger_digest": prerequisites.qualification_terminal_ledger_digest,
+            "qualification_ownership_receipt_digest":
+                prerequisites.qualification_ownership_receipt.identity,
+            "qualification_terminal_receipt_digest":
+                prerequisites.qualification_terminal_receipt.identity,
+            "checkout": _deep_thaw(qualification_execution.body["checkout"]),
+            "source_closure": _deep_thaw(qualification_execution.body["source_closure"]),
+            "execution_capsule": _deep_thaw(qualification_execution.body["execution_capsule"]),
+            "environment": _deep_thaw(qualification_execution.body["environment"]),
+            "target": target.canonical(),
+            "target_profile": _deep_thaw(qualification_execution.body["target_profile"]),
+            "output": output.canonical(),
+            "target_lease": target_lease.canonical(),
+            "source_aggregate": prerequisites.source_aggregate,
+            "profile_digest": prerequisites.profile_digest,
+            "contract_set_digest": prerequisites.contract_set_digest,
+            "capsule_digest": prerequisites.capsule_digest,
+            "pull_request_semantic_tuple": list(
+                qualification_execution.body["pull_request_semantic_tuple"]),
+            "ledger": {
+                "identity": final_snapshot["identity"],
+                "root": final_snapshot["root"],
+                "root_digest": final_snapshot["root_digest"],
+                "namespace": final_snapshot["namespace"],
+                "reservation_id": final_snapshot["reservation_id"],
+                "output_root_identity": final_snapshot["output_root_identity"],
+                "nonce": final_snapshot["nonce"],
+                "reservation_record_digest": final_ledger.head_digest,
+            },
+            "issued_at": now, "expires_at": now + MAX_PR_AGE_SECONDS,
+        }
+        authority = FinalExecutionAuthority(
+            body, self.__ownership_token, final_ledger, _AUTHORITY_TOKEN, final_run, self,
+        )
+        self.ledger_authority_minted(final_ledger, authority.identity)
+        self.__authorities[id(authority)] = authority
+        self.__final_minted = True
+        return authority
+
+    def mint_final(
+        self, prerequisites: FinalExecutionPrerequisites,
+         qualification_authority: QualificationExecutionAuthority | ActiveQualificationAuthority,
+         *, now: int | None = None, qualification_evidence: Any = None,
+        qualification_aggregate: Any = None, probe_aggregate: Any = None,
+        qualification_ledger: Any = None, final_ledger: Any,
+        target: TargetLockObservation,
+        output: OutputRootObservation,
+        target_lease: K12RetainedTargetLease,
+    ) -> FinalExecutionAuthority:
+        with self.__final_mint_lock:
+            if self.__final_claimed:
+                raise ProvenanceError("authority_replay")
+            self.__final_claimed = True
+            try:
+                return self._mint_final_impl(
+                    prerequisites, qualification_authority, now=now,
+                    qualification_evidence=qualification_evidence,
+                    qualification_aggregate=qualification_aggregate,
+                    probe_aggregate=probe_aggregate,
+                    qualification_ledger=qualification_ledger,
+                    final_ledger=final_ledger, target=target, output=output,
+                    target_lease=target_lease,
+                )
+            except Exception as exc:
+                self._safe_quarantine(final_ledger, getattr(exc, "reason", "authority_replay"))
+                raise
+
+    issue_final_authority = mint_final
+    mint_final_authority = mint_final
+
+    def activate_final(self, authority: FinalExecutionAuthority, *,
+                       ledger: Any = None) -> ActiveFinalAuthority:
+        if (not isinstance(authority, FinalExecutionAuthority)
+                or not self.owns_authority(authority)):
+            raise TypeError("parent-owned final authority required")
+        ledger = ledger or authority.ledger
+        if (not self.owns_ledger(ledger)
+                or not _ledger_is(ledger, namespace="final", state="first_consume_verified",
+                                  reservation=authority.body["reservation_id"])):
+            raise ProvenanceError("authority_replay")
+        activation = self.ledger_activate(ledger, authority.identity)
+        return ActiveFinalAuthority(
+            authority, activation, self.__ownership_token, _ACTIVE_TOKEN,
+        )
+
+
+class InjectedTestController(ParentExecutionAuthority):
+    """Parent-minted deterministic controller for non-runtime test graphs."""
+
+    def __init__(self, parent: ParentExecutionAuthority, token: object = None) -> None:
+        if not isinstance(parent, ParentExecutionAuthority):
+            raise TypeError("parent execution authority required")
+        if token is not _INJECTED_CONTROLLER_TOKEN:
+            raise TypeError("injected-test controller is parent-minted")
+        super().__init__(
+            _origin=INJECTED_TEST_ORIGIN,
+            _owner=parent,
+            _token=_INJECTED_CONTROLLER_TOKEN,
+        )
+
+    @property
+    def parent(self) -> ParentExecutionAuthority:
+        return self.owner
+
+    def _require_owned(self, authority: Any) -> None:
+        execution = authority.authority if isinstance(
+            authority, (ActiveQualificationAuthority, ActiveFinalAuthority)
+        ) else authority
+        if not self.owns_authority(execution):
+            raise ProvenanceError("authority_replay")
+
+    def verify_qualification_first_consume(
+            self, authority: QualificationExecutionAuthority,
+            observation: FirstConsumeObservation, *, now: int, ledger: Any,
+    ) -> ActiveQualificationAuthority:
+        self._require_owned(authority)
+        return verify_qualification_first_consume(
+            authority, observation, now=now, ledger=ledger,
+        )
+
+    def verify_final_first_consume(
+            self, authority: FinalExecutionAuthority,
+            observation: FinalFirstConsumeObservation, *, now: int, ledger: Any,
+    ) -> ActiveFinalAuthority:
+        self._require_owned(authority)
+        return verify_final_first_consume(
+            authority, observation, now=now, ledger=ledger,
+        )
+
+    verify_first_consume_qualification = verify_qualification_first_consume
+    verify_first_consume_final = verify_final_first_consume
+
+
+InjectedTestAuthorityController = InjectedTestController
+InjectedTestVerifier = InjectedTestController
+InjectedTestExecutionController = InjectedTestController
+
+
+def _replace_preflight(value: QualificationPreflight, **changes: Any) -> QualificationPreflight:
+    values = {name: getattr(value, name) for name in value.__dataclass_fields__}
+    values.update(changes)
+    return QualificationPreflight(**values)
+
+
+class _AggregatePairEvidence:
+    execution_provenance = "live_qualification"
+
+    def __init__(self, qualification: Any, probe: Any,
+                 authority: QualificationExecutionAuthority) -> None:
+        self.qualification_aggregate = qualification
+        self.probe_aggregate = probe
+        self.profile_digest = getattr(qualification, "profile_digest", "")
+        self.authority_binding = getattr(qualification, "authority_binding", authority.binding())
+        self.evidence_origin = getattr(
+            qualification, "evidence_origin",
+            getattr(qualification, "origin", RUNTIME_VERIFIED_ORIGIN),
+        )
+        self.authority = getattr(qualification, "authority", None)
+        self.controller = getattr(qualification, "controller", None)
+        self.qualification_aggregate_digest = getattr(qualification, "identity", "")
+        self.probe_aggregate_digest = getattr(probe, "identity", "")
+        self.qualification_terminal_ledger_digest = getattr(
+            qualification, "qualification_terminal_ledger_digest", "")
+        self.passed = getattr(qualification, "passed", False) and getattr(probe, "passed", False)
+
+    def qualifies(self) -> bool:
+        return self.passed is True
+
+
+def _aggregate_pair_evidence(qualification: Any, probe: Any,
+                             authority: QualificationExecutionAuthority) -> Any:
+    return _AggregatePairEvidence(qualification, probe, authority)
+
+
+def _verify_qualification_first_consume(
+        authority: QualificationExecutionAuthority, observation: FirstConsumeObservation,
+        *, now: int, ledger: Any, activate: bool) -> Any:
+    if not isinstance(authority, QualificationExecutionAuthority):
+        raise TypeError("typed qualification authority required")
+    if not isinstance(observation, FirstConsumeObservation):
+        raise TypeError("typed first-consume observation required")
+    bound = _deep_thaw(authority.body)
+    reservation_id = bound["reservation_id"]
+    owner = authority.owner
+    try:
+        current_ledger = durable_ledger_snapshot(ledger)
+        bound_ledger = bound["ledger"]
+        if (not isinstance(owner, ParentExecutionAuthority)
+                or not owner.owns_authority(authority)
+                or ledger is not authority.ledger or not owner.owns_ledger(ledger)
+                or not authority.current_at(now)
+                or not _ledger_is(ledger, namespace="qualification", state="authority_minted",
+                                  reservation=reservation_id)
+                or any(current_ledger[name] != bound_ledger[name] for name in (
+                    "identity", "root", "root_digest", "namespace", "reservation_id",
+                    "output_root_identity", "nonce",
+                ))
+                or bound_ledger.get("reservation_record_digest")
+                    != current_ledger["reservation_record_digest"]
+                or bound.get("run_authorization_digest")
+                    != authority.run_authorization.identity
+                or bound.get("run_authorization")
+                    != authority.run_authorization.receipt()):
+            raise ProvenanceError("authority_replay")
+        observation.checkout.validate(bound["checkout"]["head_commit"])
+        if observation.checkout.canonical() != bound["checkout"]:
+            raise ProvenanceError("first_consume_mismatch")
+        observation.pull_request.validate(expected_head=bound["checkout"]["head_commit"], now=now)
+        if tuple(observation.pull_request.semantic_tuple()) \
+                != tuple(bound["pull_request_semantic_tuple"]):
+            raise ProvenanceError("pr_semantic_mismatch")
+        observation.environment.validate()
+        observation.target.validate(reservation_id)
+        observation.output.validate()
+        if (not observation.capsule.owned_by(owner)
+                or not observation.capsule.verify()):
+            raise ProvenanceError("capsule_mismatch")
+        if observation.capsule.canonical() != bound["execution_capsule"]:
+            raise ProvenanceError("first_consume_mismatch")
+        if (observation.source.origin != authority.origin
+                or not observation.source.owned_by(owner)
+                or observation.source.canonical() != bound["source_closure"]):
+            raise ProvenanceError("first_consume_mismatch")
+        if observation.environment.canonical() != bound["environment"]:
+            raise ProvenanceError("first_consume_mismatch")
+        if observation.target.canonical() != bound["target"]:
+            raise ProvenanceError("first_consume_mismatch")
+        if observation.output.canonical() != bound["output"]:
+            raise ProvenanceError("first_consume_mismatch")
+        if (not isinstance(observation.target_lease, K12RetainedTargetLease)
+                or not observation.target_lease.owned_by(owner)
+                or observation.target_lease.reservation_id != reservation_id
+                or not _target_matches_retained_lease(
+                    observation.target, observation.target_lease, reservation_id
+                )):
+            raise ProvenanceError("target_lock_loss")
+        observation.target_lease.revalidate()
+        if observation.target_lease.canonical() != bound["target_lease"]:
+            raise ProvenanceError("target_lock_loss")
+    except Exception as exc:
+        mapped = exc if isinstance(exc, ProvenanceError) else ProvenanceError(
+            getattr(exc, "reason", "first_consume_mismatch")
+        )
+        if isinstance(owner, ParentExecutionAuthority):
+            owner.quarantine_ledger(
+                ledger, {"reason": mapped.reason, "authority": authority.identity},
+            )
+        if mapped is not exc:
+            raise mapped from exc
+        raise
+    try:
+        observed_digest = canonical_sha256(observation.canonical())
+        if activate:
+            owner.ledger_first_consume_verified(
+                ledger, authority.identity, observed_digest,
+            )
+            return owner.activate_qualification(authority, ledger=ledger)
+        return owner.ledger_first_consume_verified(
+            ledger, authority.identity, observed_digest,
+        )
+    except Exception as exc:
+        reason = getattr(exc, "reason", "first_consume_mismatch")
+        if isinstance(owner, ParentExecutionAuthority):
+            owner.quarantine_ledger(
+                ledger, {"reason": reason, "authority": authority.identity},
+            )
+        raise
+
+
+def verify_first_consume(authority: QualificationExecutionAuthority,
+                         observation: FirstConsumeObservation, *, now: int, ledger: Any) -> str:
+    """Compatibility `/1` spelling: consume, but do not activate."""
+    return _verify_qualification_first_consume(authority, observation, now=now,
+                                               ledger=ledger, activate=False)
+
+
+def verify_qualification_first_consume(
+        authority: QualificationExecutionAuthority, observation: FirstConsumeObservation,
+        *, now: int, ledger: Any) -> ActiveQualificationAuthority:
+    return _verify_qualification_first_consume(authority, observation, now=now,
+                                               ledger=ledger, activate=True)
+
+
+qualification_first_consume = verify_qualification_first_consume
+first_consume_qualification = verify_qualification_first_consume
+
+
+def verify_final_first_consume(
+        authority: FinalExecutionAuthority,
+        observation: FinalFirstConsumeObservation,
+        *, now: int, ledger: Any,
+) -> ActiveFinalAuthority:
+    if not isinstance(authority, FinalExecutionAuthority):
+        raise TypeError("typed final authority required")
+    if not isinstance(observation, FinalFirstConsumeObservation):
+        raise TypeError("typed final first-consume observation required")
+    bound = _deep_thaw(authority.body)
+    owner = authority.owner
+    try:
+        current_ledger = durable_ledger_snapshot(ledger)
+        bound_ledger = bound["ledger"]
+        if (not isinstance(owner, ParentExecutionAuthority)
+                or not owner.owns_authority(authority)
+                or ledger is not authority.ledger or not owner.owns_ledger(ledger)
+                or not authority.current_at(now)
+                or not _ledger_is(ledger, namespace="final", state="authority_minted",
+                                  reservation=bound["reservation_id"])
+                or any(current_ledger[name] != bound_ledger[name] for name in (
+                    "identity", "root", "root_digest", "namespace", "reservation_id",
+                    "output_root_identity", "nonce",
+                ))
+                or bound_ledger.get("reservation_record_digest")
+                    != current_ledger["reservation_record_digest"]
+                or bound.get("run_authorization_digest")
+                    != authority.run_authorization.identity
+                or bound.get("run_authorization")
+                    != authority.run_authorization.receipt()):
+            raise ProvenanceError("authority_replay")
+        if observation.prerequisites.qualification_authority_digest \
+                != bound["qualification_authority_digest"]:
+            raise ProvenanceError("first_consume_mismatch")
+        expected = {name: bound.get(name) for name in (
+            "qualification_aggregate_digest", "probe_aggregate_digest",
+            "qualification_terminal_ledger_digest", "source_aggregate",
+            "profile_digest", "contract_set_digest", "capsule_digest",
+            "qualification_ownership_receipt_digest",
+            "qualification_terminal_receipt_digest",
+        )}
+        observed = {name: getattr(observation.prerequisites, name)
+                    if hasattr(observation.prerequisites, name)
+                    else None for name in expected}
+        if observed != expected:
+            raise ProvenanceError("first_consume_mismatch")
+        values = _live_evidence_values(observation.prerequisites.qualification_evidence)
+        _validate_evidence_ownership(
+            values["authority"],
+            observation.prerequisites.qualification_evidence,
+            values,
+            controller=owner,
+        )
+        if (values["authority"].identity
+                != observation.prerequisites.qualification_authority_digest
+                or values["authority"].owner is not owner
+                or values["controller"] is not owner
+                or values["evidence_origin"] != bound["evidence_origin"]
+                or not values["authority"].current_at(now)
+                or values["authority"].lifecycle != "active"
+                or not values["authority"].owns(values["authority_binding"])
+                or values["qualification_aggregate_digest"]
+                != observation.prerequisites.qualification_aggregate_digest
+                or values["ownership_receipt"].identity
+                    != observation.prerequisites.qualification_ownership_receipt.identity
+                or values["terminal_receipt"].identity
+                    != observation.prerequisites.qualification_terminal_receipt.identity
+                or not values["ownership_receipt"].authenticates(
+                    observation.prerequisites.qualification_evidence
+                )):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        observation.checkout.validate(expected_head=bound["checkout"]["head_commit"])
+        if observation.checkout.canonical() != bound["checkout"]:
+            raise ProvenanceError("first_consume_mismatch")
+        if (observation.source.origin != values["authority"].origin
+                or not observation.source.owned_by(owner)
+                or observation.source.canonical() != bound["source_closure"]):
+            raise ProvenanceError("first_consume_mismatch")
+        if observation.source.aggregate_sha256 != bound["source_closure"]["aggregate_sha256"]:
+            raise ProvenanceError("first_consume_mismatch")
+        observation.environment.validate()
+        if observation.environment.canonical() != bound["environment"]:
+            raise ProvenanceError("first_consume_mismatch")
+        if (not observation.capsule.owned_by(owner)
+                or not observation.capsule.verify()
+                or observation.capsule.canonical() != bound["execution_capsule"]):
+            raise ProvenanceError("capsule_mismatch")
+        observation.target.validate(bound["reservation_id"])
+        if (observation.target.canonical() != bound["target"]
+                or not _target_matches_retained_lease(
+                    observation.target, observation.target_lease, bound["reservation_id"]
+                )):
+            raise ProvenanceError("target_lock_loss")
+        observation.output.validate()
+        if observation.output.canonical() != bound["output"]:
+            raise ProvenanceError("first_consume_mismatch")
+        observation.pull_request.validate(expected_head=bound["checkout"]["head_commit"], now=now)
+        if tuple(observation.pull_request.semantic_tuple()) \
+                != tuple(bound["pull_request_semantic_tuple"]):
+            raise ProvenanceError("pr_semantic_mismatch")
+        if (not isinstance(observation.target_lease, K12RetainedTargetLease)
+                or not observation.target_lease.owned_by(owner)
+                or observation.target_lease.reservation_id != bound["reservation_id"]):
+            raise ProvenanceError("target_lock_loss")
+        observation.target_lease.revalidate()
+        if observation.target_lease.canonical() != bound["target_lease"]:
+            raise ProvenanceError("target_lock_loss")
+    except Exception as exc:
+        mapped = exc if isinstance(exc, ProvenanceError) else ProvenanceError(
+            getattr(exc, "reason", "first_consume_mismatch")
+        )
+        if isinstance(owner, ParentExecutionAuthority):
+            owner.quarantine_ledger(
+                ledger, {"reason": mapped.reason, "authority": authority.identity},
+            )
+        if mapped is not exc:
+            raise mapped from exc
+        raise
+    try:
+        digest = canonical_sha256(observation.canonical())
+        owner.ledger_first_consume_verified(ledger, authority.identity, digest)
+        return owner.activate_final(authority, ledger=ledger)
+    except Exception as exc:
+        reason = getattr(exc, "reason", "first_consume_mismatch")
+        if isinstance(owner, ParentExecutionAuthority):
+            owner.quarantine_ledger(
+                ledger, {"reason": reason, "authority": authority.identity},
+            )
+        raise
+
+
+final_first_consume = verify_final_first_consume
+first_consume_final = verify_final_first_consume
+verify_final_first_consume_recheck = verify_final_first_consume
+
+
+def random_reservation_id() -> str:
+    return secrets.token_hex(32)
+
+
+__all__ = [
+    "ActiveFinalAuthority", "ActiveQualificationAuthority", "AuthorityBinding",
+    "AUTHORIZATION_ORIGINS", "INJECTED_FAKE_ORIGIN", "INJECTED_TEST_ORIGIN",
+    "LIVE_FINAL_NAMESPACE", "LIVE_QUALIFICATION_NAMESPACE", "QUALIFICATION_PROBE_NAMESPACE",
+    "CheckoutObservation", "EXPECTED_BASE_REF", "EXPECTED_BASE_SHA", "EXPECTED_BRANCH",
+    "EXPECTED_HEAD", "EXPECTED_PR", "EXPECTED_REPOSITORY", "FINAL_AUTHORITY",
+    "FINAL_RUN_AUTHORIZATION", "FinalExecutionAuthority", "FinalExecutionPrerequisites",
+    "FinalFirstConsumeObservation",
+    "FirstConsumeObservation", "K12FinalRunAuthorization", "K12QualificationRunAuthorization",
+    "K12RetainedTargetLease", "LiveQualificationEvidence", "MAX_PR_AGE_SECONDS",
+    "K12LiveQualificationEvidence", "QualificationEvidenceProtocol",
+    "MISMATCH_CLASSIFICATION", "MismatchClass", "OutputRootObservation", "PROFILE_V2",
+    "OPERATIONAL_PROVENANCES", "ParentExecutionAuthority", "InjectedTestController",
+    "InjectedTestAuthorityController", "InjectedTestExecutionController",
+    "InjectedTestVerifier", "ProvenanceError",
+    "PullRequestObservation", "RUNTIME_VERIFIED_ORIGIN", "SOURCE_SEMANTIC_CLASSES",
+    "QUALIFICATION_AUTHORITY", "QUALIFICATION_RUN_AUTHORIZATION",
+    "QualificationExecutionAuthority", "QualificationPreflight",
+    "SourceClosure", "SourceRecord", "SubmoduleObservation", "TargetLockObservation",
+    "authority_owns_profile", "final_first_consume", "first_consume_final",
+    "first_consume_qualification", "qualification_first_consume", "random_reservation_id",
+    "git_blob_oid", "raw_sha256", "durable_ledger_root_digest", "durable_ledger_snapshot",
+    "retained_target_binding", "source_closure_from_observations",
+    "verify_final_first_consume",
+    "verify_first_consume", "verify_qualification_first_consume",
+    "refresh_pull_request_observation",
+    "verify_final_first_consume_recheck",
+]

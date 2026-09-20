@@ -12,6 +12,13 @@ def test_deterministic_digest_and_ids():
     b = EvidenceRegistry(binding()).register("oracle", {"items": [1, 2], "ok": True})
     assert a.id == b.id and a.digest == b.digest and a.verify()
 
+def test_authority_binding_is_exposed_by_records_and_snapshots():
+    registry = EvidenceRegistry(binding())
+    record = registry.register("oracle", {"ok": True})
+    snapshot = registry.freeze()
+    assert record.authority_binding == registry.authority_binding
+    assert snapshot.authority_binding == registry.authority_binding
+
 
 def test_duplicate_conflict_and_wrong_binding():
     registry = EvidenceRegistry(binding())

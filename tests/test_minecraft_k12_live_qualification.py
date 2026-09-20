@@ -1,3 +1,5 @@
+import pytest
+
 from benchmarks.minecraft.k12_live_qualification import *
 from benchmarks.minecraft.k12_runtime_profile import load_k12_live_runtime_profile
 
@@ -30,3 +32,26 @@ def test_qualification_json_is_authenticated_and_exact():
     value=load_k12_live_qualification()
     assert tuple(value["schedule"]) == qualification_ids()
     assert len(value["detached_artifact_sha256"]) == 64
+
+
+def test_generic_mock_aggregate_cannot_be_retyped_as_live():
+    aggregate = passing_aggregate()
+    assert aggregate.execution_provenance == "mock_only"
+    assert aggregate.evidence_origin == "test_only"
+    with pytest.raises(TypeError):
+        LiveQualificationAggregate((), object(), "p", "c", object(), object())
+
+
+def test_live_cell_and_probe_orders_are_separate_and_exact():
+    profile = load_k12_live_runtime_profile()
+    assert tuple(cell["cell_id"] for cell in qualification_cells()) == qualification_ids()
+    assert PROBES == ("P1", "P2", "P3", "P4")
+    cell = LiveQualificationCellEvidence(
+        qualification_ids()[0], {"status": "passed"}, profile.profile_digest,
+        "qualification-campaign", "reset", "evidence", True, True,
+        "REVOKED", "success", "true", True, True,
+    )
+    assert cell.evidence_origin == "injected_fake"
+    with pytest.raises(ValueError):
+        qualify_mock_probes((MockProbeEvidence("P1", True, profile.profile_digest,
+            "probe-campaign", "evidence"),))
