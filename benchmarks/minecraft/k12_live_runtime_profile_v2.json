@@ -16,7 +16,7 @@
   "locale": "en_us",
   "source_identity": "minecraft-eac-k12-live-source/2",
   "source_policy_identity": "minecraft-k12-live-source-closure-policy/2",
-  "source_policy_digest": "b41ef906d55f56870084b9e12347e11827e508e96a0b150f5d78320a815bb854",
+  "source_policy_digest": "79fc4b86bc011ed99f99b7dba4d65c8cbaa3371a361ac5a646c6ba44e8d126c7",
   "environment_policy_identity": "minecraft-k12-live-environment-policy/1",
   "environment_policy_digest": "29ea8d36a73bdee0113755d017f5ed146fb26b4d239edb051619feaf248f54fd",
   "execution_capsule_policy_identity": "minecraft-k12-live-execution-capsule/1",
@@ -87,5 +87,5 @@
     "K12Q-S5-T1-N1-R", "K12Q-S5-T1-N1-A", "K12Q-S5-T1-N1-S"
   ],
   "schedule_identity": "minecraft-k12-live-runtime-qualification-schedule/1",
-  "detached_artifact_sha256": "c5a341dbd3a094ac30a0abc7e9959471f6f715f19c3f9aa37093af71571ed6e0"
+  "detached_artifact_sha256": "c75bdef1d267fe8d5753320076a7d6441a3dc294688df30a94b1530990d58323"
 }

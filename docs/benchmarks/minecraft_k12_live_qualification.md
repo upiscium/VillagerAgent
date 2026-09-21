@@ -1,5 +1,27 @@
 # K12 live qualification and final admission
 
+## Authority import and revision trust boundary
+
+Prospective K12 authority code uses the one-way import DAG
+`k12_live_qualification -> k12_execution_provenance -> k12_authority_contracts`.
+The dependency-neutral contracts module imports neither provenance nor the
+qualification implementation. Provenance therefore verifies the exact
+registered aggregate, projection, terminal evidence, authority, and parent
+controller without importing the concrete qualification module.
+Before a passed terminal event can be published, the parent atomically
+preclaims the exact canonical aggregate object under its active qualification
+authority. The same locked claim gates terminal publication and is consumed
+once when the projection/receipt pair is fulfilled; subclasses, replacement
+objects, duplicate claims, and post-terminal registration are rejected.
+
+The current Git revision is not authority embedded in tracked source. A runtime
+parent accepts a commit/tree tuple only when an external verifier receipt
+authenticates the complete checkout and fresh pull-request observations. The
+same tuple is then required across checkout HEAD/tree, upstream and remote,
+pull-request head/base, source closure, qualification authorization, and both
+first-consume boundaries. Injected controllers exercise the same agreement
+checks but remain non-runtime-admissible.
+
 The live qualification is an authority-owned, non-scientific preflight.  A
 parent first mints and first-consumes an `ActiveQualificationAuthority`; the
 runner then supplies exactly the ordered fifteen-cell `K12Q` observations and

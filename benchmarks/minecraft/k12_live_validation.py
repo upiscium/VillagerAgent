@@ -154,6 +154,8 @@ def _validate_qualification_ownership(
         qualification,
         authority=qualification.authority,
         controller=qualification.controller,
+    ) or not qualification.controller.owns_qualification_evidence(
+        qualification, receipt,
     ):
         raise ProvenanceError("final_prerequisite_mismatch")
     return receipt

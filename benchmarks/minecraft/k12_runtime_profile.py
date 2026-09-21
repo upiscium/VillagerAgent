@@ -390,6 +390,7 @@ _SOURCE_ENTRYPOINT_PATTERNS = (
     "benchmarks/common/eac/*.py",
     "benchmarks/minecraft/__init__.py",
     "benchmarks/minecraft/k12_live_*.py",
+    "benchmarks/minecraft/k12_authority_contracts.py",
     "benchmarks/minecraft/k12_execution_*.py",
     "benchmarks/minecraft/k12_containment.py",
     "benchmarks/minecraft/k12_evidence.py",

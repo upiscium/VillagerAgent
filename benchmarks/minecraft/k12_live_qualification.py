@@ -24,6 +24,13 @@ from threading import RLock
 from typing import Any
 
 from benchmarks.common.eac.canonical import canonical_argument, canonical_sha256
+from .k12_authority_contracts import (
+    _CONTRACT_MINT_TOKEN,
+    QualificationAggregateOwnershipReceipt,
+    QualificationEvidenceContract,
+    QualificationTerminalEvidenceContract,
+    install_qualification_evidence_contract,
+)
 
 from .k12_execution_provenance import (
     ActiveQualificationAuthority,
@@ -64,7 +71,6 @@ _LIVE_EVIDENCE_ORIGINS = frozenset({RUNTIME_VERIFIED_ORIGIN, INJECTED_FAKE_ORIGI
 QUALIFICATION_PATH = Path(__file__).with_name("k12_live_qualification_v1.json")
 
 _QUALIFICATION_TOKEN = object()
-_AGGREGATE_RECEIPT_TOKEN = object()
 _LIVE_AGGREGATE_LOCK = RLock()
 _LIVE_AGGREGATES: set[str] = set()
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -713,7 +719,7 @@ LiveProbeObservation = LiveQualificationProbeEvidence
 
 
 @dataclass(frozen=True, slots=True)
-class QualificationTerminalEvidence:
+class QualificationTerminalEvidence(QualificationTerminalEvidenceContract):
     """The parent ledger's terminal, passed qualification event."""
 
     ledger_digest: str
@@ -1272,7 +1278,7 @@ def _validate_live_aggregate_components(
 
 
 @dataclass(frozen=True, slots=True, init=False)
-class LiveQualificationAggregate:
+class LiveQualificationAggregate(QualificationEvidenceContract):
     """Positive aggregate minted from an active qualification authority."""
 
     results: tuple[QualificationCellResult, ...]
@@ -1286,9 +1292,6 @@ class LiveQualificationAggregate:
     evidence_origin: str = field(init=False)
     identity: str = field(init=False)
     _ownership_marker: object = field(repr=False, compare=False)
-    _ownership_receipt: "QualificationAggregateOwnershipReceipt" = field(
-        init=False, repr=False, compare=False
-    )
 
     def __init__(
         self,
@@ -1301,34 +1304,9 @@ class LiveQualificationAggregate:
         authority: ActiveQualificationAuthority,
         token: object = None,
     ) -> None:
-        if token is not _QUALIFICATION_TOKEN:
-            raise TypeError("live qualification aggregates are parent-coordinator minted")
-        result_values = tuple(results)
-        for name, value in (
-            ("results", result_values),
-            ("probes", probes),
-            ("profile_digest", profile_digest),
-            ("campaign_id", campaign_id),
-            ("authority_binding", authority_binding),
-            ("terminal", terminal),
-            ("authority", authority),
-        ):
-            object.__setattr__(self, name, value)
-        object.__setattr__(self, "_ownership_marker", object())
-        object.__setattr__(self, "execution_provenance", LIVE_QUALIFICATION_PROVENANCE)
-        origins = {
-            result.trace.evidence_origin for result in result_values
-        } | {probes.evidence_origin, terminal.evidence_origin}
-        if len(origins) == 1:
-            object.__setattr__(self, "evidence_origin", origins.pop())
-        else:
-            object.__setattr__(self, "evidence_origin", "mixed")
-        self.__post_init__()
-        object.__setattr__(
-            self,
-            "_ownership_receipt",
-            QualificationAggregateOwnershipReceipt._mint(self),
-        )
+        del results, probes, profile_digest, campaign_id, authority_binding
+        del terminal, authority, token
+        raise TypeError("live qualification aggregates are factory-minted")
 
     def __post_init__(self) -> None:
         _validate_live_aggregate_components(
@@ -1467,7 +1445,7 @@ class LiveQualificationAggregate:
     def ownership_receipt(self) -> "QualificationAggregateOwnershipReceipt":
         """Return the parent-minted capability proving aggregate ownership."""
 
-        return self._ownership_receipt
+        return QualificationEvidenceContract.ownership_receipt.fget(self)
 
     aggregate_ownership_receipt = ownership_receipt
     final_prerequisite_receipt = ownership_receipt
@@ -1478,7 +1456,15 @@ class LiveQualificationAggregate:
         """Authenticate this concrete aggregate at a final-prerequisite boundary."""
 
         receipt = self.ownership_receipt
-        if not receipt.authenticates(self, authority=authority, controller=controller):
+        resolved_controller = self.controller if controller is None else controller
+        if (not receipt.authenticates(
+                self, authority=authority, controller=resolved_controller)
+                or resolved_controller is not self.controller
+                or not bool(getattr(
+                    resolved_controller,
+                    "owns_qualification_evidence",
+                    lambda _evidence, _receipt: False,
+                )(self, receipt))):
             raise ProvenanceError("final_prerequisite_mismatch")
         return receipt
 
@@ -1507,91 +1493,6 @@ class LiveQualificationAggregate:
         )
 
     mint = from_authority
-
-
-@dataclass(frozen=True, slots=True, init=False)
-class QualificationAggregateOwnershipReceipt:
-    """Unforgeable receipt tying an aggregate to its active parent capability."""
-
-    aggregate_identity: str
-    authority_identity: str
-    authority_binding: AuthorityBinding
-    evidence_origin: str
-    authority: ActiveQualificationAuthority = field(repr=False, compare=False)
-    controller: Any = field(repr=False, compare=False)
-    _ownership_marker: object = field(repr=False, compare=False)
-    identity: str = field(init=False)
-
-    def __init__(self, aggregate: LiveQualificationAggregate, token: object = None) -> None:
-        if token is not _AGGREGATE_RECEIPT_TOKEN:
-            raise TypeError("aggregate ownership receipts are aggregate-minted")
-        if not isinstance(aggregate, LiveQualificationAggregate):
-            raise TypeError("typed live qualification aggregate required")
-        controller = aggregate.controller
-        object.__setattr__(self, "aggregate_identity", aggregate.identity)
-        object.__setattr__(self, "authority_identity", aggregate.authority.identity)
-        object.__setattr__(self, "authority_binding", aggregate.authority_binding)
-        object.__setattr__(self, "evidence_origin", aggregate.evidence_origin)
-        object.__setattr__(self, "authority", aggregate.authority)
-        object.__setattr__(self, "controller", controller)
-        object.__setattr__(self, "_ownership_marker", aggregate._ownership_marker)
-        object.__setattr__(
-            self,
-            "identity",
-            canonical_sha256(
-                {
-                    "artifact": "minecraft-k12-live-qualification-aggregate-ownership/1",
-                    "aggregate": aggregate.identity,
-                    "authority": aggregate.authority.identity,
-                    "authority_binding": aggregate.authority_binding.canonical(),
-                    "evidence_origin": aggregate.evidence_origin,
-                }
-            ),
-        )
-
-    @classmethod
-    def _mint(cls, aggregate: LiveQualificationAggregate) -> "QualificationAggregateOwnershipReceipt":
-        return cls(aggregate, _AGGREGATE_RECEIPT_TOKEN)
-
-    @property
-    def digest(self) -> str:
-        return self.identity
-
-    def authenticates(
-        self, aggregate: Any, *, authority: Any = None, controller: Any = None
-    ) -> bool:
-        if not isinstance(aggregate, LiveQualificationAggregate):
-            return False
-        if (
-            getattr(aggregate, "_ownership_receipt", None) is not self
-            or getattr(aggregate, "_ownership_marker", None) is not self._ownership_marker
-            or aggregate.identity != self.aggregate_identity
-            or aggregate.authority is not self.authority
-            or aggregate.authority_binding != self.authority_binding
-            or aggregate.evidence_origin != self.evidence_origin
-            or aggregate.authority.identity != self.authority_identity
-            or aggregate.controller is not self.controller
-            or self.identity
-            != canonical_sha256(
-                {
-                    "artifact": "minecraft-k12-live-qualification-aggregate-ownership/1",
-                    "aggregate": self.aggregate_identity,
-                    "authority": self.authority_identity,
-                    "authority_binding": self.authority_binding.canonical(),
-                    "evidence_origin": self.evidence_origin,
-                }
-            )
-        ):
-            return False
-        if authority is not None and (
-            authority is not self.authority and authority is not self.authority.authority
-        ):
-            return False
-        if controller is not None and controller is not self.controller:
-            return False
-        return True
-
-    verify = authenticates
 
 
 def aggregate_live_qualification(
@@ -1684,27 +1585,66 @@ def aggregate_live_qualification(
             reason="qualification_probe_failed",
         )
         raise ValueError("qualification probes failed")
-    terminal = _verify_or_append_terminal(
+    aggregate = object.__new__(LiveQualificationAggregate)
+    for name, value in (
+        ("results", results),
+        ("probes", probe_aggregate),
+        ("profile_digest", authority.profile_digest),
+        ("campaign_id", next(iter(campaign_ids))),
+        ("authority_binding", binding),
+        ("authority", authority),
+        ("execution_provenance", LIVE_QUALIFICATION_PROVENANCE),
+        ("evidence_origin", aggregate_origin),
+        ("identity", aggregate_identity),
+        ("_ownership_marker", object()),
+    ):
+        object.__setattr__(aggregate, name, value)
+    authority.owner._preclaim_qualification_evidence(
+        aggregate,
         authority,
-        selected_ledger,
-        aggregate_digest=aggregate_identity,
-        probe_digest=probe_digest,
-        binding=binding,
+        aggregate_identity=aggregate_identity,
+        probe_aggregate_digest=probe_digest,
+        authority_binding=binding,
         evidence_origin=aggregate_origin,
-        supplied=terminal_evidence,
     )
-    aggregate = LiveQualificationAggregate(
-        results,
-        probe_aggregate,
-        authority.profile_digest,
-        next(iter(campaign_ids)),
-        binding,
-        terminal,
-        authority,
-        _QUALIFICATION_TOKEN,
-    )
-    if aggregate.identity != aggregate_identity or not aggregate.qualifies():
-        raise ValueError("live qualification aggregate failed terminal verification")
+    try:
+        terminal = _verify_or_append_terminal(
+            authority,
+            selected_ledger,
+            aggregate_digest=aggregate_identity,
+            probe_digest=probe_digest,
+            binding=binding,
+            evidence_origin=aggregate_origin,
+            supplied=terminal_evidence,
+        )
+        object.__setattr__(aggregate, "terminal", terminal)
+        aggregate.__post_init__()
+        install_qualification_evidence_contract(
+            aggregate,
+            aggregate_identity=aggregate.identity,
+            probe_aggregate_digest=aggregate.probes.identity,
+            qualification_terminal_ledger_digest=aggregate.terminal.ledger_digest,
+            profile_digest=aggregate.profile_digest,
+            authority_binding=aggregate.authority_binding,
+            authority_binding_canonical=aggregate.authority_binding.canonical(),
+            evidence_origin=aggregate.evidence_origin,
+            execution_provenance=aggregate.execution_provenance,
+            passed=aggregate.qualifies(),
+            terminal_evidence=aggregate.terminal,
+            authority=aggregate.authority,
+            controller=aggregate.controller,
+            aggregate_marker=aggregate._ownership_marker,
+            token=_CONTRACT_MINT_TOKEN,
+        )
+        authority.owner._fulfill_qualification_evidence(
+            aggregate,
+            QualificationEvidenceContract.ownership_receipt.fget(aggregate),
+        )
+        if aggregate.identity != aggregate_identity or not aggregate.qualifies():
+            raise ValueError("live qualification aggregate failed terminal verification")
+    except Exception:
+        authority.owner._abandon_qualification_evidence(aggregate, authority)
+        raise
     with _LIVE_AGGREGATE_LOCK:
         if authority.identity in _LIVE_AGGREGATES:
             raise ProvenanceError("authority_replay")

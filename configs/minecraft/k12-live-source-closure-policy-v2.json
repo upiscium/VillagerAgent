@@ -14,6 +14,7 @@
     {"path": "benchmarks/common/eac/witness.py", "git_mode": "100644", "semantic_class": "python"},
     {"path": "benchmarks/minecraft/__init__.py", "git_mode": "100644", "semantic_class": "python"},
     {"path": "benchmarks/minecraft/eac_runtime.py", "git_mode": "100644", "semantic_class": "python"},
+    {"path": "benchmarks/minecraft/k12_authority_contracts.py", "git_mode": "100644", "semantic_class": "python"},
     {"path": "benchmarks/minecraft/k12_containment.py", "git_mode": "100644", "semantic_class": "python"},
     {"path": "benchmarks/minecraft/k12_evidence.py", "git_mode": "100644", "semantic_class": "python"},
     {"path": "benchmarks/minecraft/k12_execution_capsule.py", "git_mode": "100644", "semantic_class": "python"},
@@ -95,5 +96,5 @@
   ],
   "unlisted_executable_input": "reject",
   "observed_hashes_stored_in_policy": false,
-  "detached_artifact_sha256": "b41ef906d55f56870084b9e12347e11827e508e96a0b150f5d78320a815bb854"
+  "detached_artifact_sha256": "79fc4b86bc011ed99f99b7dba4d65c8cbaa3371a361ac5a646c6ba44e8d126c7"
 }

@@ -1,5 +1,6 @@
 import dataclasses
 import hashlib
+import hmac
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,12 +9,6 @@ import pytest
 from benchmarks.common.eac.canonical import canonical_bytes, canonical_sha256
 from benchmarks.minecraft.k12_execution_capsule import CapsuleRecord, DurableLedger, attest_capsule
 from benchmarks.minecraft.k12_execution_provenance import (
-    EXPECTED_BASE_REF,
-    EXPECTED_BASE_SHA,
-    EXPECTED_BRANCH,
-    EXPECTED_HEAD,
-    EXPECTED_PR,
-    EXPECTED_REPOSITORY,
     PROFILE_V2,
     INJECTED_FAKE_ORIGIN,
     INJECTED_TEST_ORIGIN,
@@ -37,6 +32,8 @@ from benchmarks.minecraft.k12_execution_provenance import (
     EnvironmentObservation,
     CheckoutObservation,
     OutputRootObservation,
+    ExternalRevisionAuthorization,
+    external_revision_attestation_payload,
     authority_owns_profile,
     durable_ledger_root_digest,
     git_blob_oid,
@@ -54,6 +51,13 @@ from benchmarks.minecraft.run_lock import MinecraftTargetLock
 
 
 D = "b" * 64
+REPOSITORY = "example/VillagerAgent"
+BRANCH = "refs/heads/experiment/k12-arbitrary"
+HEAD = "a" * 40
+TREE = "c" * 40
+BASE_REF = "main"
+BASE_SHA = "d" * 40
+PR_NUMBER = 580
 PROFILE = load_k12_live_runtime_profile()
 POLICY = load_k12_live_source_policy()
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -103,19 +107,19 @@ def _capsule(parent, source):
 
 def _checkout():
     return CheckoutObservation(
-        repository_identity=EXPECTED_REPOSITORY,
+        repository_identity=REPOSITORY,
         worktree_identity=D,
         git_dir_identity=D,
         common_dir_identity=D,
-        symbolic_head_ref=EXPECTED_BRANCH,
-        head_commit=EXPECTED_HEAD,
-        head_tree="c" * 40,
-        index_tree="c" * 40,
-        upstream_ref=EXPECTED_BRANCH,
-        upstream_commit=EXPECTED_HEAD,
-        remote_repository=EXPECTED_REPOSITORY,
-        remote_ref=EXPECTED_BRANCH,
-        remote_commit=EXPECTED_HEAD,
+        symbolic_head_ref=BRANCH,
+        head_commit=HEAD,
+        head_tree=TREE,
+        index_tree=TREE,
+        upstream_ref=BRANCH,
+        upstream_commit=HEAD,
+        remote_repository=REPOSITORY,
+        remote_ref=BRANCH,
+        remote_commit=HEAD,
         staged_clean=True,
         tracked_clean=True,
         untracked_clean=True,
@@ -123,8 +127,41 @@ def _checkout():
     )
 
 
-def _preflight(parent, ledger):
-    source = _source(parent)
+def _preflight(parent, ledger, *, revision_verifier_key=None):
+    checkout = _checkout()
+    now = 100 if parent.origin == INJECTED_TEST_ORIGIN else parent.current_time()
+    pull_request = PullRequestObservation(
+        REPOSITORY, PR_NUMBER, "OPEN", True,
+        REPOSITORY, BRANCH.removeprefix("refs/heads/"), HEAD,
+        BASE_REF, BASE_SHA, now, "observer/1", D,
+    )
+    revision_kwargs = {
+        "verifier_identity": "test-verifier/1",
+        "now": now,
+        "expires_at": now + 300,
+    }
+    if parent.origin == RUNTIME_VERIFIED_ORIGIN:
+        if revision_verifier_key is None:
+            raise TypeError("runtime test verifier key required")
+        payload = external_revision_attestation_payload(
+            checkout, pull_request, expires_at=now + 300,
+            origin=RUNTIME_VERIFIED_ORIGIN,
+            verifier_identity="test-verifier/1",
+        )
+        revision_kwargs["verifier_receipt_digest"] = hmac.new(
+            revision_verifier_key, payload, hashlib.sha256,
+        ).hexdigest()
+    revision = parent.mint_external_revision_authorization(
+        checkout, pull_request, **revision_kwargs,
+    )
+    source_kwargs = {
+        "root": SOURCE_ROOT,
+        "policy": POLICY,
+        "injected_only": True,
+    }
+    if parent.origin == INJECTED_TEST_ORIGIN:
+        source_kwargs["revision_authorization"] = revision
+    source = parent.collect_source_closure(**source_kwargs)
     lock = MinecraftTargetLock(
         lock_root=ledger.root.parent / f"provenance-lock-{ledger.reservation_id[:8]}",
         host="127.0.0.1",
@@ -139,19 +176,16 @@ def _preflight(parent, ledger):
         output_root_identity=ledger.output_root_identity,
         profile_digest=PROFILE.profile_digest,
         ledger=ledger,
-        now=100,
+        now=now,
+        external_revision_authorization=revision,
     )
     return QualificationPreflight(
         reservation_id=ledger.reservation_id,
         run_authorization_digest=run_auth.identity,
         run_authorization=run_auth,
-        expected_head=EXPECTED_HEAD,
-        checkout=_checkout(),
-        pull_request=PullRequestObservation(
-            EXPECTED_REPOSITORY, EXPECTED_PR, "OPEN", True,
-            EXPECTED_REPOSITORY, EXPECTED_BRANCH.removeprefix("refs/heads/"), EXPECTED_HEAD,
-            EXPECTED_BASE_REF, EXPECTED_BASE_SHA, 100, "observer/1", D,
-        ),
+        external_revision_authorization=revision,
+        checkout=checkout,
+        pull_request=pull_request,
         source=source,
         capsule=_capsule(parent, source),
         profile_identity=PROFILE.profile_id,
@@ -198,13 +232,23 @@ def _first(preflight):
     )
 
 
-def test_issue_524_constants_and_canonical_head_are_frozen():
-    assert EXPECTED_REPOSITORY == "upiscium/VillagerAgent"
-    assert EXPECTED_BRANCH == "refs/heads/experiment/k11-k12-ecological-validation"
-    assert EXPECTED_PR == 524
-    assert EXPECTED_BASE_REF == "main"
-    assert EXPECTED_BASE_SHA == "66a904de8af2b0bbaf79071628f06bed91a40078"
-    assert EXPECTED_HEAD.startswith("36a1453") and len(EXPECTED_HEAD) == 40
+def test_external_revision_authorization_is_parent_owned_and_dynamic():
+    parent = ParentExecutionAuthority().injected_test_controller()
+    revision = parent.mint_external_revision_authorization(
+        _checkout(),
+        PullRequestObservation(
+            REPOSITORY, PR_NUMBER, "OPEN", True, REPOSITORY,
+            BRANCH.removeprefix("refs/heads/"), HEAD, BASE_REF, BASE_SHA,
+            100, "observer/1", D,
+        ),
+        verifier_identity="test-verifier/1", now=100,
+    )
+    assert revision.head_commit == HEAD
+    assert revision.base_sha == BASE_SHA
+    assert revision.owned_by(parent)
+    assert revision.runtime_admissible is False
+    with pytest.raises(TypeError):
+        type(revision)(**revision.canonical(), ownership_token=object(), token=object())
 
 
 def test_runtime_source_collector_authenticates_checkout_git_tree():

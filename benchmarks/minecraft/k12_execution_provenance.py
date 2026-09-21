@@ -13,6 +13,7 @@ separate: runtime chains use ``runtime_verified`` and deterministic chains use
 from __future__ import annotations
 
 import hashlib
+import hmac
 import math
 import os
 import re
@@ -26,9 +27,17 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, Protocol, runtime_checkable
+from typing import Any
 
 from benchmarks.common.eac.canonical import canonical_bytes, canonical_sha256
+from .k12_authority_contracts import (
+    QualificationEvidenceContract,
+    QualificationEvidenceOwnershipReceipt,
+    QualificationEvidenceProjection,
+    QualificationTerminalEvidenceContract,
+    is_canonical_qualification_evidence,
+    qualification_evidence_values,
+)
 
 
 QUALIFICATION_AUTHORITY = "minecraft-k12-live-qualification-execution-authority/1"
@@ -49,12 +58,6 @@ OPERATIONAL_PROVENANCES = frozenset({
     "mock_only", LIVE_QUALIFICATION_NAMESPACE, QUALIFICATION_PROBE_NAMESPACE,
     LIVE_FINAL_NAMESPACE,
 })
-EXPECTED_BRANCH = "refs/heads/experiment/k11-k12-ecological-validation"
-EXPECTED_PR = 524
-EXPECTED_REPOSITORY = "upiscium/VillagerAgent"
-EXPECTED_BASE_REF = "main"
-EXPECTED_BASE_SHA = "66a904de8af2b0bbaf79071628f06bed91a40078"
-EXPECTED_HEAD = "36a145338ae839eaf145b879d0317b24ae852300"
 MAX_PR_AGE_SECONDS = 300
 
 _SHA1 = re.compile(r"[0-9a-f]{40}")
@@ -67,6 +70,7 @@ _ACTIVE_TOKEN = object()
 _LEASE_TOKEN = object()
 _INJECTED_CONTROLLER_TOKEN = object()
 _SOURCE_CLOSURE_TOKEN = object()
+_REVISION_AUTH_TOKEN = object()
 _MISSING_TREE_ENTRY = object()
 
 _LEDGER_ROOT_ARTIFACT = "minecraft-k12-live-execution-ledger-root/1"
@@ -252,7 +256,11 @@ class SourceClosure:
             _require_sha1(head_commit, "git_head_mismatch")
             _require_sha1(head_tree, "git_tree_mismatch")
         elif head_commit or head_tree:
-            raise ProvenanceError("source_closure_incomplete")
+            # An injected closure is never runtime-admissible, but a
+            # parent-owned revision authorization may still carry the
+            # authenticated ancestry used to bind a deterministic fixture.
+            _require_sha1(head_commit, "git_head_mismatch")
+            _require_sha1(head_tree, "git_tree_mismatch")
         ordered = tuple(sorted(tuple(records), key=lambda item: item.path))
         names = tuple(item.path for item in ordered)
         if (not ordered or len(names) != len(set(names))
@@ -323,6 +331,276 @@ def git_blob_oid(data: bytes) -> str:
         raise TypeError("Git blob data must be bytes")
     header = f"blob {len(data)}\0".encode("ascii")
     return hashlib.sha1(header + data, usedforsecurity=False).hexdigest()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ExternalRevisionAuthorization:
+    """Parent-owned authorization for one externally verified revision.
+
+    Revision values are intentionally not module constants.  A parent mints
+    this tuple from the checkout/PR observation authenticated for the current
+    run and embeds the resulting receipt in the qualification run
+    authorization.  The ownership token and object identity prevent a raw
+    caller mapping, SHA, or detached receipt from becoming authority.
+    """
+
+    repository: str
+    branch: str
+    head_commit: str
+    head_tree: str
+    pull_request: int
+    pull_request_semantic_tuple: tuple[Any, ...]
+    base_ref: str
+    base_sha: str
+    issued_at: int
+    expires_at: int
+    origin: str
+    verifier_identity: str
+    pull_request_observed_at: int
+    pull_request_observer: str
+    pull_request_receipt_digest: str
+    verifier_receipt_digest: str
+    detached_artifact_sha256: str
+    identity: str
+    ownership_token: object = field(repr=False, compare=False)
+    owner: Any = field(repr=False, compare=False)
+
+    def __init__(
+        self,
+        *,
+        repository: str,
+        branch: str,
+        head_commit: str,
+        head_tree: str,
+        pull_request: int,
+        pull_request_semantic_tuple: Sequence[Any],
+        base_ref: str,
+        base_sha: str,
+        issued_at: int,
+        expires_at: int,
+        origin: str,
+        verifier_identity: str,
+        pull_request_observed_at: int,
+        pull_request_observer: str,
+        pull_request_receipt_digest: str,
+        verifier_receipt_digest: str,
+        ownership_token: object = None,
+        owner: Any = None,
+        token: object = None,
+    ) -> None:
+        if token is not _REVISION_AUTH_TOKEN or ownership_token is None or owner is None:
+            raise TypeError("external revision authorizations are parent-minted")
+        if (not isinstance(repository, str) or not repository
+                or not isinstance(branch, str) or not branch
+                or not branch.startswith("refs/heads/")
+                or not isinstance(base_ref, str) or not base_ref
+                or not isinstance(verifier_identity, str) or not verifier_identity
+                or not isinstance(pull_request_observer, str)
+                or not pull_request_observer):
+            raise ProvenanceError("pr_semantic_mismatch")
+        _require_sha1(head_commit, "git_head_mismatch")
+        _require_sha1(head_tree, "git_tree_mismatch")
+        _require_sha1(base_sha, "pr_semantic_mismatch")
+        _require_sha256(pull_request_receipt_digest, "pr_observation_missing")
+        _require_sha256(verifier_receipt_digest, "pr_observation_missing")
+        if type(pull_request) is not int or pull_request <= 0:
+            raise ProvenanceError("pr_semantic_mismatch")
+        semantic = tuple(pull_request_semantic_tuple)
+        if len(semantic) != 9:
+            raise ProvenanceError("pr_semantic_mismatch")
+        if (semantic[0] != repository or semantic[1] != pull_request
+                or semantic[4] != repository
+                or semantic[5] != branch.removeprefix("refs/heads/")
+                or semantic[6] != head_commit
+                or semantic[7] != base_ref or semantic[8] != base_sha):
+            raise ProvenanceError("pr_semantic_mismatch")
+        if (type(issued_at) is not int or type(expires_at) is not int
+                or type(pull_request_observed_at) is not int):
+            raise ProvenanceError("pr_observation_stale")
+        if issued_at > expires_at or expires_at - issued_at > MAX_PR_AGE_SECONDS:
+            raise ProvenanceError("pr_observation_stale")
+        normalized_origin = _normalize_origin(origin)
+        canonical = {
+            "artifact_id": "minecraft-k12-live-external-revision-authorization",
+            "artifact_version": 1,
+            "repository": repository,
+            "branch": branch,
+            "head_commit": head_commit,
+            "head_tree": head_tree,
+            "pull_request": pull_request,
+            "pull_request_semantic_tuple": list(semantic),
+            "base_ref": base_ref,
+            "base_sha": base_sha,
+            "issued_at": issued_at,
+            "expires_at": expires_at,
+            "origin": normalized_origin,
+            "verifier_identity": verifier_identity,
+            "pull_request_observed_at": pull_request_observed_at,
+            "pull_request_observer": pull_request_observer,
+            "pull_request_receipt_digest": pull_request_receipt_digest,
+            "verifier_receipt_digest": verifier_receipt_digest,
+        }
+        detached = raw_sha256(canonical_bytes(canonical))
+        object.__setattr__(self, "repository", repository)
+        object.__setattr__(self, "branch", branch)
+        object.__setattr__(self, "head_commit", head_commit)
+        object.__setattr__(self, "head_tree", head_tree)
+        object.__setattr__(self, "pull_request", pull_request)
+        object.__setattr__(self, "pull_request_semantic_tuple", semantic)
+        object.__setattr__(self, "base_ref", base_ref)
+        object.__setattr__(self, "base_sha", base_sha)
+        object.__setattr__(self, "issued_at", issued_at)
+        object.__setattr__(self, "expires_at", expires_at)
+        object.__setattr__(self, "origin", normalized_origin)
+        object.__setattr__(self, "verifier_identity", verifier_identity)
+        object.__setattr__(self, "pull_request_observed_at", pull_request_observed_at)
+        object.__setattr__(self, "pull_request_observer", pull_request_observer)
+        object.__setattr__(self, "pull_request_receipt_digest", pull_request_receipt_digest)
+        object.__setattr__(self, "verifier_receipt_digest", verifier_receipt_digest)
+        object.__setattr__(self, "detached_artifact_sha256", detached)
+        object.__setattr__(
+            self,
+            "identity",
+            canonical_sha256({
+                "schema": "minecraft-k12-live-external-revision-authorization/1",
+                "digest": detached,
+            }),
+        )
+        object.__setattr__(self, "ownership_token", ownership_token)
+        object.__setattr__(self, "owner", owner)
+
+    @property
+    def repository_identity(self) -> str:
+        return self.repository
+
+    @property
+    def branch_ref(self) -> str:
+        return self.branch
+
+    @property
+    def pr(self) -> int:
+        return self.pull_request
+
+    @property
+    def pr_number(self) -> int:
+        return self.pull_request
+
+    @property
+    def fresh_semantic_tuple(self) -> tuple[Any, ...]:
+        return self.pull_request_semantic_tuple
+
+    @property
+    def semantic_tuple(self) -> tuple[Any, ...]:
+        return self.pull_request_semantic_tuple
+
+    @property
+    def runtime_admissible(self) -> bool:
+        return self.origin == RUNTIME_VERIFIED_ORIGIN
+
+    @property
+    def evidence_origin(self) -> str:
+        return self.origin
+
+    def owned_by(self, owner: Any) -> bool:
+        return self.owner is owner and bool(
+            getattr(owner, "owns_external_revision", lambda _value: False)(self)
+        )
+
+    def current_at(self, now: int) -> bool:
+        return type(now) is int and self.issued_at <= now <= self.expires_at
+
+    def canonical(self) -> dict[str, Any]:
+        return {
+            "artifact_id": "minecraft-k12-live-external-revision-authorization",
+            "artifact_version": 1,
+            "repository": self.repository,
+            "branch": self.branch,
+            "head_commit": self.head_commit,
+            "head_tree": self.head_tree,
+            "pull_request": self.pull_request,
+            "pull_request_semantic_tuple": list(self.pull_request_semantic_tuple),
+            "base_ref": self.base_ref,
+            "base_sha": self.base_sha,
+            "issued_at": self.issued_at,
+            "expires_at": self.expires_at,
+            "origin": self.origin,
+            "verifier_identity": self.verifier_identity,
+            "pull_request_observed_at": self.pull_request_observed_at,
+            "pull_request_observer": self.pull_request_observer,
+            "pull_request_receipt_digest": self.pull_request_receipt_digest,
+            "verifier_receipt_digest": self.verifier_receipt_digest,
+        }
+
+    def receipt(self) -> dict[str, Any]:
+        return {
+            **self.canonical(),
+            "detached_artifact_sha256": self.detached_artifact_sha256,
+            "authorization_digest": self.identity,
+        }
+
+    def matches_checkout(self, checkout: "CheckoutObservation") -> bool:
+        return (
+            isinstance(checkout, CheckoutObservation)
+            and checkout.repository_identity == self.repository
+            and checkout.symbolic_head_ref == self.branch
+            and checkout.head_commit == self.head_commit
+            and checkout.head_tree == self.head_tree
+            and checkout.index_tree == self.head_tree
+            and checkout.upstream_ref == self.branch
+            and checkout.upstream_commit == self.head_commit
+            and checkout.remote_repository == self.repository
+            and checkout.remote_ref == self.branch
+            and checkout.remote_commit == self.head_commit
+        )
+
+    def matches_pull_request(
+        self, observation: "PullRequestObservation", *, now: int
+    ) -> bool:
+        return (
+            isinstance(observation, PullRequestObservation)
+            and observation.semantic_tuple() == self.pull_request_semantic_tuple
+            and observation.repository == self.repository
+            and observation.number == self.pull_request
+            and observation.head_sha == self.head_commit
+            and observation.base_ref == self.base_ref
+            and observation.base_sha == self.base_sha
+            and observation.observed_at == self.pull_request_observed_at
+            and observation.observer == self.pull_request_observer
+            and observation.receipt_digest == self.pull_request_receipt_digest
+            and type(observation.observed_at) is int
+            and observation.observed_at <= now
+            and now - observation.observed_at <= MAX_PR_AGE_SECONDS
+            and self.current_at(now)
+        )
+
+    def matches_source(self, source: "SourceClosure") -> bool:
+        if not isinstance(source, SourceClosure):
+            return False
+        return source.head_commit == self.head_commit and source.head_tree == self.head_tree
+
+
+def external_revision_attestation_payload(
+    checkout: "CheckoutObservation",
+    pull_request: "PullRequestObservation",
+    *,
+    expires_at: int,
+    origin: str,
+    verifier_identity: str,
+) -> bytes:
+    """Canonical evidence bytes signed by the external revision verifier."""
+
+    if not isinstance(checkout, CheckoutObservation):
+        raise TypeError("typed checkout observation required")
+    if not isinstance(pull_request, PullRequestObservation):
+        raise TypeError("typed pull-request observation required")
+    return canonical_bytes({
+        "schema": "minecraft-k12-live-external-revision-attestation/1",
+        "checkout": checkout.canonical(),
+        "pull_request": pull_request.canonical(),
+        "expires_at": expires_at,
+        "origin": _normalize_origin(origin),
+        "verifier_identity": verifier_identity,
+    })
 
 
 def _open_trusted_source_root(root: str | Path) -> int:
@@ -498,7 +776,7 @@ def _authenticated_git_tree(root: str | Path, checkout: Any, policy: Any) -> Map
     """Read exact blob identities from the checkout's authenticated commit tree."""
     if not isinstance(checkout, CheckoutObservation):
         raise TypeError("typed checkout observation required for runtime source collection")
-    checkout.validate(checkout.head_commit)
+    checkout.validate_structure()
     candidate = shutil.which("git")
     if not candidate:
         raise ProvenanceError("git_tree_mismatch")
@@ -566,6 +844,7 @@ def _authenticated_git_tree(root: str | Path, checkout: Any, policy: Any) -> Map
 def _collect_source_closure(*, policy: Any, root: str | Path,
                             expected_tree: Any, injected_only: bool,
                             marker: object, origin: str, owner: Any,
+                            revision_authorization: ExternalRevisionAuthorization | None = None,
                             head_commit: str = "", head_tree: str = "") -> SourceClosure:
     from .k12_runtime_profile import K12SourcePolicy
 
@@ -579,6 +858,17 @@ def _collect_source_closure(*, policy: Any, root: str | Path,
             raise ProvenanceError("source_closure_incomplete")
     else:
         raise ProvenanceError("authority_origin_mismatch")
+    if revision_authorization is not None:
+        if (not isinstance(revision_authorization, ExternalRevisionAuthorization)
+                or not revision_authorization.owned_by(owner)
+                or revision_authorization.origin != origin):
+            raise ProvenanceError("authority_replay")
+        if head_commit and head_commit != revision_authorization.head_commit:
+            raise ProvenanceError("git_head_mismatch")
+        if head_tree and head_tree != revision_authorization.head_tree:
+            raise ProvenanceError("git_tree_mismatch")
+        head_commit = revision_authorization.head_commit
+        head_tree = revision_authorization.head_tree
 
     root_fd = _open_trusted_source_root(root)
     records: list[SourceRecord] = []
@@ -656,8 +946,7 @@ class CheckoutObservation:
     git_environment_overrides: tuple[str, ...] = ()
     submodules: tuple[SubmoduleObservation, ...] = ()
 
-    def validate(self, expected_head: str = EXPECTED_HEAD) -> None:
-        _require_sha1(expected_head, "git_head_mismatch")
+    def validate_structure(self) -> None:
         for value in (self.worktree_identity, self.git_dir_identity, self.common_dir_identity):
             _require_sha256(value, "git_worktree_mismatch")
         for value in (self.head_commit, self.head_tree, self.index_tree,
@@ -665,14 +954,13 @@ class CheckoutObservation:
             _require_sha1(value, "git_head_mismatch")
         if self.git_environment_overrides:
             raise ProvenanceError("git_environment_override")
-        if self.symbolic_head_ref != EXPECTED_BRANCH or self.upstream_ref != EXPECTED_BRANCH:
+        if (not isinstance(self.repository_identity, str) or not self.repository_identity
+                or not isinstance(self.symbolic_head_ref, str) or not self.symbolic_head_ref
+                or not isinstance(self.upstream_ref, str) or not self.upstream_ref):
             raise ProvenanceError("git_head_mismatch")
-        if self.repository_identity != EXPECTED_REPOSITORY:
-            raise ProvenanceError("git_repository_mismatch")
-        if self.remote_repository != EXPECTED_REPOSITORY or self.remote_ref != EXPECTED_BRANCH:
+        if (not isinstance(self.remote_repository, str) or not self.remote_repository
+                or not isinstance(self.remote_ref, str) or not self.remote_ref):
             raise ProvenanceError("git_remote_mismatch")
-        if self.head_commit != expected_head:
-            raise ProvenanceError("git_head_mismatch")
         if self.index_tree != self.head_tree:
             raise ProvenanceError("git_tree_mismatch")
         if self.upstream_commit != self.head_commit or self.remote_commit != self.head_commit:
@@ -685,6 +973,26 @@ class CheckoutObservation:
             raise ProvenanceError("git_dirty_untracked")
         if any(not isinstance(item, SubmoduleObservation) for item in self.submodules):
             raise ProvenanceError("git_submodule_mismatch")
+
+    def validate(self, authorization: ExternalRevisionAuthorization) -> None:
+        if not isinstance(authorization, ExternalRevisionAuthorization):
+            raise TypeError("parent-owned external revision authorization required")
+        self.validate_structure()
+        if self.repository_identity != authorization.repository:
+            raise ProvenanceError("git_repository_mismatch")
+        if (self.symbolic_head_ref != authorization.branch
+                or self.upstream_ref != authorization.branch):
+            raise ProvenanceError("git_head_mismatch")
+        if (self.remote_repository != authorization.repository
+                or self.remote_ref != authorization.branch):
+            raise ProvenanceError("git_remote_mismatch")
+        if self.head_commit != authorization.head_commit:
+            raise ProvenanceError("git_head_mismatch")
+        if self.head_tree != authorization.head_tree or self.index_tree != authorization.head_tree:
+            raise ProvenanceError("git_tree_mismatch")
+        if (self.upstream_commit != authorization.head_commit
+                or self.remote_commit != authorization.head_commit):
+            raise ProvenanceError("git_upstream_mismatch")
 
     def canonical(self) -> dict[str, Any]:
         return {
@@ -726,20 +1034,31 @@ class PullRequestObservation:
                 self.head_repository, self.head_ref, self.head_sha,
                 self.base_ref, self.base_sha)
 
-    def validate(self, *, expected_head: str = EXPECTED_HEAD, now: int) -> None:
+    def validate_structure(self, *, now: int) -> None:
         _require_sha1(self.head_sha, "pr_semantic_mismatch")
         _require_sha1(self.base_sha, "pr_semantic_mismatch")
         _require_sha256(self.receipt_digest, "pr_observation_missing")
-        if (self.number != EXPECTED_PR or self.state != "OPEN" or self.is_draft is not True
-                or self.repository != EXPECTED_REPOSITORY
-                or self.head_repository != EXPECTED_REPOSITORY
-                or self.head_ref != EXPECTED_BRANCH.removeprefix("refs/heads/")
-                or self.head_sha != expected_head or self.base_ref != EXPECTED_BASE_REF
-                or self.base_sha != EXPECTED_BASE_SHA):
+        if (type(self.number) is not int or self.number <= 0
+                or self.state != "OPEN" or self.is_draft is not True
+                or not isinstance(self.repository, str) or not self.repository
+                or not isinstance(self.head_repository, str) or not self.head_repository
+                or not isinstance(self.head_ref, str) or not self.head_ref
+                or not isinstance(self.base_ref, str) or not self.base_ref):
             raise ProvenanceError("pr_semantic_mismatch")
         if (type(now) is not int or type(self.observed_at) is not int
                 or now < self.observed_at or now - self.observed_at > MAX_PR_AGE_SECONDS):
             raise ProvenanceError("pr_observation_stale")
+
+    def validate(
+        self, authorization: ExternalRevisionAuthorization, *, now: int
+    ) -> None:
+        if not isinstance(authorization, ExternalRevisionAuthorization):
+            raise TypeError("parent-owned external revision authorization required")
+        self.validate_structure(now=now)
+        if not authorization.current_at(now):
+            raise ProvenanceError("pr_observation_stale")
+        if not authorization.matches_pull_request(self, now=now):
+            raise ProvenanceError("pr_semantic_mismatch")
 
     def canonical(self) -> dict[str, Any]:
         return {"repository": self.repository, "number": self.number,
@@ -1175,7 +1494,7 @@ class AuthorityBinding:
 class QualificationPreflight:
     reservation_id: str
     run_authorization_digest: str
-    expected_head: str
+    external_revision_authorization: ExternalRevisionAuthorization
     checkout: CheckoutObservation
     pull_request: PullRequestObservation
     source: SourceClosure
@@ -1200,19 +1519,29 @@ class QualificationPreflight:
 
         _require_sha256(self.reservation_id, "authority_replay")
         _require_sha256(self.ledger_root_digest, "authority_replay")
-        if self.expected_head != EXPECTED_HEAD:
-            raise ProvenanceError("git_head_mismatch")
+        if not isinstance(
+            self.external_revision_authorization, ExternalRevisionAuthorization
+        ):
+            raise TypeError("typed external revision authorization required")
+        if not self.external_revision_authorization.owned_by(
+            self.run_authorization.owner
+            if isinstance(self.run_authorization, K12QualificationRunAuthorization)
+            else None
+        ):
+            raise ProvenanceError("authority_replay")
         if self.ledger_identity != "minecraft-k12-live-execution-ledger/1":
             raise ProvenanceError("authority_replay")
         if not isinstance(self.source, SourceClosure):
             raise ProvenanceError("source_closure_incomplete")
-        self.checkout.validate(self.expected_head)
+        self.checkout.validate(self.external_revision_authorization)
         if self.source.runtime_admissible and (
             self.source.head_commit != self.checkout.head_commit
             or self.source.head_tree != self.checkout.head_tree
         ):
             raise ProvenanceError("git_tree_mismatch")
-        self.pull_request.validate(expected_head=self.expected_head, now=now)
+        if not self.external_revision_authorization.matches_source(self.source):
+            raise ProvenanceError("git_tree_mismatch")
+        self.pull_request.validate(self.external_revision_authorization, now=now)
         if (not isinstance(self.authenticated_profile, K12RuntimeProfile)
                 or not isinstance(self.authenticated_source_policy, K12SourcePolicy)
                 or self.authenticated_profile.profile_id != PROFILE_V2
@@ -1289,6 +1618,8 @@ class QualificationPreflight:
             raise TypeError("typed qualification run authorization required")
         if (self.run_authorization.reservation_id != self.reservation_id
                 or self.run_authorization.profile_digest != self.profile_digest
+                or self.run_authorization.external_revision_authorization
+                    is not self.external_revision_authorization
                 or self.run_authorization.body.get("profile_identity") != PROFILE_V2
                 or self.run_authorization.output_root_identity != self.output.root_identity
                 or self.run_authorization.body.get("namespace") != "qualification"
@@ -1306,6 +1637,11 @@ class QualificationPreflight:
         if not self.run_authorization.current_at(now):
             raise ProvenanceError("authority_replay")
         if self.run_authorization_digest != self.run_authorization.identity:
+            raise ProvenanceError("authority_replay")
+        if (_deep_thaw(self.run_authorization.body.get("external_revision_authorization"))
+                != self.external_revision_authorization.receipt()
+                or self.run_authorization.body.get("external_revision_authorization_digest")
+                != self.external_revision_authorization.identity):
             raise ProvenanceError("authority_replay")
         if getattr(self.capsule, "source_aggregate", None) != self.source.aggregate_sha256:
             raise ProvenanceError("capsule_mismatch")
@@ -1378,20 +1714,17 @@ class FinalExecutionPrerequisites:
         _require_canonical_digest(self.contract_set_digest, "final_prerequisite_mismatch")
         _require_sha256(self.capsule_digest, "final_prerequisite_mismatch")
         try:
-            from .k12_live_qualification import (
-                LiveQualificationAggregate,
-                QualificationAggregateOwnershipReceipt,
-                QualificationTerminalEvidence,
-            )
             evidence = self.qualification_evidence
             receipt = self.qualification_ownership_receipt
             terminal = self.qualification_terminal_receipt
-            if (type(evidence) is not LiveQualificationAggregate
-                    or type(receipt) is not QualificationAggregateOwnershipReceipt
-                    or type(terminal) is not QualificationTerminalEvidence
-                    or evidence.terminal is not terminal
+            if (not isinstance(evidence, QualificationEvidenceContract)
+                    or not isinstance(receipt, QualificationEvidenceOwnershipReceipt)
+                    or not isinstance(terminal, QualificationTerminalEvidenceContract)
+                    or evidence.terminal_evidence is not terminal
                     or evidence.ownership_receipt is not receipt
-                    or evidence.qualifies() is not True
+                    or not isinstance(evidence.qualification_projection,
+                                      QualificationEvidenceProjection)
+                    or not evidence.qualification_projection.passed
                     or not receipt.authenticates(evidence)):
                 raise ProvenanceError("final_prerequisite_mismatch")
             _live_evidence_values(evidence)
@@ -1404,18 +1737,12 @@ class FinalExecutionPrerequisites:
     @classmethod
     def from_live_qualification(cls, authority: "QualificationExecutionAuthority",
                                  evidence: Any) -> "FinalExecutionPrerequisites":
-        from .k12_live_qualification import (
-            LiveQualificationAggregate,
-            QualificationAggregateOwnershipReceipt,
-            QualificationTerminalEvidence,
-        )
-
-        if not isinstance(evidence, LiveQualificationAggregate):
+        if not isinstance(evidence, QualificationEvidenceContract):
             raise ProvenanceError("final_prerequisite_mismatch")
         if isinstance(authority, ActiveQualificationAuthority):
             active_authority = authority
         elif isinstance(authority, QualificationExecutionAuthority):
-            active_authority = evidence.authority
+            active_authority = evidence.qualification_projection.authority
             if (not isinstance(active_authority, ActiveQualificationAuthority)
                     or active_authority.authority is not authority):
                 raise TypeError("active parent qualification authority required")
@@ -1423,8 +1750,8 @@ class FinalExecutionPrerequisites:
             raise TypeError("typed qualification authority required")
         receipt = evidence.ownership_receipt
         terminal = evidence.terminal_evidence
-        if (type(receipt) is not QualificationAggregateOwnershipReceipt
-                or type(terminal) is not QualificationTerminalEvidence):
+        if (not isinstance(receipt, QualificationEvidenceOwnershipReceipt)
+                or not isinstance(terminal, QualificationTerminalEvidenceContract)):
             raise ProvenanceError("final_prerequisite_mismatch")
         owner = active_authority.owner
         try:
@@ -1434,12 +1761,12 @@ class FinalExecutionPrerequisites:
         except (AttributeError, KeyError, IndexError, TypeError, ValueError,
                 ProvenanceError):
             authenticated = False
-        if (not authenticated or evidence.authority is not active_authority
-                or evidence.authority_binding != active_authority.binding
-                or evidence.terminal is not terminal
-                or evidence.qualifies() is not True):
-            raise ProvenanceError("final_prerequisite_mismatch")
         values = _live_evidence_values(evidence)
+        if (not authenticated or values["authority"] is not active_authority
+                or values["authority_binding"] != active_authority.binding
+                or evidence.terminal_evidence is not terminal
+                or values["passed"] is not True):
+            raise ProvenanceError("final_prerequisite_mismatch")
         _validate_evidence_ownership(active_authority, evidence, values)
         qualification = active_authority.authority
         body = qualification.body
@@ -1459,7 +1786,9 @@ class FinalExecutionPrerequisites:
 
     @property
     def origin(self) -> str:
-        return _normalize_origin(self.qualification_evidence.evidence_origin)
+        return _normalize_origin(
+            _live_evidence_values(self.qualification_evidence)["evidence_origin"]
+        )
 
     @property
     def runtime_admissible(self) -> bool:
@@ -1567,10 +1896,11 @@ class _RunAuthorizationBase:
     nonce: str
     output_root_identity: str
     ownership_token: object = field(repr=False, compare=False)
+    owner: Any = field(repr=False, compare=False)
 
     def __init__(self, body: Mapping[str, Any], ownership_token: object, token: object,
-                 schema: str, expected_capability: str) -> None:
-        if token is not _RUN_AUTH_TOKEN or ownership_token is None:
+                 schema: str, expected_capability: str, owner: Any = None) -> None:
+        if token is not _RUN_AUTH_TOKEN or ownership_token is None or owner is None:
             raise TypeError("run authorizations are parent-minted")
         if not isinstance(body, Mapping) or "detached_artifact_sha256" in body:
             raise ProvenanceError("authority_digest_mismatch")
@@ -1597,6 +1927,7 @@ class _RunAuthorizationBase:
         object.__setattr__(self, "nonce", nonce)
         object.__setattr__(self, "output_root_identity", root)
         object.__setattr__(self, "ownership_token", ownership_token)
+        object.__setattr__(self, "owner", owner)
 
     def receipt(self) -> dict[str, Any]:
         return {**_deep_thaw(self.body), "detached_artifact_sha256": self.detached_artifact_sha256}
@@ -1651,11 +1982,29 @@ class _RunAuthorizationBase:
 
 @dataclass(frozen=True, slots=True, init=False)
 class K12QualificationRunAuthorization(_RunAuthorizationBase):
+    external_revision_authorization: ExternalRevisionAuthorization = field(
+        repr=False, compare=False
+    )
+
     def __init__(self, body: Mapping[str, Any], ownership_token: object,
-                 token: object = None) -> None:
+                 token: object = None,
+                 external_revision_authorization: ExternalRevisionAuthorization = None,
+                 owner: Any = None) -> None:
+        if not isinstance(external_revision_authorization, ExternalRevisionAuthorization):
+            raise TypeError("typed external revision authorization required")
         _RunAuthorizationBase.__init__(
             self, body, ownership_token, token, QUALIFICATION_RUN_AUTHORIZATION,
-            "qualification_execute",
+            "qualification_execute", owner,
+        )
+        if (external_revision_authorization.ownership_token is not ownership_token
+                or external_revision_authorization.owner is not owner
+                or _deep_thaw(self.body.get("external_revision_authorization"))
+                    != external_revision_authorization.receipt()
+                or self.body.get("external_revision_authorization_digest")
+                    != external_revision_authorization.identity):
+            raise ProvenanceError("authority_replay")
+        object.__setattr__(
+            self, "external_revision_authorization", external_revision_authorization
         )
         if self.evidence_origin not in {RUNTIME_VERIFIED_ORIGIN, INJECTED_TEST_ORIGIN}:
             raise ProvenanceError("authority_origin_mismatch")
@@ -1664,13 +2013,40 @@ class K12QualificationRunAuthorization(_RunAuthorizationBase):
     def profile_digest(self) -> str:
         return self.body.get("profile_digest", "")
 
+    @property
+    def revision_authorization(self) -> ExternalRevisionAuthorization:
+        return self.external_revision_authorization
+
+    def current_at(self, now: int) -> bool:
+        return (_RunAuthorizationBase.current_at(self, now)
+                and self.external_revision_authorization.current_at(now))
+
 
 @dataclass(frozen=True, slots=True, init=False)
 class K12FinalRunAuthorization(_RunAuthorizationBase):
+    external_revision_authorization: ExternalRevisionAuthorization = field(
+        repr=False, compare=False
+    )
+
     def __init__(self, body: Mapping[str, Any], ownership_token: object,
-                 token: object = None) -> None:
+                 token: object = None,
+                 external_revision_authorization: ExternalRevisionAuthorization = None,
+                 owner: Any = None) -> None:
+        if not isinstance(external_revision_authorization, ExternalRevisionAuthorization):
+            raise TypeError("typed external revision authorization required")
         _RunAuthorizationBase.__init__(
             self, body, ownership_token, token, FINAL_RUN_AUTHORIZATION, "final_execute",
+            owner,
+        )
+        if (external_revision_authorization.ownership_token is not ownership_token
+                or external_revision_authorization.owner is not owner
+                or _deep_thaw(self.body.get("external_revision_authorization"))
+                    != external_revision_authorization.receipt()
+                or self.body.get("external_revision_authorization_digest")
+                    != external_revision_authorization.identity):
+            raise ProvenanceError("authority_replay")
+        object.__setattr__(
+            self, "external_revision_authorization", external_revision_authorization
         )
         if self.evidence_origin not in AUTHORIZATION_ORIGINS:
             raise ProvenanceError("authority_origin_mismatch")
@@ -1678,6 +2054,14 @@ class K12FinalRunAuthorization(_RunAuthorizationBase):
     @property
     def profile_digest(self) -> str:
         return self.body.get("profile_digest", "")
+
+    @property
+    def revision_authorization(self) -> ExternalRevisionAuthorization:
+        return self.external_revision_authorization
+
+    def current_at(self, now: int) -> bool:
+        return (_RunAuthorizationBase.current_at(self, now)
+                and self.external_revision_authorization.current_at(now))
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -1702,6 +2086,11 @@ class QualificationExecutionAuthority:
         canonical["evidence_origin"] = _normalize_origin(canonical.get("evidence_origin"))
         if run_authorization.evidence_origin != canonical["evidence_origin"]:
             raise ProvenanceError("authority_origin_mismatch")
+        if (canonical.get("external_revision_authorization")
+                != run_authorization.external_revision_authorization.receipt()
+                or canonical.get("external_revision_authorization_digest")
+                != run_authorization.external_revision_authorization.identity):
+            raise ProvenanceError("authority_replay")
         detached = raw_sha256(canonical_bytes(canonical))
         object.__setattr__(self, "body", _deep_freeze(canonical))
         object.__setattr__(self, "detached_artifact_sha256", detached)
@@ -1769,7 +2158,12 @@ class QualificationExecutionAuthority:
                 and binding.namespace in {"live_qualification", "qualification_probe"})
 
     def refresh_pull_request(self, observation: PullRequestObservation, *, now: int) -> None:
-        observation.validate(expected_head=self.body["checkout"]["head_commit"], now=now)
+        if not isinstance(self.owner, ParentExecutionAuthority):
+            raise ProvenanceError("authority_replay")
+        now = self.owner._resolve_time(now)
+        observation.validate(
+            self.run_authorization.external_revision_authorization, now=now
+        )
         if tuple(observation.semantic_tuple()) != tuple(self.body["pull_request_semantic_tuple"]):
             raise ProvenanceError("pr_semantic_mismatch")
 
@@ -1811,6 +2205,11 @@ class FinalExecutionAuthority:
         canonical["evidence_origin"] = _normalize_origin(canonical.get("evidence_origin"))
         if run_authorization.evidence_origin != canonical["evidence_origin"]:
             raise ProvenanceError("authority_origin_mismatch")
+        if (canonical.get("external_revision_authorization")
+                != run_authorization.external_revision_authorization.receipt()
+                or canonical.get("external_revision_authorization_digest")
+                != run_authorization.external_revision_authorization.identity):
+            raise ProvenanceError("authority_replay")
         detached = raw_sha256(canonical_bytes(canonical))
         object.__setattr__(self, "body", _deep_freeze(canonical))
         object.__setattr__(self, "detached_artifact_sha256", detached)
@@ -1876,10 +2275,15 @@ class FinalExecutionAuthority:
                 and binding.reservation == self.body["reservation_id"])
 
     def refresh_pull_request(self, observation: PullRequestObservation, *, now: int) -> None:
+        if not isinstance(self.owner, ParentExecutionAuthority):
+            raise ProvenanceError("authority_replay")
+        now = self.owner._resolve_time(now)
         semantic = self.body.get("pull_request_semantic_tuple")
         if semantic is None:
             raise ProvenanceError("pr_observation_missing")
-        observation.validate(expected_head=semantic[6], now=now)
+        observation.validate(
+            self.run_authorization.external_revision_authorization, now=now
+        )
         if tuple(observation.semantic_tuple()) != tuple(semantic):
             raise ProvenanceError("pr_semantic_mismatch")
 
@@ -2048,68 +2452,41 @@ class ActiveFinalAuthority:
         self.authority.refresh_pull_request(observation, now=now)
 
 
-@runtime_checkable
-class LiveQualificationEvidence(Protocol):
-    """Protocol supplied by the later qualification scope.
-
-    The authority layer depends only on these public values, not on a future
-    aggregate module.  ``qualifies`` may be a method or ``passed`` may be a
-    boolean property; the validator accepts either form for aggregate-like
-    evidence while keeping operational provenance separate from origin.
-    """
-
-    profile_digest: str
-    authority_binding: AuthorityBinding
-
-
-# Stable spelling for the later qualification scope; both names refer to the
-# same structural protocol and neither imports its future aggregate module.
-K12LiveQualificationEvidence = LiveQualificationEvidence
-QualificationEvidenceProtocol = LiveQualificationEvidence
+LiveQualificationEvidence = QualificationEvidenceContract
+K12LiveQualificationEvidence = QualificationEvidenceContract
+QualificationEvidenceProtocol = QualificationEvidenceContract
 
 
 def _live_evidence_values(evidence: Any) -> dict[str, Any]:
-    # This is intentionally a nominal check.  A protocol or a namespace with
-    # the same attributes is not an authenticated qualification aggregate.
-    from .k12_live_qualification import (
-        LiveQualificationAggregate,
-        QualificationAggregateOwnershipReceipt,
-        QualificationTerminalEvidence,
-    )
-
-    if type(evidence) is not LiveQualificationAggregate:
+    # A structural namespace with the same fields is not an authenticated
+    # qualification aggregate.  The neutral contract performs the nominal and
+    # object-identity checks before this authority layer inspects semantics.
+    if not isinstance(evidence, QualificationEvidenceContract):
         raise ProvenanceError("final_prerequisite_mismatch")
     try:
-        origin = _normalize_origin(evidence.evidence_origin)
-        binding = evidence.authority_binding
-        passed = evidence.qualifies()
-        receipt = evidence.ownership_receipt
-        terminal = evidence.terminal_evidence
+        values = qualification_evidence_values(evidence)
+        origin = _normalize_origin(values["evidence_origin"])
+        binding = values["authority_binding"]
+        passed = values["passed"]
+        receipt = values["ownership_receipt"]
+        terminal = values["terminal_receipt"]
     except (AttributeError, KeyError, IndexError, TypeError, ValueError,
             ProvenanceError) as exc:
         raise ProvenanceError("final_prerequisite_mismatch") from exc
-    if (evidence.execution_provenance != "live_qualification"
+    if (values["execution_provenance"] != "live_qualification"
             or origin not in {RUNTIME_VERIFIED_ORIGIN, INJECTED_FAKE_ORIGIN}
             or passed is not True
+            or not bool(getattr(
+                values["controller"],
+                "owns_qualification_evidence",
+                lambda _evidence, _receipt: False,
+            )(evidence, receipt))
             or not isinstance(binding, AuthorityBinding)
             or binding.namespace != "live_qualification"):
         raise ProvenanceError("final_prerequisite_mismatch")
-    if (type(receipt) is not QualificationAggregateOwnershipReceipt
-            or type(terminal) is not QualificationTerminalEvidence):
+    if (not isinstance(receipt, QualificationEvidenceOwnershipReceipt)
+            or not isinstance(terminal, QualificationTerminalEvidenceContract)):
         raise ProvenanceError("final_prerequisite_mismatch")
-
-    values = {
-        "qualification_aggregate_digest": evidence.identity,
-        "probe_aggregate_digest": evidence.probes.identity,
-        "qualification_terminal_ledger_digest": terminal.ledger_digest,
-        "profile_digest": evidence.profile_digest,
-        "authority_binding": binding,
-        "evidence_origin": origin,
-        "authority": evidence.authority,
-        "controller": evidence.controller,
-        "ownership_receipt": receipt,
-        "terminal_receipt": terminal,
-    }
     for name in ("qualification_aggregate_digest", "probe_aggregate_digest",
                  "qualification_terminal_ledger_digest"):
         _require_canonical_digest(values[name], "final_prerequisite_mismatch")
@@ -2285,18 +2662,25 @@ class _TrustedClock:
 
     def now(self) -> int:
         if not self._injected:
-            return int(time.time())
+            observed = int(time.time())
+            with self._lock:
+                if observed < self._value:
+                    raise ProvenanceError("trusted_clock_rollback")
+                self._value = observed
+                return self._value
         with self._lock:
             return self._value
 
     def observe_explicit(self, value: int) -> int:
         if type(value) is not int:
             raise TypeError("integer trusted time is required")
-        if self._injected:
-            with self._lock:
-                if value > self._value:
-                    self._value = value
-        return value
+        if not self._injected:
+            return self.now()
+        with self._lock:
+            if value < self._value:
+                raise ProvenanceError("trusted_clock_rollback")
+            self._value = value
+            return self._value
 
     def advance(self, seconds: int) -> int:
         if type(seconds) is not int or seconds < 0:
@@ -2311,12 +2695,24 @@ class _TrustedClock:
 class ParentExecutionAuthority:
     """The only parent mint for run authorizations and live capabilities."""
 
-    def __init__(self, *, _origin: str = RUNTIME_VERIFIED_ORIGIN,
+    def __init__(self, *, revision_verifier_key: bytes | None = None,
+                 revision_verifier_identity: str | None = None,
+                 _origin: str = RUNTIME_VERIFIED_ORIGIN,
                  _owner: Any = None, _token: object = None) -> None:
         if _origin != RUNTIME_VERIFIED_ORIGIN and _token is not _INJECTED_CONTROLLER_TOKEN:
             raise TypeError("injected-test controller is parent-minted")
         if _origin not in {RUNTIME_VERIFIED_ORIGIN, INJECTED_TEST_ORIGIN}:
             raise ProvenanceError("authority_origin_mismatch")
+        if revision_verifier_key is not None:
+            if (type(revision_verifier_key) is not bytes
+                    or len(revision_verifier_key) < 32
+                    or not isinstance(revision_verifier_identity, str)
+                    or not revision_verifier_identity):
+                raise TypeError("external revision verifier capability is invalid")
+        elif revision_verifier_identity is not None:
+            raise TypeError("external revision verifier key is required")
+        if _origin != RUNTIME_VERIFIED_ORIGIN and revision_verifier_key is not None:
+            raise TypeError("injected controller cannot hold runtime verifier capability")
         self.__ownership_token = object()
         self.__qualification_mint_lock = threading.RLock()
         self.__final_mint_lock = threading.RLock()
@@ -2333,8 +2729,16 @@ class ParentExecutionAuthority:
         self.__leases: dict[int, K12RetainedTargetLease] = {}
         self.__source_closures: dict[int, SourceClosure] = {}
         self.__capsules: dict[int, Any] = {}
+        self.__external_revisions: dict[int, ExternalRevisionAuthorization] = {}
+        self.__external_revision_identities: set[str] = set()
+        self.__qualification_evidence_lock = threading.RLock()
+        self.__qualification_evidence_claims: dict[str, dict[str, Any]] = {}
+        self.__qualification_evidence: dict[int, tuple[Any, Any]] = {}
+        self.__qualification_evidence_by_authority: dict[str, int] = {}
         self.__origin = _origin
         self.__owner = _owner
+        self.__revision_verifier_key = revision_verifier_key
+        self.__revision_verifier_identity = revision_verifier_identity
         self.__trusted_clock = _TrustedClock(
             injected=_origin == INJECTED_TEST_ORIGIN,
         )
@@ -2392,6 +2796,116 @@ class ParentExecutionAuthority:
     def owns_capsule(self, capsule: Any) -> bool:
         return self.__capsules.get(id(capsule)) is capsule
 
+    def owns_external_revision(self, authorization: Any) -> bool:
+        return self.__external_revisions.get(id(authorization)) is authorization
+
+    def owns_qualification_evidence(self, evidence: Any, receipt: Any) -> bool:
+        with self.__qualification_evidence_lock:
+            pair = self.__qualification_evidence.get(id(evidence))
+            return pair is not None and pair[0] is evidence and pair[1] is receipt
+
+    def _preclaim_qualification_evidence(
+            self, evidence: Any, authority: Any, *, aggregate_identity: str,
+            probe_aggregate_digest: str, authority_binding: Any,
+            evidence_origin: str) -> None:
+        """Bind one exact, validated candidate before a passed terminal event."""
+
+        if (not isinstance(evidence, QualificationEvidenceContract)
+                or not is_canonical_qualification_evidence(evidence)):
+            raise TypeError("nominal qualification evidence is required")
+        if (not isinstance(authority, ActiveQualificationAuthority)
+                or authority.owner is not self
+                or not self.owns_authority(authority.authority)
+                or authority_binding != authority.binding
+                or not authority.owns(authority_binding)
+                or getattr(evidence, "identity", None) != aggregate_identity
+                or getattr(evidence, "authority", None) is not authority
+                or getattr(evidence, "authority_binding", None) != authority_binding
+                or getattr(evidence, "evidence_origin", None) != evidence_origin
+                or getattr(getattr(evidence, "probes", None), "identity", None)
+                    != probe_aggregate_digest):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        ledger = authority.authority.ledger
+        with self.__qualification_evidence_lock:
+            if (not _ledger_is(ledger, namespace="qualification", state="active",
+                               reservation=authority.reservation_id)
+                    or authority.identity in self.__qualification_evidence_claims
+                    or authority.identity in self.__qualification_evidence_by_authority):
+                raise ProvenanceError("authority_replay")
+            self.__qualification_evidence_claims[authority.identity] = {
+                "evidence": evidence,
+                "authority": authority,
+                "ledger": ledger,
+                "aggregate_identity": aggregate_identity,
+                "probe_aggregate_digest": probe_aggregate_digest,
+                "authority_binding": authority_binding,
+                "evidence_origin": evidence_origin,
+                "state": "claimed",
+            }
+
+    def _abandon_qualification_evidence(self, evidence: Any, authority: Any) -> None:
+        """Burn a failed preclaim; it can never be replaced for this authority."""
+
+        with self.__qualification_evidence_lock:
+            claim = self.__qualification_evidence_claims.get(
+                getattr(authority, "identity", "")
+            )
+            if claim is not None and claim["evidence"] is evidence:
+                claim["state"] = "abandoned"
+
+    def _fulfill_qualification_evidence(self, evidence: Any, receipt: Any) -> None:
+        """Consume the exact preclaim after its parent terminal event exists."""
+
+        if (not isinstance(evidence, QualificationEvidenceContract)
+                or not isinstance(receipt, QualificationEvidenceOwnershipReceipt)):
+            raise TypeError("typed qualification evidence receipt required")
+        projection = getattr(receipt, "projection", None)
+        authority = getattr(projection, "authority", None)
+        terminal = getattr(projection, "terminal_evidence", None)
+        with self.__qualification_evidence_lock:
+            claim = self.__qualification_evidence_claims.get(
+                getattr(authority, "identity", "")
+            )
+            if (claim is None or claim["state"] != "published"
+                    or claim["evidence"] is not evidence
+                    or claim["authority"] is not authority):
+                raise ProvenanceError("authority_replay")
+            if (not isinstance(projection, QualificationEvidenceProjection)
+                    or not isinstance(terminal, QualificationTerminalEvidenceContract)
+                    or projection.aggregate is not evidence
+                    or receipt.aggregate is not evidence
+                    or receipt.controller is not self
+                    or projection.controller is not self
+                    or evidence.qualification_projection is not projection
+                    or evidence.ownership_receipt is not receipt
+                    or projection.aggregate_identity != claim["aggregate_identity"]
+                    or projection.probe_aggregate_digest
+                        != claim["probe_aggregate_digest"]
+                    or projection.authority_binding != claim["authority_binding"]
+                    or projection.evidence_origin != claim["evidence_origin"]
+                    or projection.passed is not True):
+                raise ProvenanceError("final_prerequisite_mismatch")
+            ledger = claim["ledger"]
+            events = getattr(ledger, "events", ())
+            payload = dict(events[-1].payload) if events else {}
+            if (not _ledger_is(ledger, namespace="qualification", state="terminal",
+                               reservation=authority.reservation_id)
+                    or not events
+                    or payload.get("result") != "passed"
+                    or payload.get("terminal_verified") is not True
+                    or payload.get("authority_digest") != authority.identity
+                    or payload.get("qualification_aggregate_digest")
+                        != claim["aggregate_identity"]
+                    or payload.get("probe_aggregate_digest")
+                        != claim["probe_aggregate_digest"]
+                    or payload.get("evidence_origin") != claim["evidence_origin"]
+                    or getattr(terminal, "ledger_digest", None)
+                        != getattr(ledger, "head_digest", None)):
+                raise ProvenanceError("final_prerequisite_mismatch")
+            self.__qualification_evidence[id(evidence)] = (evidence, receipt)
+            self.__qualification_evidence_by_authority[authority.identity] = id(evidence)
+            claim["state"] = "consumed"
+
     def lifecycle_for(self, ledger: Any) -> tuple[str, str]:
         if not self.owns_ledger(ledger):
             raise ProvenanceError("authority_replay")
@@ -2415,8 +2929,14 @@ class ParentExecutionAuthority:
             return False
         issued_at = authority.body.get("issued_at")
         expires_at = authority.body.get("expires_at")
-        return (type(issued_at) is int and type(expires_at) is int
-                and issued_at <= now <= expires_at)
+        if (type(issued_at) is not int or type(expires_at) is not int
+                or not issued_at <= now <= expires_at):
+            return False
+        run_authorization = getattr(authority, "run_authorization", None)
+        if isinstance(run_authorization, (K12QualificationRunAuthorization,
+                                          K12FinalRunAuthorization)):
+            return run_authorization.current_at(now)
+        return True
 
     def advance_trusted_time(self, seconds: int = 1) -> int:
         """Advance only an injected controller's deterministic trusted clock."""
@@ -2494,7 +3014,26 @@ class ParentExecutionAuthority:
         return self._ledger_controller(ledger).activate(authority_digest)
 
     def ledger_terminal(self, ledger: Any, payload: Mapping[str, Any]) -> str:
-        return self._ledger_controller(ledger).terminal(payload)
+        terminal_payload = dict(payload)
+        if (getattr(ledger, "namespace", None) == "qualification"
+                and terminal_payload.get("result") == "passed"):
+            authority_identity = terminal_payload.get("authority_digest")
+            with self.__qualification_evidence_lock:
+                claim = self.__qualification_evidence_claims.get(authority_identity)
+                if (claim is None or claim["state"] != "claimed"
+                        or claim["ledger"] is not ledger
+                        or terminal_payload.get("qualification_aggregate_digest")
+                            != claim["aggregate_identity"]
+                        or terminal_payload.get("probe_aggregate_digest")
+                            != claim["probe_aggregate_digest"]
+                        or terminal_payload.get("evidence_origin")
+                            != claim["evidence_origin"]
+                        or terminal_payload.get("terminal_verified") is not True):
+                    raise ProvenanceError("final_prerequisite_mismatch")
+                digest = self._ledger_controller(ledger).terminal(terminal_payload)
+                claim["state"] = "published"
+                return digest
+        return self._ledger_controller(ledger).terminal(terminal_payload)
 
     def quarantine_ledger(self, ledger: Any, payload: Mapping[str, Any]) -> str:
         return self._ledger_controller(ledger).quarantine(payload)
@@ -2514,6 +3053,7 @@ class ParentExecutionAuthority:
             self, root: str | Path | None = None, policy: Any = None, *,
             trusted_root: str | Path | None = None,
             checkout: CheckoutObservation | None = None,
+            revision_authorization: ExternalRevisionAuthorization | None = None,
             injected_only: bool = False,
     ) -> SourceClosure:
         """Collect policy source bytes through parent-owned file descriptors.
@@ -2533,6 +3073,8 @@ class ParentExecutionAuthority:
             tree = None
             head_commit = head_tree = ""
         else:
+            if not isinstance(checkout, CheckoutObservation):
+                raise TypeError("typed checkout observation required")
             tree = _authenticated_git_tree(root, checkout, policy)
             head_commit = checkout.head_commit
             head_tree = checkout.head_tree
@@ -2544,17 +3086,121 @@ class ParentExecutionAuthority:
             marker=self.__ownership_token,
             origin=collection_origin,
             owner=self,
+            revision_authorization=revision_authorization,
             head_commit=head_commit,
             head_tree=head_tree,
         )
         self.__source_closures[id(closure)] = closure
         return closure
 
+    def mint_external_revision_authorization(
+        self,
+        checkout: CheckoutObservation,
+        pull_request: PullRequestObservation,
+        *,
+        verifier_identity: str | None = None,
+        verifier_receipt_digest: str | None = None,
+        now: int | None = None,
+        expires_at: int | None = None,
+        origin: str | None = None,
+    ) -> ExternalRevisionAuthorization:
+        """Mint a parent-owned authorization for the observed external tuple."""
+
+        if not isinstance(checkout, CheckoutObservation):
+            raise TypeError("typed checkout observation required")
+        if not isinstance(pull_request, PullRequestObservation):
+            raise TypeError("typed pull-request observation required")
+        now = self._resolve_time(now)
+        checkout.validate_structure()
+        pull_request.validate_structure(now=now)
+        if (checkout.symbolic_head_ref != checkout.upstream_ref
+                or checkout.symbolic_head_ref != checkout.remote_ref
+                or checkout.repository_identity != checkout.remote_repository
+                or checkout.head_commit != checkout.upstream_commit
+                or checkout.head_commit != checkout.remote_commit
+                or checkout.index_tree != checkout.head_tree):
+            raise ProvenanceError("git_head_mismatch")
+        if (pull_request.repository != checkout.repository_identity
+                or pull_request.head_repository != checkout.repository_identity
+                or pull_request.head_ref
+                    != checkout.symbolic_head_ref.removeprefix("refs/heads/")
+                or pull_request.head_sha != checkout.head_commit):
+            raise ProvenanceError("pr_semantic_mismatch")
+        selected_origin = _normalize_origin(self.origin if origin is None else origin)
+        if selected_origin != self.origin:
+            raise ProvenanceError("authority_origin_mismatch")
+        if verifier_identity is None:
+            verifier_identity = (
+                self.__revision_verifier_identity
+                or "injected-external-revision-verifier/1"
+            )
+        if expires_at is None:
+            expires_at = now + MAX_PR_AGE_SECONDS
+        if type(expires_at) is not int or expires_at < now:
+            raise ProvenanceError("pr_observation_stale")
+        payload = external_revision_attestation_payload(
+            checkout,
+            pull_request,
+            expires_at=expires_at,
+            origin=selected_origin,
+            verifier_identity=verifier_identity,
+        )
+        if self.origin == RUNTIME_VERIFIED_ORIGIN:
+            if (self.__revision_verifier_key is None
+                    or verifier_identity != self.__revision_verifier_identity
+                    or not isinstance(verifier_receipt_digest, str)):
+                raise TypeError("externally verified revision receipt is required")
+            expected_receipt = hmac.new(
+                self.__revision_verifier_key, payload, hashlib.sha256,
+            ).hexdigest()
+            if not hmac.compare_digest(expected_receipt, verifier_receipt_digest):
+                raise ProvenanceError("pr_observation_missing")
+        else:
+            if verifier_receipt_digest is not None:
+                raise TypeError("injected revision authorization cannot claim runtime receipt")
+            verifier_receipt_digest = raw_sha256(payload)
+        authorization = ExternalRevisionAuthorization(
+            repository=checkout.repository_identity,
+            branch=checkout.symbolic_head_ref,
+            head_commit=checkout.head_commit,
+            head_tree=checkout.head_tree,
+            pull_request=pull_request.number,
+            pull_request_semantic_tuple=pull_request.semantic_tuple(),
+            base_ref=pull_request.base_ref,
+            base_sha=pull_request.base_sha,
+            issued_at=now,
+            expires_at=expires_at,
+            origin=selected_origin,
+            verifier_identity=verifier_identity,
+            pull_request_observed_at=pull_request.observed_at,
+            pull_request_observer=pull_request.observer,
+            pull_request_receipt_digest=pull_request.receipt_digest,
+            verifier_receipt_digest=verifier_receipt_digest,
+            ownership_token=self.__ownership_token,
+            owner=self,
+            token=_REVISION_AUTH_TOKEN,
+        )
+        if not authorization.matches_pull_request(pull_request, now=now):
+            raise ProvenanceError("pr_semantic_mismatch")
+        with self.__run_auth_lock:
+            if authorization.identity in self.__external_revision_identities:
+                raise ProvenanceError("authority_replay")
+            self.__external_revisions[id(authorization)] = authorization
+            self.__external_revision_identities.add(authorization.identity)
+        return authorization
+
+    authorize_external_revision = mint_external_revision_authorization
+    issue_external_revision_authorization = mint_external_revision_authorization
+    mint_revision_authorization = mint_external_revision_authorization
+    mint_external_revision = mint_external_revision_authorization
+
     def mint_qualification_run_authorization(
         self, preflight: QualificationPreflight | None = None, *,
         reservation_id: str | None = None, output_root_identity: str = "",
         nonce: str | None = None, profile_digest: str = "",
          profile_identity: str = PROFILE_V2, evidence_origin: str | None = None,
+         external_revision_authorization: ExternalRevisionAuthorization | None = None,
+         revision_authorization: ExternalRevisionAuthorization | None = None,
          now: int | None = None, ledger: Any = None,
     ) -> K12QualificationRunAuthorization:
         now = self._resolve_time(now)
@@ -2572,9 +3218,25 @@ class ParentExecutionAuthority:
                 raise ProvenanceError("authority_replay")
             if profile_digest and profile_digest != preflight.profile_digest:
                 raise ProvenanceError("authority_replay")
+            if (external_revision_authorization is not None
+                    and external_revision_authorization
+                    is not preflight.external_revision_authorization):
+                raise ProvenanceError("authority_replay")
+            external_revision_authorization = preflight.external_revision_authorization
             reservation_id = preflight.reservation_id
             output_root_identity = preflight.output.root_identity
             profile_digest = profile_digest or preflight.profile_digest
+        if (external_revision_authorization is not None
+                and revision_authorization is not None
+                and external_revision_authorization is not revision_authorization):
+            raise ProvenanceError("authority_replay")
+        external_revision_authorization = (
+            external_revision_authorization or revision_authorization
+        )
+        if (not isinstance(external_revision_authorization, ExternalRevisionAuthorization)
+                or not external_revision_authorization.owned_by(self)
+                or external_revision_authorization.origin != requested_origin):
+            raise TypeError("parent-owned external revision authorization required")
         if reservation_id is None:
             raise TypeError("reservation identity is required")
         if type(now) is not int:
@@ -2601,6 +3263,8 @@ class ParentExecutionAuthority:
             except Exception:
                 profile_digest = ""
         _require_sha256(profile_digest, "profile_mismatch")
+        if not external_revision_authorization.current_at(now):
+            raise ProvenanceError("pr_observation_stale")
         body = {
             "artifact_id": "minecraft-k12-live-qualification-run-authorization",
             "artifact_version": 1,
@@ -2614,11 +3278,19 @@ class ParentExecutionAuthority:
             "capabilities": ["qualification_execute"],
             "evidence_origin": requested_origin,
             "issued_at": now,
+            "expires_at": min(
+                now + MAX_PR_AGE_SECONDS,
+                external_revision_authorization.expires_at,
+            ),
+            "external_revision_authorization": external_revision_authorization.receipt(),
+            "external_revision_authorization_digest": external_revision_authorization.identity,
         }
         if ledger_snapshot is not None:
             body["ledger"] = dict(ledger_snapshot)
         auth = K12QualificationRunAuthorization(
             body, self.__ownership_token, _RUN_AUTH_TOKEN,
+            external_revision_authorization=external_revision_authorization,
+            owner=self,
         )
         with self.__run_auth_lock:
             if auth.identity in self.__run_auths:
@@ -2634,7 +3306,8 @@ class ParentExecutionAuthority:
     def mint_final_run_authorization(
         self, *, reservation_id: str, output_root_identity: str,
         nonce: str | None = None, profile_digest: str, qualification_authority_digest: str,
-         evidence_origin: str | None = None, now: int | None = None, ledger: Any = None,
+        evidence_origin: str | None = None, now: int | None = None, ledger: Any = None,
+        external_revision_authorization: ExternalRevisionAuthorization | None = None,
     ) -> K12FinalRunAuthorization:
         now = self._resolve_time(now)
         requested_origin = _normalize_origin(
@@ -2651,6 +3324,11 @@ class ParentExecutionAuthority:
             qualification_authority_digest, "authority_replay",
         )
         _require_sha256(profile_digest, "profile_mismatch")
+        if (not isinstance(external_revision_authorization, ExternalRevisionAuthorization)
+                or not external_revision_authorization.owned_by(self)
+                or external_revision_authorization.origin != self.origin
+                or not external_revision_authorization.current_at(now)):
+            raise ProvenanceError("authority_replay")
         supplied_nonce = nonce
         nonce = nonce or secrets.token_hex(32)
         ledger_snapshot: Mapping[str, Any] | None = None
@@ -2679,10 +3357,16 @@ class ParentExecutionAuthority:
             "capabilities": ["final_execute"],
             "evidence_origin": requested_origin,
             "issued_at": now,
+            "external_revision_authorization": external_revision_authorization.receipt(),
+            "external_revision_authorization_digest": external_revision_authorization.identity,
         }
         if ledger_snapshot is not None:
             body["ledger"] = dict(ledger_snapshot)
-        auth = K12FinalRunAuthorization(body, self.__ownership_token, _RUN_AUTH_TOKEN)
+        auth = K12FinalRunAuthorization(
+            body, self.__ownership_token, _RUN_AUTH_TOKEN,
+            external_revision_authorization=external_revision_authorization,
+            owner=self,
+        )
         with self.__run_auth_lock:
             if auth.identity in self.__run_auths:
                 raise ProvenanceError("authority_replay")
@@ -2710,7 +3394,10 @@ class ParentExecutionAuthority:
         if not isinstance(auth, K12QualificationRunAuthorization):
             raise TypeError("typed qualification run authorization required")
         if (auth.ownership_token is not self.__ownership_token
+                or auth.owner is not self
                 or auth.evidence_origin != self.origin
+                or not auth.external_revision_authorization.owned_by(self)
+                or auth.external_revision_authorization.origin != self.origin
                 or auth.reservation_id != ledger.reservation_id
                 or auth.output_root_identity != ledger.output_root_identity
                 or auth.nonce != ledger.nonce):
@@ -2733,6 +3420,11 @@ class ParentExecutionAuthority:
                 or not preflight.source.owned_by(self)
                 or preflight.source.origin != self.origin):
             raise ProvenanceError("source_closure_incomplete")
+        if (not isinstance(preflight.external_revision_authorization,
+                           ExternalRevisionAuthorization)
+                or not preflight.external_revision_authorization.owned_by(self)
+                or preflight.external_revision_authorization.origin != self.origin):
+            raise ProvenanceError("authority_replay")
         if not preflight.capsule.owned_by(self):
             raise ProvenanceError("capsule_mismatch")
         if (not isinstance(preflight.target_lease, K12RetainedTargetLease)
@@ -2783,6 +3475,12 @@ class ParentExecutionAuthority:
             "reservation_id": preflight.reservation_id,
             "run_authorization_digest": run_auth.identity,
             "run_authorization": run_auth.receipt(),
+            "external_revision_authorization": (
+                preflight.external_revision_authorization.receipt()
+            ),
+            "external_revision_authorization_digest": (
+                preflight.external_revision_authorization.identity
+            ),
             "capabilities": list(run_auth.capabilities),
             "evidence_origin": run_auth.evidence_origin,
             "checkout": preflight.checkout.canonical(),
@@ -2997,6 +3695,10 @@ class ParentExecutionAuthority:
             qualification_authority_digest=qualification_execution.identity,
             evidence_origin=final_origin,
             ledger=final_ledger, now=now,
+            external_revision_authorization=(
+                qualification_execution.run_authorization
+                .external_revision_authorization
+            ),
         )
         if final_run.identity == qualification_execution.run_authorization.identity:
             raise ProvenanceError("authority_replay")
@@ -3032,6 +3734,14 @@ class ParentExecutionAuthority:
             "capsule_digest": prerequisites.capsule_digest,
             "pull_request_semantic_tuple": list(
                 qualification_execution.body["pull_request_semantic_tuple"]),
+            "external_revision_authorization": (
+                qualification_execution.run_authorization
+                .external_revision_authorization.receipt()
+            ),
+            "external_revision_authorization_digest": (
+                qualification_execution.run_authorization
+                .external_revision_authorization.identity
+            ),
             "ledger": {
                 "identity": final_snapshot["identity"],
                 "root": final_snapshot["root"],
@@ -3157,36 +3867,6 @@ def _replace_preflight(value: QualificationPreflight, **changes: Any) -> Qualifi
     return QualificationPreflight(**values)
 
 
-class _AggregatePairEvidence:
-    execution_provenance = "live_qualification"
-
-    def __init__(self, qualification: Any, probe: Any,
-                 authority: QualificationExecutionAuthority) -> None:
-        self.qualification_aggregate = qualification
-        self.probe_aggregate = probe
-        self.profile_digest = getattr(qualification, "profile_digest", "")
-        self.authority_binding = getattr(qualification, "authority_binding", authority.binding())
-        self.evidence_origin = getattr(
-            qualification, "evidence_origin",
-            getattr(qualification, "origin", RUNTIME_VERIFIED_ORIGIN),
-        )
-        self.authority = getattr(qualification, "authority", None)
-        self.controller = getattr(qualification, "controller", None)
-        self.qualification_aggregate_digest = getattr(qualification, "identity", "")
-        self.probe_aggregate_digest = getattr(probe, "identity", "")
-        self.qualification_terminal_ledger_digest = getattr(
-            qualification, "qualification_terminal_ledger_digest", "")
-        self.passed = getattr(qualification, "passed", False) and getattr(probe, "passed", False)
-
-    def qualifies(self) -> bool:
-        return self.passed is True
-
-
-def _aggregate_pair_evidence(qualification: Any, probe: Any,
-                             authority: QualificationExecutionAuthority) -> Any:
-    return _AggregatePairEvidence(qualification, probe, authority)
-
-
 def _verify_qualification_first_consume(
         authority: QualificationExecutionAuthority, observation: FirstConsumeObservation,
         *, now: int, ledger: Any, activate: bool) -> Any:
@@ -3197,6 +3877,8 @@ def _verify_qualification_first_consume(
     bound = _deep_thaw(authority.body)
     reservation_id = bound["reservation_id"]
     owner = authority.owner
+    if isinstance(owner, ParentExecutionAuthority):
+        now = owner._resolve_time(now)
     try:
         current_ledger = durable_ledger_snapshot(ledger)
         bound_ledger = bound["ledger"]
@@ -3217,10 +3899,17 @@ def _verify_qualification_first_consume(
                 or bound.get("run_authorization")
                     != authority.run_authorization.receipt()):
             raise ProvenanceError("authority_replay")
-        observation.checkout.validate(bound["checkout"]["head_commit"])
+        revision_authorization = authority.run_authorization.external_revision_authorization
+        if (not revision_authorization.owned_by(owner)
+                or bound.get("external_revision_authorization")
+                    != revision_authorization.receipt()
+                or bound.get("external_revision_authorization_digest")
+                    != revision_authorization.identity):
+            raise ProvenanceError("authority_replay")
+        observation.checkout.validate(revision_authorization)
         if observation.checkout.canonical() != bound["checkout"]:
             raise ProvenanceError("first_consume_mismatch")
-        observation.pull_request.validate(expected_head=bound["checkout"]["head_commit"], now=now)
+        observation.pull_request.validate(revision_authorization, now=now)
         if tuple(observation.pull_request.semantic_tuple()) \
                 != tuple(bound["pull_request_semantic_tuple"]):
             raise ProvenanceError("pr_semantic_mismatch")
@@ -3236,6 +3925,8 @@ def _verify_qualification_first_consume(
                 or not observation.source.owned_by(owner)
                 or observation.source.canonical() != bound["source_closure"]):
             raise ProvenanceError("first_consume_mismatch")
+        if not revision_authorization.matches_source(observation.source):
+            raise ProvenanceError("git_tree_mismatch")
         if observation.environment.canonical() != bound["environment"]:
             raise ProvenanceError("first_consume_mismatch")
         if observation.target.canonical() != bound["target"]:
@@ -3311,6 +4002,8 @@ def verify_final_first_consume(
         raise TypeError("typed final first-consume observation required")
     bound = _deep_thaw(authority.body)
     owner = authority.owner
+    if isinstance(owner, ParentExecutionAuthority):
+        now = owner._resolve_time(now)
     try:
         current_ledger = durable_ledger_snapshot(ledger)
         bound_ledger = bound["ledger"]
@@ -3371,7 +4064,17 @@ def verify_final_first_consume(
                     observation.prerequisites.qualification_evidence
                 )):
             raise ProvenanceError("final_prerequisite_mismatch")
-        observation.checkout.validate(expected_head=bound["checkout"]["head_commit"])
+        revision_authorization = (
+            values["authority"].authority.run_authorization
+            .external_revision_authorization
+        )
+        if (not revision_authorization.owned_by(values["controller"])
+                or bound.get("external_revision_authorization")
+                    != revision_authorization.receipt()
+                or bound.get("external_revision_authorization_digest")
+                    != revision_authorization.identity):
+            raise ProvenanceError("first_consume_mismatch")
+        observation.checkout.validate(revision_authorization)
         if observation.checkout.canonical() != bound["checkout"]:
             raise ProvenanceError("first_consume_mismatch")
         if (observation.source.origin != values["authority"].origin
@@ -3380,6 +4083,8 @@ def verify_final_first_consume(
             raise ProvenanceError("first_consume_mismatch")
         if observation.source.aggregate_sha256 != bound["source_closure"]["aggregate_sha256"]:
             raise ProvenanceError("first_consume_mismatch")
+        if not revision_authorization.matches_source(observation.source):
+            raise ProvenanceError("git_tree_mismatch")
         observation.environment.validate()
         if observation.environment.canonical() != bound["environment"]:
             raise ProvenanceError("first_consume_mismatch")
@@ -3396,7 +4101,7 @@ def verify_final_first_consume(
         observation.output.validate()
         if observation.output.canonical() != bound["output"]:
             raise ProvenanceError("first_consume_mismatch")
-        observation.pull_request.validate(expected_head=bound["checkout"]["head_commit"], now=now)
+        observation.pull_request.validate(revision_authorization, now=now)
         if tuple(observation.pull_request.semantic_tuple()) \
                 != tuple(bound["pull_request_semantic_tuple"]):
             raise ProvenanceError("pr_semantic_mismatch")
@@ -3444,8 +4149,8 @@ __all__ = [
     "ActiveFinalAuthority", "ActiveQualificationAuthority", "AuthorityBinding",
     "AUTHORIZATION_ORIGINS", "INJECTED_FAKE_ORIGIN", "INJECTED_TEST_ORIGIN",
     "LIVE_FINAL_NAMESPACE", "LIVE_QUALIFICATION_NAMESPACE", "QUALIFICATION_PROBE_NAMESPACE",
-    "CheckoutObservation", "EXPECTED_BASE_REF", "EXPECTED_BASE_SHA", "EXPECTED_BRANCH",
-    "EXPECTED_HEAD", "EXPECTED_PR", "EXPECTED_REPOSITORY", "FINAL_AUTHORITY",
+    "CheckoutObservation", "ExternalRevisionAuthorization",
+    "external_revision_attestation_payload", "FINAL_AUTHORITY",
     "FINAL_RUN_AUTHORIZATION", "FinalExecutionAuthority", "FinalExecutionPrerequisites",
     "FinalFirstConsumeObservation",
     "FirstConsumeObservation", "K12FinalRunAuthorization", "K12QualificationRunAuthorization",

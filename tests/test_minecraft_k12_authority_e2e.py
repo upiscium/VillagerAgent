@@ -10,11 +10,6 @@ import pytest
 from benchmarks.common.eac.canonical import canonical_bytes, canonical_sha256
 from benchmarks.minecraft.k12_execution_capsule import CapsuleRecord, attest_capsule
 from benchmarks.minecraft.k12_execution_provenance import (
-    EXPECTED_BASE_REF,
-    EXPECTED_BASE_SHA,
-    EXPECTED_BRANCH,
-    EXPECTED_HEAD,
-    EXPECTED_PR,
     INJECTED_FAKE_ORIGIN,
     INJECTED_TEST_ORIGIN,
     MAX_PR_AGE_SECONDS,
@@ -97,6 +92,12 @@ PROFILE = load_k12_live_runtime_profile()
 POLICY = load_k12_live_source_policy()
 _DIGEST = "b" * 64
 _TREE = "c" * 40
+_REPOSITORY = "example/VillagerAgent"
+_BRANCH = "refs/heads/experiment/k12-arbitrary"
+_HEAD = "a" * 40
+_BASE_REF = "main"
+_BASE_SHA = "d" * 40
+_PR_NUMBER = 580
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -109,11 +110,8 @@ def _nonce(label: str, namespace: str) -> str:
 
 
 def _source_closure(controller):
-    return controller.collect_source_closure(
-        root=_SOURCE_ROOT,
-        policy=POLICY,
-        injected_only=True,
-    )
+    return controller.collect_source_closure(root=_SOURCE_ROOT, policy=POLICY,
+                                             injected_only=True)
 
 
 def _capsule(controller, source):
@@ -160,19 +158,19 @@ def _capsule(controller, source):
 
 def _checkout():
     return CheckoutObservation(
-        repository_identity="upiscium/VillagerAgent",
+        repository_identity=_REPOSITORY,
         worktree_identity=_DIGEST,
         git_dir_identity=_DIGEST,
         common_dir_identity=_DIGEST,
-        symbolic_head_ref=EXPECTED_BRANCH,
-        head_commit=EXPECTED_HEAD,
+        symbolic_head_ref=_BRANCH,
+        head_commit=_HEAD,
         head_tree=_TREE,
         index_tree=_TREE,
-        upstream_ref=EXPECTED_BRANCH,
-        upstream_commit=EXPECTED_HEAD,
-        remote_repository="upiscium/VillagerAgent",
-        remote_ref=EXPECTED_BRANCH,
-        remote_commit=EXPECTED_HEAD,
+        upstream_ref=_BRANCH,
+        upstream_commit=_HEAD,
+        remote_repository=_REPOSITORY,
+        remote_ref=_BRANCH,
+        remote_commit=_HEAD,
         staged_clean=True,
         tracked_clean=True,
         untracked_clean=True,
@@ -182,15 +180,15 @@ def _checkout():
 
 def _pull_request():
     return PullRequestObservation(
-        "upiscium/VillagerAgent",
-        EXPECTED_PR,
+        _REPOSITORY,
+        _PR_NUMBER,
         "OPEN",
         True,
-        "upiscium/VillagerAgent",
-        EXPECTED_BRANCH.removeprefix("refs/heads/"),
-        EXPECTED_HEAD,
-        EXPECTED_BASE_REF,
-        EXPECTED_BASE_SHA,
+        _REPOSITORY,
+        _BRANCH.removeprefix("refs/heads/"),
+        _HEAD,
+        _BASE_REF,
+        _BASE_SHA,
         100,
         "observer/1",
         _DIGEST,
@@ -249,20 +247,29 @@ def _preflight(
     ledger: Any,
     lease: K12RetainedTargetLease,
 ) -> QualificationPreflight:
-    source = _source_closure(controller)
+    checkout = _checkout()
+    pull_request = _pull_request()
+    revision = controller.mint_external_revision_authorization(
+        checkout, pull_request, verifier_identity="e2e-verifier/1", now=100,
+    )
+    source = controller.collect_source_closure(
+        root=_SOURCE_ROOT, policy=POLICY, injected_only=True,
+        revision_authorization=revision,
+    )
     run_authorization = controller.mint_qualification_run_authorization(
         reservation_id=ledger.reservation_id,
         output_root_identity=ledger.output_root_identity,
         profile_digest=PROFILE.profile_digest,
         ledger=ledger,
         now=100,
+        external_revision_authorization=revision,
     )
     return QualificationPreflight(
         reservation_id=ledger.reservation_id,
         run_authorization_digest=run_authorization.identity,
-        expected_head=EXPECTED_HEAD,
-        checkout=_checkout(),
-        pull_request=_pull_request(),
+        external_revision_authorization=revision,
+        checkout=checkout,
+        pull_request=pull_request,
         source=source,
         capsule=_capsule(controller, source),
         authenticated_profile=PROFILE,

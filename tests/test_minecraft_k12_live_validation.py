@@ -426,8 +426,11 @@ def test_injected_controller_mints_typed_final_scope_but_not_runtime_scope(tmp_p
 
 def test_runtime_qualification_rejects_injected_source_closure(tmp_path):
     helpers = pytest.importorskip("test_minecraft_k12_execution_provenance")
-    profile = helpers.PROFILE
-    parent = ParentExecutionAuthority()
+    verifier_key = b"k" * 32
+    parent = ParentExecutionAuthority(
+        revision_verifier_key=verifier_key,
+        revision_verifier_identity="test-verifier/1",
+    )
     root = tmp_path / "runtime-qualification"
     root.mkdir(mode=0o700)
     ledger = parent.create_ledger(
@@ -436,10 +439,12 @@ def test_runtime_qualification_rejects_injected_source_closure(tmp_path):
         reservation_id="a" * 64,
         output_root_identity="qualification-output",
     )
+    preflight = helpers._preflight(
+        parent, ledger, revision_verifier_key=verifier_key,
+    )
     try:
-        preflight = helpers._preflight(parent, ledger)
         with pytest.raises(ProvenanceError, match="source_closure_incomplete"):
-            parent.mint_qualification(preflight, now=101, ledger=ledger)
+            parent.mint_qualification(preflight, ledger=ledger)
         assert ledger.state == "quarantined"
     finally:
         preflight.target_lease.lock.release()
