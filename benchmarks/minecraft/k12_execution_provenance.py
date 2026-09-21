@@ -24,7 +24,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any
@@ -32,11 +32,23 @@ from typing import Any
 from benchmarks.common.eac.canonical import canonical_bytes, canonical_sha256
 from .k12_authority_contracts import (
     QualificationEvidenceContract,
-    QualificationEvidenceOwnershipReceipt,
-    QualificationEvidenceProjection,
-    QualificationTerminalEvidenceContract,
-    is_canonical_qualification_evidence,
-    qualification_evidence_values,
+)
+from .k12_qualification_semantics import (
+    NormalizedCell,
+    NormalizedProbe,
+    NormalizedRejectionBinding,
+    NormalizedTerminal,
+    QualificationCensus,
+    QualificationVerdict,
+    QUALIFICATION_PROBE_IDENTITY,
+    QUALIFICATION_SCHEDULE,
+    QUALIFICATION_SCHEDULE_DIGEST,
+    QUALIFICATION_SCHEDULE_IDENTITY,
+    PROBES as QUALIFICATION_PROBES,
+    PROBE_SCHEDULE_DIGEST,
+    SEMANTIC_VERIFIER_IDENTITY,
+    verify_qualification,
+    verify_qualification_projection,
 )
 
 
@@ -1556,8 +1568,10 @@ class QualificationPreflight:
                        for name, value in self.contracts.items())):
             raise ProvenanceError("contract_mismatch")
         if (dict(self.contracts) != dict(self.authenticated_profile["contract_digests"])
-                or self.schedule_digest != raw_sha256(canonical_bytes(
-                    list(self.authenticated_profile["schedule"])) )):
+                or tuple(self.authenticated_profile["schedule"])
+                    != QUALIFICATION_SCHEDULE
+                or self.schedule_digest
+                    != QUALIFICATION_SCHEDULE_DIGEST.removeprefix("sha256:")):
             raise ProvenanceError("contract_mismatch")
         if (self.source.policy_identity != self.authenticated_profile["source_policy_identity"]
                 or self.source.policy_digest != self.authenticated_profile["source_policy_digest"]
@@ -1684,11 +1698,150 @@ class FirstConsumeObservation:
         return result
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class QualificationSemanticAttestation:
+    """Parent-owned proof of the frozen 15-cell plus P1--P4 semantics.
+
+    Construction secrecy is not an authorization boundary.  Consumers must
+    additionally ask the parent whether it owns this exact object and whether
+    its body still matches the parent's immutable terminal registry.
+    """
+
+    qualification_authority_digest: str
+    activation_digest: str
+    reservation_id: str
+    ledger_root_digest: str
+    namespace: str
+    evidence_origin: str
+    schedule_identity: str
+    schedule_digest: str
+    probe_identity: str
+    probe_schedule_digest: str
+    cell_terminal_digest: str
+    probe_terminal_digest: str
+    terminal_receipt_digest: str
+    cell_campaign_id: str
+    probe_campaign_id: str
+    semantic_projection_digest: str
+    semantic_verdict_digest: str
+    semantic_verifier_identity: str
+    semantic_result: str
+    source_aggregate: str
+    profile_digest: str
+    contract_set_digest: str
+    capsule_digest: str
+    environment_digest: str
+    terminal_ledger_digest: str
+    terminal_event_digest: str
+    identity: str
+    _owner: Any = field(repr=False, compare=False)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("qualification semantic attestations are parent-minted")
+
+    def canonical(self) -> dict[str, Any]:
+        return {
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+            if name not in {"identity", "_owner"}
+        }
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class _QualificationCoordinateCapability:
+    authority_digest: str
+    activation_digest: str
+    reservation_id: str
+    domain: str
+    coordinate: str
+    nonce: str
+    identity: str
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("qualification coordinate capabilities are parent-issued")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class QualificationCoordinateTerminalReceipt:
+    authority_digest: str
+    activation_digest: str
+    reservation_id: str
+    domain: str
+    coordinate: str
+    capability_identity: str
+    record_identity: str
+    identity: str
+    _owner: Any = field(repr=False, compare=False)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("qualification terminal receipts are parent-minted")
+
+
+def _snapshot_normalized_record(
+    record: NormalizedCell | NormalizedProbe,
+) -> NormalizedCell | NormalizedProbe:
+    """Reconstruct a parent-owned immutable snapshot and recompute identities."""
+
+    values = {
+        item.name: getattr(record, item.name)
+        for item in fields(record)
+        if item.init and item.name != "identity"
+    }
+    rejection = values.get("rejection_binding")
+    if isinstance(rejection, NormalizedRejectionBinding):
+        values["rejection_binding"] = NormalizedRejectionBinding(**{
+            item.name: getattr(rejection, item.name)
+            for item in fields(rejection)
+            if item.init and item.name != "identity"
+        })
+    record_type = NormalizedCell if type(record) is NormalizedCell else NormalizedProbe
+    snapshot = record_type(**values)
+    if snapshot.identity != record.identity:
+        raise ProvenanceError("final_prerequisite_mismatch")
+    return snapshot
+
+
+def _terminal_receipt_census_digest(session: Mapping[str, Any]) -> str:
+    return canonical_sha256({
+        "artifact": "minecraft-k12-qualification-terminal-receipt-census/1",
+        "receipts": list(session["receipt_identities"].values()),
+    })
+
+
+def _coordinate_capability_identity(value: _QualificationCoordinateCapability) -> str:
+    return canonical_sha256({
+        "artifact": "minecraft-k12-qualification-coordinate-capability/1",
+        "authority": value.authority_digest,
+        "activation": value.activation_digest,
+        "reservation": value.reservation_id,
+        "domain": value.domain,
+        "coordinate": value.coordinate,
+        "nonce": value.nonce,
+    })
+
+
+def _coordinate_terminal_receipt_identity(
+    value: QualificationCoordinateTerminalReceipt,
+) -> str:
+    return canonical_sha256({
+        "artifact": "minecraft-k12-qualification-coordinate-terminal-receipt/1",
+        "authority": value.authority_digest,
+        "activation": value.activation_digest,
+        "reservation": value.reservation_id,
+        "domain": value.domain,
+        "coordinate": value.coordinate,
+        "capability": value.capability_identity,
+        "record": value.record_identity,
+    })
+
+
 @dataclass(frozen=True, slots=True)
 class FinalExecutionPrerequisites:
     qualification_authority_digest: str
-    qualification_aggregate_digest: str
-    probe_aggregate_digest: str
+    qualification_semantic_projection_digest: str
+    qualification_probe_projection_digest: str
+    qualification_terminal_receipt_census_digest: str
+    qualification_terminal_event_digest: str
     qualification_terminal_ledger_digest: str
     head_commit: str
     head_tree: str
@@ -1696,14 +1849,17 @@ class FinalExecutionPrerequisites:
     profile_digest: str
     contract_set_digest: str
     capsule_digest: str
-    qualification_evidence: Any
-    qualification_ownership_receipt: Any
-    qualification_terminal_receipt: Any
+    qualification_semantic_attestation: QualificationSemanticAttestation
 
     def __post_init__(self) -> None:
         _require_canonical_digest(self.qualification_authority_digest, "final_prerequisite_mismatch")
-        for value in (self.qualification_aggregate_digest, self.probe_aggregate_digest,
-                      self.qualification_terminal_ledger_digest):
+        for value in (
+            self.qualification_semantic_projection_digest,
+            self.qualification_probe_projection_digest,
+            self.qualification_terminal_receipt_census_digest,
+            self.qualification_terminal_event_digest,
+            self.qualification_terminal_ledger_digest,
+        ):
             _require_canonical_digest(value, "final_prerequisite_mismatch")
         _require_sha1(self.head_commit, "final_prerequisite_mismatch")
         _require_sha1(self.head_tree, "final_prerequisite_mismatch")
@@ -1714,20 +1870,30 @@ class FinalExecutionPrerequisites:
         _require_canonical_digest(self.contract_set_digest, "final_prerequisite_mismatch")
         _require_sha256(self.capsule_digest, "final_prerequisite_mismatch")
         try:
-            evidence = self.qualification_evidence
-            receipt = self.qualification_ownership_receipt
-            terminal = self.qualification_terminal_receipt
-            if (not isinstance(evidence, QualificationEvidenceContract)
-                    or not isinstance(receipt, QualificationEvidenceOwnershipReceipt)
-                    or not isinstance(terminal, QualificationTerminalEvidenceContract)
-                    or evidence.terminal_evidence is not terminal
-                    or evidence.ownership_receipt is not receipt
-                    or not isinstance(evidence.qualification_projection,
-                                      QualificationEvidenceProjection)
-                    or not evidence.qualification_projection.passed
-                    or not receipt.authenticates(evidence)):
+            attestation = self.qualification_semantic_attestation
+            if (not isinstance(attestation, QualificationSemanticAttestation)
+                    or not bool(getattr(
+                        attestation._owner,
+                        "owns_qualification_semantic_attestation",
+                        lambda _attestation: False,
+                    )(attestation))
+                    or self.qualification_semantic_projection_digest
+                        != attestation.semantic_projection_digest
+                    or self.qualification_probe_projection_digest
+                        != attestation.probe_terminal_digest
+                    or self.qualification_terminal_receipt_census_digest
+                        != attestation.terminal_receipt_digest
+                    or self.qualification_terminal_event_digest
+                        != attestation.terminal_event_digest
+                    or self.qualification_terminal_ledger_digest
+                        != attestation.terminal_ledger_digest
+                    or self.qualification_authority_digest
+                        != attestation.qualification_authority_digest
+                    or self.source_aggregate != attestation.source_aggregate
+                    or self.profile_digest != attestation.profile_digest
+                    or self.contract_set_digest != attestation.contract_set_digest
+                    or self.capsule_digest != attestation.capsule_digest):
                 raise ProvenanceError("final_prerequisite_mismatch")
-            _live_evidence_values(evidence)
         except (AttributeError, KeyError, IndexError, TypeError, ValueError,
                 ProvenanceError) as exc:
             if isinstance(exc, ProvenanceError):
@@ -1737,58 +1903,50 @@ class FinalExecutionPrerequisites:
     @classmethod
     def from_live_qualification(cls, authority: "QualificationExecutionAuthority",
                                  evidence: Any) -> "FinalExecutionPrerequisites":
-        if not isinstance(evidence, QualificationEvidenceContract):
+        attestation = getattr(evidence, "semantic_attestation", None)
+        if not isinstance(attestation, QualificationSemanticAttestation):
             raise ProvenanceError("final_prerequisite_mismatch")
+        return cls.from_semantic_attestation(
+            authority, attestation,
+        )
+
+    @classmethod
+    def from_semantic_attestation(
+        cls,
+        authority: "QualificationExecutionAuthority | ActiveQualificationAuthority",
+        attestation: QualificationSemanticAttestation,
+    ) -> "FinalExecutionPrerequisites":
         if isinstance(authority, ActiveQualificationAuthority):
-            active_authority = authority
+            qualification = authority.authority
+            owner = authority.owner
         elif isinstance(authority, QualificationExecutionAuthority):
-            active_authority = evidence.qualification_projection.authority
-            if (not isinstance(active_authority, ActiveQualificationAuthority)
-                    or active_authority.authority is not authority):
-                raise TypeError("active parent qualification authority required")
+            qualification = authority
+            owner = authority.owner
         else:
             raise TypeError("typed qualification authority required")
-        receipt = evidence.ownership_receipt
-        terminal = evidence.terminal_evidence
-        if (not isinstance(receipt, QualificationEvidenceOwnershipReceipt)
-                or not isinstance(terminal, QualificationTerminalEvidenceContract)):
+        if (not isinstance(owner, ParentExecutionAuthority)
+                or not owner.owns_qualification_semantic_attestation(
+                    attestation, authority=authority,
+                )):
             raise ProvenanceError("final_prerequisite_mismatch")
-        owner = active_authority.owner
-        try:
-            authenticated = receipt.authenticates(
-                evidence, authority=active_authority, controller=owner,
-            )
-        except (AttributeError, KeyError, IndexError, TypeError, ValueError,
-                ProvenanceError):
-            authenticated = False
-        values = _live_evidence_values(evidence)
-        if (not authenticated or values["authority"] is not active_authority
-                or values["authority_binding"] != active_authority.binding
-                or evidence.terminal_evidence is not terminal
-                or values["passed"] is not True):
-            raise ProvenanceError("final_prerequisite_mismatch")
-        _validate_evidence_ownership(active_authority, evidence, values)
-        qualification = active_authority.authority
         body = qualification.body
-        if (values["profile_digest"] != body["profile"]["detached_digest"]
-                or values["authority_binding"].lifecycle != "active"
-                or not qualification.owns(values["authority_binding"])
-                or terminal.ledger_digest != values["qualification_terminal_ledger_digest"]):
+        if (attestation.profile_digest != body["profile"]["detached_digest"]
+                or attestation.terminal_ledger_digest
+                    != qualification.ledger.head_digest):
             raise ProvenanceError("final_prerequisite_mismatch")
         return cls(
-            qualification.identity, values["qualification_aggregate_digest"],
-            values["probe_aggregate_digest"], values["qualification_terminal_ledger_digest"],
+            qualification.identity, attestation.semantic_projection_digest,
+            attestation.probe_terminal_digest, attestation.terminal_receipt_digest,
+            attestation.terminal_event_digest, attestation.terminal_ledger_digest,
             body["checkout"]["head_commit"], body["checkout"]["head_tree"],
             body["source_closure"]["aggregate_sha256"], body["profile"]["detached_digest"],
             canonical_sha256(_deep_thaw(body["contracts"])),
-            body["execution_capsule"]["capsule_digest"], evidence, receipt, terminal,
+            body["execution_capsule"]["capsule_digest"], attestation,
         )
 
     @property
     def origin(self) -> str:
-        return _normalize_origin(
-            _live_evidence_values(self.qualification_evidence)["evidence_origin"]
-        )
+        return _normalize_origin(self.qualification_semantic_attestation.evidence_origin)
 
     @property
     def runtime_admissible(self) -> bool:
@@ -1799,18 +1957,8 @@ class FinalExecutionPrerequisites:
         return self.origin
 
     @property
-    def qualification_ownership_receipt_digest(self) -> str:
-        receipt = self.qualification_ownership_receipt
-        if receipt is None:
-            raise ProvenanceError("final_prerequisite_mismatch")
-        return receipt.identity
-
-    @property
-    def qualification_terminal_receipt_digest(self) -> str:
-        receipt = self.qualification_terminal_receipt
-        if receipt is None:
-            raise ProvenanceError("final_prerequisite_mismatch")
-        return receipt.identity
+    def qualification_semantic_attestation_digest(self) -> str:
+        return self.qualification_semantic_attestation.identity
 
     def matches(self, authority: "QualificationExecutionAuthority") -> bool:
         if not isinstance(authority, QualificationExecutionAuthority):
@@ -1828,8 +1976,24 @@ class FinalExecutionPrerequisites:
                 and self.profile_digest == body["profile"]["detached_digest"]
                 and self.contract_set_digest == canonical_sha256(_deep_thaw(body["contracts"]))
                 and self.capsule_digest == body["execution_capsule"]["capsule_digest"]
-                and self.qualification_ownership_receipt is not None
-                and self.qualification_terminal_receipt is not None)
+                and self.qualification_semantic_attestation.qualification_authority_digest
+                    == authority.identity
+                and self.qualification_semantic_projection_digest
+                    == self.qualification_semantic_attestation.semantic_projection_digest
+                and self.qualification_probe_projection_digest
+                    == self.qualification_semantic_attestation.probe_terminal_digest
+                and self.qualification_terminal_receipt_census_digest
+                    == self.qualification_semantic_attestation.terminal_receipt_digest
+                and self.qualification_terminal_event_digest
+                    == self.qualification_semantic_attestation.terminal_event_digest
+                and self.qualification_terminal_ledger_digest
+                    == self.qualification_semantic_attestation.terminal_ledger_digest
+                and bool(getattr(
+                    authority.owner,
+                    "owns_qualification_semantic_attestation",
+                    lambda _attestation, **_kwargs: False,
+                )(self.qualification_semantic_attestation, authority=authority))
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1867,10 +2031,7 @@ class FinalFirstConsumeObservation:
         result: dict[str, Any] = {"prerequisites": {
             name: getattr(self.prerequisites, name)
             for name in self.prerequisites.__dataclass_fields__
-            if name not in {
-                "qualification_evidence", "qualification_ownership_receipt",
-                "qualification_terminal_receipt",
-            }
+            if name != "qualification_semantic_attestation"
         }}
         result.update({
             "checkout": self.checkout.canonical(),
@@ -2458,85 +2619,10 @@ QualificationEvidenceProtocol = QualificationEvidenceContract
 
 
 def _live_evidence_values(evidence: Any) -> dict[str, Any]:
-    # A structural namespace with the same fields is not an authenticated
-    # qualification aggregate.  The neutral contract performs the nominal and
-    # object-identity checks before this authority layer inspects semantics.
-    if not isinstance(evidence, QualificationEvidenceContract):
-        raise ProvenanceError("final_prerequisite_mismatch")
-    try:
-        values = qualification_evidence_values(evidence)
-        origin = _normalize_origin(values["evidence_origin"])
-        binding = values["authority_binding"]
-        passed = values["passed"]
-        receipt = values["ownership_receipt"]
-        terminal = values["terminal_receipt"]
-    except (AttributeError, KeyError, IndexError, TypeError, ValueError,
-            ProvenanceError) as exc:
-        raise ProvenanceError("final_prerequisite_mismatch") from exc
-    if (values["execution_provenance"] != "live_qualification"
-            or origin not in {RUNTIME_VERIFIED_ORIGIN, INJECTED_FAKE_ORIGIN}
-            or passed is not True
-            or not bool(getattr(
-                values["controller"],
-                "owns_qualification_evidence",
-                lambda _evidence, _receipt: False,
-            )(evidence, receipt))
-            or not isinstance(binding, AuthorityBinding)
-            or binding.namespace != "live_qualification"):
-        raise ProvenanceError("final_prerequisite_mismatch")
-    if (not isinstance(receipt, QualificationEvidenceOwnershipReceipt)
-            or not isinstance(terminal, QualificationTerminalEvidenceContract)):
-        raise ProvenanceError("final_prerequisite_mismatch")
-    for name in ("qualification_aggregate_digest", "probe_aggregate_digest",
-                 "qualification_terminal_ledger_digest"):
-        _require_canonical_digest(values[name], "final_prerequisite_mismatch")
-    _require_sha256(values["profile_digest"], "final_prerequisite_mismatch")
-    return values
+    """Reject the retired aggregate-projection authorization boundary."""
 
-
-def _qualification_execution(authority: Any) -> QualificationExecutionAuthority:
-    if isinstance(authority, ActiveQualificationAuthority):
-        authority = authority.authority
-    if not isinstance(authority, QualificationExecutionAuthority):
-        raise TypeError("typed qualification authority required")
-    return authority
-
-
-def _validate_evidence_ownership(
-        authority: Any, evidence: Any, values: Mapping[str, Any], *,
-        controller: Any = None,
-) -> None:
-    """Require runtime evidence or a controller-owned injected fake graph."""
-    execution = _qualification_execution(authority)
-    binding = values["authority_binding"]
-    origin = values["evidence_origin"]
-    owner = execution.owner
-    if (not execution.owns(binding)
-            or owner is None
-            or not owner.owns_authority(execution)):
-        raise ProvenanceError("final_prerequisite_mismatch")
-    if origin == RUNTIME_VERIFIED_ORIGIN:
-        if (execution.origin != RUNTIME_VERIFIED_ORIGIN
-                or values.get("authority") is not authority
-                or (values.get("controller") is not None
-                    and values.get("controller") is not owner)):
-            raise ProvenanceError("final_prerequisite_mismatch")
-        return
-    if origin != INJECTED_FAKE_ORIGIN:
-        raise ProvenanceError("final_prerequisite_mismatch")
-    if (owner.origin != INJECTED_TEST_ORIGIN
-            or not owner.is_injected_test_controller):
-        raise ProvenanceError("final_prerequisite_mismatch")
-    if controller is not None and controller is not owner:
-        raise ProvenanceError("final_prerequisite_mismatch")
-    evidence_authority = values.get("authority")
-    if (not isinstance(evidence_authority, ActiveQualificationAuthority)
-            or evidence_authority.authority is not execution
-            or evidence_authority.owner is not owner):
-        raise ProvenanceError("final_prerequisite_mismatch")
-    claimed_controller = values.get("controller")
-    if claimed_controller is not None and claimed_controller is not owner:
-        raise ProvenanceError("final_prerequisite_mismatch")
+    del evidence
+    raise ProvenanceError("final_prerequisite_mismatch")
 
 
 def _ledger_binding_state(ledger: Any) -> tuple[str, str]:
@@ -2731,10 +2817,13 @@ class ParentExecutionAuthority:
         self.__capsules: dict[int, Any] = {}
         self.__external_revisions: dict[int, ExternalRevisionAuthorization] = {}
         self.__external_revision_identities: set[str] = set()
-        self.__qualification_evidence_lock = threading.RLock()
-        self.__qualification_evidence_claims: dict[str, dict[str, Any]] = {}
-        self.__qualification_evidence: dict[int, tuple[Any, Any]] = {}
-        self.__qualification_evidence_by_authority: dict[str, int] = {}
+        self.__qualification_semantic_lock = threading.RLock()
+        self.__qualification_semantic_sessions: dict[str, dict[str, Any]] = {}
+        self.__qualification_coordinate_capabilities: dict[int, _QualificationCoordinateCapability] = {}
+        self.__qualification_coordinate_observations: dict[
+            int, tuple[QualificationCoordinateTerminalReceipt, NormalizedCell | NormalizedProbe]
+        ] = {}
+        self.__qualification_semantic_attestations: dict[int, QualificationSemanticAttestation] = {}
         self.__origin = _origin
         self.__owner = _owner
         self.__revision_verifier_key = revision_verifier_key
@@ -2799,112 +2888,476 @@ class ParentExecutionAuthority:
     def owns_external_revision(self, authorization: Any) -> bool:
         return self.__external_revisions.get(id(authorization)) is authorization
 
-    def owns_qualification_evidence(self, evidence: Any, receipt: Any) -> bool:
-        with self.__qualification_evidence_lock:
-            pair = self.__qualification_evidence.get(id(evidence))
-            return pair is not None and pair[0] is evidence and pair[1] is receipt
+    def _issue_qualification_coordinate_capabilities(
+        self, authority: ActiveQualificationAuthority,
+    ) -> tuple[tuple[_QualificationCoordinateCapability, ...],
+               tuple[_QualificationCoordinateCapability, ...]]:
+        """Issue the exact one-shot 15-cell and P1--P4 publication set."""
 
-    def _preclaim_qualification_evidence(
-            self, evidence: Any, authority: Any, *, aggregate_identity: str,
-            probe_aggregate_digest: str, authority_binding: Any,
-            evidence_origin: str) -> None:
-        """Bind one exact, validated candidate before a passed terminal event."""
-
-        if (not isinstance(evidence, QualificationEvidenceContract)
-                or not is_canonical_qualification_evidence(evidence)):
-            raise TypeError("nominal qualification evidence is required")
         if (not isinstance(authority, ActiveQualificationAuthority)
                 or authority.owner is not self
                 or not self.owns_authority(authority.authority)
-                or authority_binding != authority.binding
-                or not authority.owns(authority_binding)
-                or getattr(evidence, "identity", None) != aggregate_identity
-                or getattr(evidence, "authority", None) is not authority
-                or getattr(evidence, "authority_binding", None) != authority_binding
-                or getattr(evidence, "evidence_origin", None) != evidence_origin
-                or getattr(getattr(evidence, "probes", None), "identity", None)
-                    != probe_aggregate_digest):
-            raise ProvenanceError("final_prerequisite_mismatch")
-        ledger = authority.authority.ledger
-        with self.__qualification_evidence_lock:
-            if (not _ledger_is(ledger, namespace="qualification", state="active",
-                               reservation=authority.reservation_id)
-                    or authority.identity in self.__qualification_evidence_claims
-                    or authority.identity in self.__qualification_evidence_by_authority):
+                or not authority.current_at()
+                or authority.lifecycle != "active"):
+            raise ProvenanceError("authority_replay")
+        with self.__qualification_semantic_lock:
+            if authority.identity in self.__qualification_semantic_sessions:
                 raise ProvenanceError("authority_replay")
-            self.__qualification_evidence_claims[authority.identity] = {
-                "evidence": evidence,
+            session: dict[str, Any] = {
                 "authority": authority,
-                "ledger": ledger,
-                "aggregate_identity": aggregate_identity,
-                "probe_aggregate_digest": probe_aggregate_digest,
-                "authority_binding": authority_binding,
-                "evidence_origin": evidence_origin,
-                "state": "claimed",
+                "cells": {},
+                "probes": {},
+                "receipts": {},
+                "receipt_identities": {},
+                "capabilities": {},
+                "capability_identities": {},
+                "probe_binding": authority.authority.binding(QUALIFICATION_PROBE_NAMESPACE),
+                "state": "collecting",
             }
+            issued: list[_QualificationCoordinateCapability] = []
+            for domain, coordinates in (
+                (LIVE_QUALIFICATION_NAMESPACE, QUALIFICATION_SCHEDULE),
+                (QUALIFICATION_PROBE_NAMESPACE, QUALIFICATION_PROBES),
+            ):
+                for coordinate in coordinates:
+                    value = object.__new__(_QualificationCoordinateCapability)
+                    body = {
+                        "artifact": "minecraft-k12-qualification-coordinate-capability/1",
+                        "authority": authority.identity,
+                        "activation": authority.activation_digest,
+                        "reservation": authority.reservation_id,
+                        "domain": domain,
+                        "coordinate": coordinate,
+                        "nonce": secrets.token_hex(32),
+                    }
+                    for name, item in (
+                        ("authority_digest", body["authority"]),
+                        ("activation_digest", body["activation"]),
+                        ("reservation_id", body["reservation"]),
+                        ("domain", domain),
+                        ("coordinate", coordinate),
+                        ("nonce", body["nonce"]),
+                        ("identity", canonical_sha256(body)),
+                    ):
+                        object.__setattr__(value, name, item)
+                    session["capabilities"][(domain, coordinate)] = value
+                    session["capability_identities"][(domain, coordinate)] = value.identity
+                    self.__qualification_coordinate_capabilities[id(value)] = value
+                    issued.append(value)
+            self.__qualification_semantic_sessions[authority.identity] = session
+            split = len(QUALIFICATION_SCHEDULE)
+            return tuple(issued[:split]), tuple(issued[split:])
 
-    def _abandon_qualification_evidence(self, evidence: Any, authority: Any) -> None:
-        """Burn a failed preclaim; it can never be replaced for this authority."""
+    def _observe_qualification_coordinate_terminal(
+        self,
+        authority: ActiveQualificationAuthority,
+        capability: _QualificationCoordinateCapability,
+        record: NormalizedCell | NormalizedProbe,
+    ) -> QualificationCoordinateTerminalReceipt:
+        """Consume a capability into a parent-owned terminal observation receipt."""
 
-        with self.__qualification_evidence_lock:
-            claim = self.__qualification_evidence_claims.get(
-                getattr(authority, "identity", "")
+        if not isinstance(authority, ActiveQualificationAuthority) or authority.owner is not self:
+            raise TypeError("active parent qualification authority required")
+        with self.__qualification_semantic_lock:
+            session = self.__qualification_semantic_sessions.get(authority.identity)
+            expected = None if session is None else session["capabilities"].get(
+                (getattr(capability, "domain", None), getattr(capability, "coordinate", None))
             )
-            if claim is not None and claim["evidence"] is evidence:
-                claim["state"] = "abandoned"
-
-    def _fulfill_qualification_evidence(self, evidence: Any, receipt: Any) -> None:
-        """Consume the exact preclaim after its parent terminal event exists."""
-
-        if (not isinstance(evidence, QualificationEvidenceContract)
-                or not isinstance(receipt, QualificationEvidenceOwnershipReceipt)):
-            raise TypeError("typed qualification evidence receipt required")
-        projection = getattr(receipt, "projection", None)
-        authority = getattr(projection, "authority", None)
-        terminal = getattr(projection, "terminal_evidence", None)
-        with self.__qualification_evidence_lock:
-            claim = self.__qualification_evidence_claims.get(
-                getattr(authority, "identity", "")
-            )
-            if (claim is None or claim["state"] != "published"
-                    or claim["evidence"] is not evidence
-                    or claim["authority"] is not authority):
+            if (session is None or session["state"] != "collecting"
+                    or expected is not capability
+                    or self.__qualification_coordinate_capabilities.get(id(capability)) is not capability
+                    or capability.identity != session["capability_identities"].get(
+                        (capability.domain, capability.coordinate)
+                    )
+                    or _coordinate_capability_identity(capability)
+                        != capability.identity
+                    or capability.authority_digest != authority.identity
+                    or capability.activation_digest != authority.activation_digest
+                    or capability.reservation_id != authority.reservation_id
+                    or not authority.current_at()
+                    or authority.lifecycle != "active"):
                 raise ProvenanceError("authority_replay")
-            if (not isinstance(projection, QualificationEvidenceProjection)
-                    or not isinstance(terminal, QualificationTerminalEvidenceContract)
-                    or projection.aggregate is not evidence
-                    or receipt.aggregate is not evidence
-                    or receipt.controller is not self
-                    or projection.controller is not self
-                    or evidence.qualification_projection is not projection
-                    or evidence.ownership_receipt is not receipt
-                    or projection.aggregate_identity != claim["aggregate_identity"]
-                    or projection.probe_aggregate_digest
-                        != claim["probe_aggregate_digest"]
-                    or projection.authority_binding != claim["authority_binding"]
-                    or projection.evidence_origin != claim["evidence_origin"]
-                    or projection.passed is not True):
+            if capability.domain == LIVE_QUALIFICATION_NAMESPACE:
+                target = session["cells"]
+                valid = type(record) is NormalizedCell and record.cell_id == capability.coordinate
+            elif capability.domain == QUALIFICATION_PROBE_NAMESPACE:
+                target = session["probes"]
+                valid = type(record) is NormalizedProbe and record.probe == capability.coordinate
+            else:
+                target = {}
+                valid = False
+            if valid:
+                record = _snapshot_normalized_record(record)
+            if (not valid or capability.coordinate in target
+                    or record.authority != authority.identity
+                    or record.activation != authority.activation_digest
+                    or record.profile_digest != authority.profile_digest
+                    or record.evidence_origin != (
+                        RUNTIME_VERIFIED_ORIGIN
+                        if authority.origin == RUNTIME_VERIFIED_ORIGIN else INJECTED_FAKE_ORIGIN
+                    )):
                 raise ProvenanceError("final_prerequisite_mismatch")
-            ledger = claim["ledger"]
+            receipt = object.__new__(QualificationCoordinateTerminalReceipt)
+            receipt_body = {
+                "artifact": "minecraft-k12-qualification-coordinate-terminal-receipt/1",
+                "authority": authority.identity,
+                "activation": authority.activation_digest,
+                "reservation": authority.reservation_id,
+                "domain": capability.domain,
+                "coordinate": capability.coordinate,
+                "capability": capability.identity,
+                "record": record.identity,
+            }
+            for name, value in (
+                ("authority_digest", authority.identity),
+                ("activation_digest", authority.activation_digest),
+                ("reservation_id", authority.reservation_id),
+                ("domain", capability.domain),
+                ("coordinate", capability.coordinate),
+                ("capability_identity", capability.identity),
+                ("record_identity", record.identity),
+                ("identity", canonical_sha256(receipt_body)),
+                ("_owner", self),
+            ):
+                object.__setattr__(receipt, name, value)
+            session["receipts"][(capability.domain, capability.coordinate)] = receipt
+            session["receipt_identities"][(capability.domain, capability.coordinate)] = receipt.identity
+            self.__qualification_coordinate_observations[id(receipt)] = (receipt, record)
+            del self.__qualification_coordinate_capabilities[id(capability)]
+            return receipt
+
+    def _publish_qualification_coordinate_terminal(
+        self,
+        authority: ActiveQualificationAuthority,
+        receipt: QualificationCoordinateTerminalReceipt,
+    ) -> None:
+        """Publish only an exact parent-observed terminal receipt to the registry."""
+
+        if not isinstance(authority, ActiveQualificationAuthority) or authority.owner is not self:
+            raise TypeError("active parent qualification authority required")
+        with self.__qualification_semantic_lock:
+            session = self.__qualification_semantic_sessions.get(authority.identity)
+            observed = self.__qualification_coordinate_observations.get(id(receipt))
+            if (session is None or session["state"] != "collecting"
+                    or observed is None or observed[0] is not receipt
+                    or receipt._owner is not self
+                    or receipt.authority_digest != authority.identity
+                    or receipt.activation_digest != authority.activation_digest
+                    or receipt.reservation_id != authority.reservation_id
+                    or session["receipts"].get((receipt.domain, receipt.coordinate)) is not receipt
+                    or receipt.identity != session["receipt_identities"].get(
+                        (receipt.domain, receipt.coordinate)
+                    )
+                    or _coordinate_terminal_receipt_identity(receipt)
+                        != receipt.identity
+                    or not authority.current_at()
+                    or authority.lifecycle != "active"):
+                raise ProvenanceError("authority_replay")
+            record = observed[1]
+            if receipt.domain == LIVE_QUALIFICATION_NAMESPACE:
+                target = session["cells"]
+            elif receipt.domain == QUALIFICATION_PROBE_NAMESPACE:
+                target = session["probes"]
+            else:
+                raise ProvenanceError("final_prerequisite_mismatch")
+            if (receipt.coordinate in target
+                    or receipt.record_identity != record.identity):
+                raise ProvenanceError("final_prerequisite_mismatch")
+            target[receipt.coordinate] = record
+            del self.__qualification_coordinate_observations[id(receipt)]
+
+    def _prepare_qualification_semantics(
+        self, authority: ActiveQualificationAuthority,
+    ) -> tuple[QualificationCensus, QualificationVerdict]:
+        """Recompute the frozen predicate exclusively from the parent registry."""
+
+        with self.__qualification_semantic_lock:
+            session = self.__qualification_semantic_sessions.get(authority.identity)
+            if (session is None or session["authority"] is not authority
+                    or session["state"] != "collecting"
+                    or tuple(session["cells"]) != QUALIFICATION_SCHEDULE
+                    or tuple(session["probes"]) != QUALIFICATION_PROBES
+                    or tuple(session["receipts"]) != tuple(
+                        (domain, coordinate)
+                        for domain, coordinates in (
+                            (LIVE_QUALIFICATION_NAMESPACE, QUALIFICATION_SCHEDULE),
+                            (QUALIFICATION_PROBE_NAMESPACE, QUALIFICATION_PROBES),
+                        )
+                        for coordinate in coordinates
+                    )
+                    or tuple(session["receipt_identities"]) != tuple(session["receipts"])
+                    or not authority.current_at()
+                    or authority.lifecycle != "active"):
+                raise ProvenanceError("final_prerequisite_mismatch")
+            census = QualificationCensus(
+                tuple(session["cells"][key] for key in QUALIFICATION_SCHEDULE),
+                tuple(session["probes"][key] for key in QUALIFICATION_PROBES),
+            )
+            verdict = verify_qualification_projection(census)
+            if verdict.passed is not True:
+                raise ProvenanceError("final_prerequisite_mismatch")
+            session["census"] = census
+            session["verdict"] = verdict
+            session["state"] = "verified"
+            return census, verdict
+
+    def finalize_qualification_semantics(
+        self, authority: ActiveQualificationAuthority,
+    ) -> QualificationSemanticAttestation:
+        """Publish the semantic ledger terminal and mint its owned attestation."""
+
+        census, verdict = self._prepare_qualification_semantics(authority)
+        ledger = authority.authority.ledger
+        with self.__qualification_semantic_lock:
+            session = self.__qualification_semantic_sessions[authority.identity]
+            receipt_digest = _terminal_receipt_census_digest(session)
+        payload = {
+            "result": "passed",
+            "phase": "qualification",
+            "authority_digest": authority.identity,
+            "evidence_origin": (
+                RUNTIME_VERIFIED_ORIGIN
+                if authority.origin == RUNTIME_VERIFIED_ORIGIN else INJECTED_FAKE_ORIGIN
+            ),
+            "terminal_verified": True,
+            "semantic_projection_digest": census.aggregate_digest,
+            "semantic_probe_digest": census.probe_digest,
+            "semantic_verdict_digest": verdict.identity,
+            "semantic_verifier_identity": SEMANTIC_VERIFIER_IDENTITY,
+            "terminal_receipt_digest": receipt_digest,
+        }
+        try:
+            self.ledger_terminal(ledger, payload)
+        except Exception as exc:
+            raise ProvenanceError("authority_replay") from exc
+        return self._mint_qualification_semantic_attestation(authority)
+
+    def _mint_qualification_semantic_attestation(
+        self,
+        authority: ActiveQualificationAuthority,
+    ) -> QualificationSemanticAttestation:
+        """Bind a verified parent census to its durable terminal ledger event."""
+
+        with self.__qualification_semantic_lock:
+            session = self.__qualification_semantic_sessions.get(authority.identity)
+            if (session is None or session["authority"] is not authority
+                    or session["state"] != "terminal"):
+                raise ProvenanceError("final_prerequisite_mismatch")
+            census = session["census"]
+            projection_verdict = session["verdict"]
+            ledger = authority.authority.ledger
             events = getattr(ledger, "events", ())
             payload = dict(events[-1].payload) if events else {}
             if (not _ledger_is(ledger, namespace="qualification", state="terminal",
                                reservation=authority.reservation_id)
-                    or not events
-                    or payload.get("result") != "passed"
-                    or payload.get("terminal_verified") is not True
                     or payload.get("authority_digest") != authority.identity
-                    or payload.get("qualification_aggregate_digest")
-                        != claim["aggregate_identity"]
-                    or payload.get("probe_aggregate_digest")
-                        != claim["probe_aggregate_digest"]
-                    or payload.get("evidence_origin") != claim["evidence_origin"]
-                    or getattr(terminal, "ledger_digest", None)
-                        != getattr(ledger, "head_digest", None)):
+                    or payload.get("semantic_projection_digest") != census.aggregate_digest
+                    or payload.get("semantic_probe_digest") != census.probe_digest
+                    or payload.get("semantic_verdict_digest") != projection_verdict.identity
+                    or payload.get("semantic_verifier_identity") != SEMANTIC_VERIFIER_IDENTITY
+                    or payload.get("terminal_receipt_digest")
+                        != _terminal_receipt_census_digest(session)
+                    or payload.get("terminal_verified") is not True):
                 raise ProvenanceError("final_prerequisite_mismatch")
-            self.__qualification_evidence[id(evidence)] = (evidence, receipt)
-            self.__qualification_evidence_by_authority[authority.identity] = id(evidence)
-            claim["state"] = "consumed"
+            terminal = NormalizedTerminal(
+                authority=authority.identity,
+                activation=authority.activation_digest,
+                profile_digest=authority.profile_digest,
+                evidence_origin=(RUNTIME_VERIFIED_ORIGIN if authority.origin == RUNTIME_VERIFIED_ORIGIN
+                                 else INJECTED_FAKE_ORIGIN),
+                ledger_digest=ledger.head_digest,
+                aggregate_digest=census.aggregate_digest,
+                probe_digest=census.probe_digest,
+                result="passed",
+                state="terminal",
+                verified=True,
+            )
+            complete = QualificationCensus(census.cells, census.probes, terminal)
+            verdict = verify_qualification(complete)
+            if verdict.passed is not True:
+                raise ProvenanceError("final_prerequisite_mismatch")
+            body = authority.body
+            values = {
+                "qualification_authority_digest": authority.identity,
+                "activation_digest": authority.activation_digest,
+                "reservation_id": authority.reservation_id,
+                "ledger_root_digest": body["ledger"]["root_digest"],
+                "namespace": body["namespace"],
+                "evidence_origin": terminal.evidence_origin,
+                "schedule_identity": QUALIFICATION_SCHEDULE_IDENTITY,
+                "schedule_digest": QUALIFICATION_SCHEDULE_DIGEST,
+                "probe_identity": QUALIFICATION_PROBE_IDENTITY,
+                "probe_schedule_digest": PROBE_SCHEDULE_DIGEST,
+                "cell_terminal_digest": complete.cell_digest,
+                "probe_terminal_digest": complete.probe_digest,
+                "terminal_receipt_digest": _terminal_receipt_census_digest(session),
+                "cell_campaign_id": complete.cells[0].campaign_id,
+                "probe_campaign_id": complete.probes[0].campaign_id,
+                "semantic_projection_digest": census.aggregate_digest,
+                "semantic_verdict_digest": verdict.identity,
+                "semantic_verifier_identity": SEMANTIC_VERIFIER_IDENTITY,
+                "semantic_result": "passed",
+                "source_aggregate": body["source_closure"]["aggregate_sha256"],
+                "profile_digest": body["profile"]["detached_digest"],
+                "contract_set_digest": canonical_sha256(_deep_thaw(body["contracts"])),
+                "capsule_digest": body["execution_capsule"]["capsule_digest"],
+                "environment_digest": canonical_sha256(_deep_thaw(body["environment"])),
+                "terminal_ledger_digest": ledger.head_digest,
+                "terminal_event_digest": events[-1].digest,
+            }
+            attestation = object.__new__(QualificationSemanticAttestation)
+            for name, value in values.items():
+                object.__setattr__(attestation, name, value)
+            object.__setattr__(attestation, "identity", canonical_sha256({
+                "artifact": "minecraft-k12-qualification-semantic-attestation/1",
+                **values,
+            }))
+            object.__setattr__(attestation, "_owner", self)
+            session.update({
+                "complete_census": complete,
+                "terminal_verdict": verdict,
+                "attestation": attestation,
+                "state": "attested",
+            })
+            self.__qualification_semantic_attestations[id(attestation)] = attestation
+            return attestation
+
+    def owns_qualification_semantic_attestation(
+        self, attestation: Any, *, authority: Any = None,
+    ) -> bool:
+        """Authenticate an exact parent-minted attestation and its live closure."""
+
+        if not isinstance(attestation, QualificationSemanticAttestation):
+            return False
+        with self.__qualification_semantic_lock:
+            if self.__qualification_semantic_attestations.get(id(attestation)) is not attestation:
+                return False
+            session = self.__qualification_semantic_sessions.get(
+                attestation.qualification_authority_digest
+            )
+            if (session is None or session.get("attestation") is not attestation
+                    or session.get("state") != "attested"):
+                return False
+            active = session["authority"]
+            execution = active.authority
+            if isinstance(authority, ActiveQualificationAuthority):
+                if authority is not active:
+                    return False
+            elif isinstance(authority, QualificationExecutionAuthority):
+                if authority is not execution:
+                    return False
+            elif authority is not None:
+                return False
+            complete = session["complete_census"]
+            verdict = verify_qualification(complete)
+            ledger = execution.ledger
+            events = getattr(ledger, "events", ())
+            body = execution.body
+            expected = {
+                "qualification_authority_digest": execution.identity,
+                "activation_digest": active.activation_digest,
+                "reservation_id": execution.reservation_id,
+                "ledger_root_digest": body["ledger"]["root_digest"],
+                "namespace": body["namespace"],
+                "evidence_origin": (RUNTIME_VERIFIED_ORIGIN if execution.origin == RUNTIME_VERIFIED_ORIGIN
+                                    else INJECTED_FAKE_ORIGIN),
+                "schedule_identity": QUALIFICATION_SCHEDULE_IDENTITY,
+                "schedule_digest": QUALIFICATION_SCHEDULE_DIGEST,
+                "probe_identity": QUALIFICATION_PROBE_IDENTITY,
+                "probe_schedule_digest": PROBE_SCHEDULE_DIGEST,
+                "cell_terminal_digest": complete.cell_digest,
+                "probe_terminal_digest": complete.probe_digest,
+                "terminal_receipt_digest": _terminal_receipt_census_digest(session),
+                "cell_campaign_id": complete.cells[0].campaign_id,
+                "probe_campaign_id": complete.probes[0].campaign_id,
+                "semantic_projection_digest": session["census"].aggregate_digest,
+                "semantic_verdict_digest": verdict.identity,
+                "semantic_verifier_identity": SEMANTIC_VERIFIER_IDENTITY,
+                "semantic_result": "passed",
+                "source_aggregate": body["source_closure"]["aggregate_sha256"],
+                "profile_digest": body["profile"]["detached_digest"],
+                "contract_set_digest": canonical_sha256(_deep_thaw(body["contracts"])),
+                "capsule_digest": body["execution_capsule"]["capsule_digest"],
+                "environment_digest": canonical_sha256(_deep_thaw(body["environment"])),
+                "terminal_ledger_digest": getattr(ledger, "head_digest", ""),
+                "terminal_event_digest": events[-1].digest if events else "",
+            }
+            expected_identity = canonical_sha256({
+                "artifact": "minecraft-k12-qualification-semantic-attestation/1",
+                **expected,
+            })
+            return (verdict.passed is True
+                    and _ledger_is(ledger, namespace="qualification", state="terminal",
+                                   reservation=execution.reservation_id)
+                    and all(getattr(attestation, name, None) == value
+                            for name, value in expected.items())
+                    and attestation.identity == expected_identity)
+
+    def qualification_semantic_attestation(
+        self, authority: ActiveQualificationAuthority,
+    ) -> QualificationSemanticAttestation:
+        """Return the already-finalized attestation for descriptive consumers."""
+
+        with self.__qualification_semantic_lock:
+            session = self.__qualification_semantic_sessions.get(
+                getattr(authority, "identity", "")
+            )
+            attestation = None if session is None else session.get("attestation")
+        if not self.owns_qualification_semantic_attestation(
+            attestation, authority=authority,
+        ):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        return attestation
+
+    def owns_qualification_terminal_receipt(self, receipt: Any) -> bool:
+        if not isinstance(receipt, QualificationCoordinateTerminalReceipt):
+            return False
+        with self.__qualification_semantic_lock:
+            session = self.__qualification_semantic_sessions.get(receipt.authority_digest)
+            if session is None:
+                return False
+            expected = session["receipts"].get((receipt.domain, receipt.coordinate))
+            expected_identity = session["receipt_identities"].get(
+                (receipt.domain, receipt.coordinate)
+            )
+            return (
+                expected is receipt
+                and receipt._owner is self
+                and receipt.identity == expected_identity
+                and _coordinate_terminal_receipt_identity(receipt)
+                    == receipt.identity
+            )
+
+    def qualification_terminal_receipts(
+        self, authority: ActiveQualificationAuthority,
+    ) -> tuple[QualificationCoordinateTerminalReceipt, ...]:
+        attestation = self.qualification_semantic_attestation(authority)
+        del attestation
+        with self.__qualification_semantic_lock:
+            session = self.__qualification_semantic_sessions[authority.identity]
+            return tuple(session["receipts"].values())
+
+    def qualification_probe_binding(
+        self, authority: ActiveQualificationAuthority,
+    ) -> AuthorityBinding:
+        self.qualification_semantic_attestation(authority)
+        with self.__qualification_semantic_lock:
+            return self.__qualification_semantic_sessions[authority.identity]["probe_binding"]
+
+    def qualification_authority_is_current_for_attestation(
+        self, attestation: QualificationSemanticAttestation, *, now: int,
+    ) -> bool:
+        if not self.owns_qualification_semantic_attestation(attestation):
+            return False
+        with self.__qualification_semantic_lock:
+            session = self.__qualification_semantic_sessions.get(
+                attestation.qualification_authority_digest
+            )
+            active = None if session is None else session.get("authority")
+        return (
+            isinstance(active, ActiveQualificationAuthority)
+            and active.current_at(now)
+        )
 
     def lifecycle_for(self, ledger: Any) -> tuple[str, str]:
         if not self.owns_ledger(ledger):
@@ -3018,20 +3471,31 @@ class ParentExecutionAuthority:
         if (getattr(ledger, "namespace", None) == "qualification"
                 and terminal_payload.get("result") == "passed"):
             authority_identity = terminal_payload.get("authority_digest")
-            with self.__qualification_evidence_lock:
-                claim = self.__qualification_evidence_claims.get(authority_identity)
-                if (claim is None or claim["state"] != "claimed"
-                        or claim["ledger"] is not ledger
-                        or terminal_payload.get("qualification_aggregate_digest")
-                            != claim["aggregate_identity"]
-                        or terminal_payload.get("probe_aggregate_digest")
-                            != claim["probe_aggregate_digest"]
-                        or terminal_payload.get("evidence_origin")
-                            != claim["evidence_origin"]
+            with self.__qualification_semantic_lock:
+                session = self.__qualification_semantic_sessions.get(authority_identity)
+                census = None if session is None else session.get("census")
+                verdict = None if session is None else session.get("verdict")
+                if (session is None or session.get("state") != "verified"
+                        or session["authority"].authority.ledger is not ledger
+                        or terminal_payload.get("semantic_projection_digest")
+                            != getattr(census, "aggregate_digest", None)
+                        or terminal_payload.get("semantic_probe_digest")
+                            != getattr(census, "probe_digest", None)
+                        or terminal_payload.get("semantic_verdict_digest")
+                            != getattr(verdict, "identity", None)
+                        or terminal_payload.get("semantic_verifier_identity")
+                            != SEMANTIC_VERIFIER_IDENTITY
+                        or terminal_payload.get("terminal_receipt_digest")
+                            != _terminal_receipt_census_digest(session)
+                        or terminal_payload.get("evidence_origin") != (
+                            RUNTIME_VERIFIED_ORIGIN
+                            if session["authority"].origin == RUNTIME_VERIFIED_ORIGIN
+                            else INJECTED_FAKE_ORIGIN
+                        )
                         or terminal_payload.get("terminal_verified") is not True):
                     raise ProvenanceError("final_prerequisite_mismatch")
                 digest = self._ledger_controller(ledger).terminal(terminal_payload)
-                claim["state"] = "published"
+                session["state"] = "terminal"
                 return digest
         return self._ledger_controller(ledger).terminal(terminal_payload)
 
@@ -3306,6 +3770,7 @@ class ParentExecutionAuthority:
     def mint_final_run_authorization(
         self, *, reservation_id: str, output_root_identity: str,
         nonce: str | None = None, profile_digest: str, qualification_authority_digest: str,
+        qualification_semantic_attestation: QualificationSemanticAttestation,
         evidence_origin: str | None = None, now: int | None = None, ledger: Any = None,
         external_revision_authorization: ExternalRevisionAuthorization | None = None,
     ) -> K12FinalRunAuthorization:
@@ -3324,6 +3789,23 @@ class ParentExecutionAuthority:
             qualification_authority_digest, "authority_replay",
         )
         _require_sha256(profile_digest, "profile_mismatch")
+        if (not self.owns_qualification_semantic_attestation(
+                    qualification_semantic_attestation)
+                or qualification_semantic_attestation.qualification_authority_digest
+                    != qualification_authority_digest
+                or qualification_semantic_attestation.profile_digest != profile_digest
+                or qualification_semantic_attestation.evidence_origin != requested_origin):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        with self.__qualification_semantic_lock:
+            semantic_session = self.__qualification_semantic_sessions.get(
+                qualification_authority_digest
+            )
+            active_qualification = (
+                None if semantic_session is None else semantic_session.get("authority")
+            )
+        if (not isinstance(active_qualification, ActiveQualificationAuthority)
+                or not active_qualification.current_at(now)):
+            raise ProvenanceError("authority_replay")
         if (not isinstance(external_revision_authorization, ExternalRevisionAuthorization)
                 or not external_revision_authorization.owned_by(self)
                 or external_revision_authorization.origin != self.origin
@@ -3354,6 +3836,18 @@ class ParentExecutionAuthority:
             "nonce": nonce,
             "profile_digest": profile_digest,
             "qualification_authority_digest": qualification_authority_digest,
+            "qualification_semantic_attestation_digest":
+                qualification_semantic_attestation.identity,
+            "qualification_semantic_projection_digest":
+                qualification_semantic_attestation.semantic_projection_digest,
+            "qualification_probe_projection_digest":
+                qualification_semantic_attestation.probe_terminal_digest,
+            "qualification_terminal_receipt_census_digest":
+                qualification_semantic_attestation.terminal_receipt_digest,
+            "qualification_terminal_event_digest":
+                qualification_semantic_attestation.terminal_event_digest,
+            "qualification_terminal_ledger_digest":
+                qualification_semantic_attestation.terminal_ledger_digest,
             "capabilities": ["final_execute"],
             "evidence_origin": requested_origin,
             "issued_at": now,
@@ -3562,9 +4056,7 @@ class ParentExecutionAuthority:
     def _mint_final_impl(
         self, prerequisites: FinalExecutionPrerequisites,
         qualification_authority: QualificationExecutionAuthority | ActiveQualificationAuthority,
-        *, now: int | None, qualification_evidence: Any = None,
-        qualification_aggregate: Any = None, probe_aggregate: Any = None,
-        qualification_ledger: Any = None, final_ledger: Any,
+        *, now: int | None, qualification_ledger: Any = None, final_ledger: Any,
         target: TargetLockObservation,
         output: OutputRootObservation,
         target_lease: K12RetainedTargetLease,
@@ -3598,45 +4090,38 @@ class ParentExecutionAuthority:
             raise ProvenanceError("final_prerequisite_mismatch")
         if not prerequisites.matches(qualification_execution):
             raise ProvenanceError("final_prerequisite_mismatch")
-        evidence = qualification_evidence or prerequisites.qualification_evidence
-        if evidence is None and qualification_aggregate is not None:
-            evidence = qualification_aggregate
-            if probe_aggregate is not None and getattr(evidence, "probes", None) is not probe_aggregate:
-                raise ProvenanceError("final_prerequisite_mismatch")
-        values = _live_evidence_values(evidence)
-        _validate_evidence_ownership(
-            qualification_authority, evidence, values, controller=self,
-        )
+        attestation = prerequisites.qualification_semantic_attestation
+        if (not self.owns_qualification_semantic_attestation(
+                    attestation, authority=qualification_authority)
+                or attestation.semantic_result != "passed"
+                or attestation.terminal_ledger_digest
+                    != prerequisites.qualification_terminal_ledger_digest
+                or attestation.terminal_receipt_digest
+                    != prerequisites.qualification_terminal_receipt_census_digest
+                or attestation.terminal_event_digest
+                    != prerequisites.qualification_terminal_event_digest
+                or attestation.source_aggregate != prerequisites.source_aggregate
+                or attestation.profile_digest != prerequisites.profile_digest
+                or attestation.contract_set_digest != prerequisites.contract_set_digest
+                or attestation.capsule_digest != prerequisites.capsule_digest
+                or attestation.environment_digest != canonical_sha256(
+                    _deep_thaw(qualification_execution.body["environment"])
+                )):
+            raise ProvenanceError("final_prerequisite_mismatch")
         if not qualification_authority.current_at(now):
             raise ProvenanceError("authority_replay")
-        if (evidence is not prerequisites.qualification_evidence
-                or values["ownership_receipt"] is not prerequisites.qualification_ownership_receipt
-                or values["terminal_receipt"] is not prerequisites.qualification_terminal_receipt):
-            raise ProvenanceError("final_prerequisite_mismatch")
-        if values["evidence_origin"] == RUNTIME_VERIFIED_ORIGIN:
+        if attestation.evidence_origin == RUNTIME_VERIFIED_ORIGIN:
             final_origin = RUNTIME_VERIFIED_ORIGIN
-        elif values["evidence_origin"] == INJECTED_FAKE_ORIGIN:
+        elif attestation.evidence_origin == INJECTED_FAKE_ORIGIN:
             if self.origin != INJECTED_TEST_ORIGIN:
                 raise ProvenanceError("final_prerequisite_mismatch")
             final_origin = INJECTED_FAKE_ORIGIN
         else:
             raise ProvenanceError("final_prerequisite_mismatch")
-        if (values["profile_digest"] != qualification_execution.body["profile"]["detached_digest"]
-                or qualification_execution.origin != (
+        if (qualification_execution.origin != (
                     RUNTIME_VERIFIED_ORIGIN
                     if final_origin == RUNTIME_VERIFIED_ORIGIN else INJECTED_TEST_ORIGIN
-                )
-                or values["qualification_aggregate_digest"] != prerequisites.qualification_aggregate_digest
-                or values["probe_aggregate_digest"] != prerequisites.probe_aggregate_digest
-                or values["qualification_terminal_ledger_digest"]
-                    != prerequisites.qualification_terminal_ledger_digest
-                or values["ownership_receipt"].identity
-                    != prerequisites.qualification_ownership_receipt.identity
-                or values["terminal_receipt"].identity
-                    != prerequisites.qualification_terminal_receipt.identity
-                or not qualification_execution.owns(values["authority_binding"])):
-            raise ProvenanceError("final_prerequisite_mismatch")
-        if values["authority_binding"].lifecycle != "active":
+                )):
             raise ProvenanceError("final_prerequisite_mismatch")
         if not _ledger_is(qualification_ledger, namespace="qualification", state="terminal",
                           reservation=qualification_execution.body["reservation_id"]):
@@ -3645,9 +4130,12 @@ class ParentExecutionAuthority:
             raise ProvenanceError("final_prerequisite_mismatch")
         terminal = qualification_ledger.events[-1].payload
         if (terminal.get("result") != "passed"
-                or terminal.get("qualification_aggregate_digest")
-                    != prerequisites.qualification_aggregate_digest
-                or terminal.get("probe_aggregate_digest") != prerequisites.probe_aggregate_digest):
+                or terminal.get("semantic_projection_digest")
+                    != prerequisites.qualification_semantic_projection_digest
+                or attestation.probe_terminal_digest
+                    != prerequisites.qualification_probe_projection_digest
+                or terminal.get("semantic_verifier_identity")
+                    != attestation.semantic_verifier_identity):
             raise ProvenanceError("final_prerequisite_mismatch")
         if (target is None or output is None
                 or not isinstance(target, TargetLockObservation)
@@ -3693,6 +4181,7 @@ class ParentExecutionAuthority:
             nonce=final_snapshot["nonce"],
             profile_digest=prerequisites.profile_digest,
             qualification_authority_digest=qualification_execution.identity,
+            qualification_semantic_attestation=attestation,
             evidence_origin=final_origin,
             ledger=final_ledger, now=now,
             external_revision_authorization=(
@@ -3713,13 +4202,16 @@ class ParentExecutionAuthority:
             "capabilities": list(final_run.capabilities),
             "evidence_origin": final_origin,
             "qualification_authority_digest": qualification_execution.identity,
-            "qualification_aggregate_digest": prerequisites.qualification_aggregate_digest,
-            "probe_aggregate_digest": prerequisites.probe_aggregate_digest,
+            "qualification_semantic_attestation_digest": attestation.identity,
+            "qualification_semantic_projection_digest":
+                prerequisites.qualification_semantic_projection_digest,
+            "qualification_probe_projection_digest":
+                prerequisites.qualification_probe_projection_digest,
+            "qualification_terminal_receipt_census_digest":
+                prerequisites.qualification_terminal_receipt_census_digest,
+            "qualification_terminal_event_digest":
+                prerequisites.qualification_terminal_event_digest,
             "qualification_terminal_ledger_digest": prerequisites.qualification_terminal_ledger_digest,
-            "qualification_ownership_receipt_digest":
-                prerequisites.qualification_ownership_receipt.identity,
-            "qualification_terminal_receipt_digest":
-                prerequisites.qualification_terminal_receipt.identity,
             "checkout": _deep_thaw(qualification_execution.body["checkout"]),
             "source_closure": _deep_thaw(qualification_execution.body["source_closure"]),
             "execution_capsule": _deep_thaw(qualification_execution.body["execution_capsule"]),
@@ -3765,9 +4257,7 @@ class ParentExecutionAuthority:
     def mint_final(
         self, prerequisites: FinalExecutionPrerequisites,
          qualification_authority: QualificationExecutionAuthority | ActiveQualificationAuthority,
-         *, now: int | None = None, qualification_evidence: Any = None,
-        qualification_aggregate: Any = None, probe_aggregate: Any = None,
-        qualification_ledger: Any = None, final_ledger: Any,
+         *, now: int | None = None, qualification_ledger: Any = None, final_ledger: Any,
         target: TargetLockObservation,
         output: OutputRootObservation,
         target_lease: K12RetainedTargetLease,
@@ -3779,9 +4269,6 @@ class ParentExecutionAuthority:
             try:
                 return self._mint_final_impl(
                     prerequisites, qualification_authority, now=now,
-                    qualification_evidence=qualification_evidence,
-                    qualification_aggregate=qualification_aggregate,
-                    probe_aggregate=probe_aggregate,
                     qualification_ledger=qualification_ledger,
                     final_ledger=final_ledger, target=target, output=output,
                     target_lease=target_lease,
@@ -4028,47 +4515,46 @@ def verify_final_first_consume(
                 != bound["qualification_authority_digest"]:
             raise ProvenanceError("first_consume_mismatch")
         expected = {name: bound.get(name) for name in (
-            "qualification_aggregate_digest", "probe_aggregate_digest",
+            "qualification_semantic_projection_digest",
+            "qualification_probe_projection_digest",
+            "qualification_terminal_receipt_census_digest",
+            "qualification_terminal_event_digest",
             "qualification_terminal_ledger_digest", "source_aggregate",
             "profile_digest", "contract_set_digest", "capsule_digest",
-            "qualification_ownership_receipt_digest",
-            "qualification_terminal_receipt_digest",
+            "qualification_semantic_attestation_digest",
         )}
         observed = {name: getattr(observation.prerequisites, name)
                     if hasattr(observation.prerequisites, name)
                     else None for name in expected}
         if observed != expected:
             raise ProvenanceError("first_consume_mismatch")
-        values = _live_evidence_values(observation.prerequisites.qualification_evidence)
-        _validate_evidence_ownership(
-            values["authority"],
-            observation.prerequisites.qualification_evidence,
-            values,
-            controller=owner,
-        )
-        if (values["authority"].identity
-                != observation.prerequisites.qualification_authority_digest
-                or values["authority"].owner is not owner
-                or values["controller"] is not owner
-                or values["evidence_origin"] != bound["evidence_origin"]
-                or not values["authority"].current_at(now)
-                or values["authority"].lifecycle != "active"
-                or not values["authority"].owns(values["authority_binding"])
-                or values["qualification_aggregate_digest"]
-                != observation.prerequisites.qualification_aggregate_digest
-                or values["ownership_receipt"].identity
-                    != observation.prerequisites.qualification_ownership_receipt.identity
-                or values["terminal_receipt"].identity
-                    != observation.prerequisites.qualification_terminal_receipt.identity
-                or not values["ownership_receipt"].authenticates(
-                    observation.prerequisites.qualification_evidence
-                )):
+        attestation = observation.prerequisites.qualification_semantic_attestation
+        if (not owner.owns_qualification_semantic_attestation(attestation)
+                or not owner.qualification_authority_is_current_for_attestation(
+                    attestation, now=now,
+                )
+                or attestation.identity
+                    != bound["qualification_semantic_attestation_digest"]
+                or authority.run_authorization.body.get(
+                    "qualification_semantic_attestation_digest"
+                ) != attestation.identity):
             raise ProvenanceError("final_prerequisite_mismatch")
-        revision_authorization = (
-            values["authority"].authority.run_authorization
-            .external_revision_authorization
-        )
-        if (not revision_authorization.owned_by(values["controller"])
+        if (attestation.qualification_authority_digest
+                != observation.prerequisites.qualification_authority_digest
+                or attestation.evidence_origin != bound["evidence_origin"]
+                or attestation.semantic_projection_digest
+                    != observation.prerequisites.qualification_semantic_projection_digest
+                or attestation.probe_terminal_digest
+                    != observation.prerequisites.qualification_probe_projection_digest
+                or attestation.terminal_receipt_digest
+                    != observation.prerequisites.qualification_terminal_receipt_census_digest
+                or attestation.terminal_event_digest
+                    != observation.prerequisites.qualification_terminal_event_digest
+                or attestation.terminal_ledger_digest
+                    != observation.prerequisites.qualification_terminal_ledger_digest):
+            raise ProvenanceError("final_prerequisite_mismatch")
+        revision_authorization = authority.run_authorization.external_revision_authorization
+        if (not revision_authorization.owned_by(owner)
                 or bound.get("external_revision_authorization")
                     != revision_authorization.receipt()
                 or bound.get("external_revision_authorization_digest")
@@ -4077,7 +4563,12 @@ def verify_final_first_consume(
         observation.checkout.validate(revision_authorization)
         if observation.checkout.canonical() != bound["checkout"]:
             raise ProvenanceError("first_consume_mismatch")
-        if (observation.source.origin != values["authority"].origin
+        expected_source_origin = (
+            RUNTIME_VERIFIED_ORIGIN
+            if attestation.evidence_origin == RUNTIME_VERIFIED_ORIGIN
+            else INJECTED_TEST_ORIGIN
+        )
+        if (observation.source.origin != expected_source_origin
                 or not observation.source.owned_by(owner)
                 or observation.source.canonical() != bound["source_closure"]):
             raise ProvenanceError("first_consume_mismatch")

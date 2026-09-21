@@ -34,22 +34,12 @@ from .k12_execution_provenance import (
     LIVE_FINAL_NAMESPACE,
     PROFILE_V2,
     ProvenanceError,
+    QualificationSemanticAttestation,
     RUNTIME_VERIFIED_ORIGIN,
     authority_owns_profile,
 )
 from .k12_live_containment import LiveObservation, validate_final_observation
-# The qualification module intentionally owns only the four probe labels.  Do
-# not import a second mutable copy of that schedule here.
-from .k12_live_qualification import (
-    INJECTED_FAKE_EVIDENCE_ORIGIN,
-    LIVE_EVIDENCE_ORIGIN,
-    LIVE_QUALIFICATION_PROVENANCE,
-    LiveQualificationAggregate,
-    ProbeAggregate,
-    QualificationAggregateOwnershipReceipt,
-    QualificationAggregate,
-    QUALIFICATION_PROBE_PROVENANCE,
-)
+from .k12_qualification_semantics import PROBES as QUALIFICATION_PROBES
 from .k12_protocol import build_k12_cells
 from .k12_runtime_profile import detached_digest, strict_json_load
 
@@ -57,7 +47,7 @@ from .k12_runtime_profile import detached_digest, strict_json_load
 # Deliberately exhaustive: a caller cannot continue by inventing a new/default
 # state after an A/R/S or containment stop.
 LIVE_CONTAINMENT_PROBE_IDENTITY = "minecraft-k12-live-containment-probe/1"
-CONTAINMENT_PROBES = ("P1", "P2", "P3", "P4")
+CONTAINMENT_PROBES = QUALIFICATION_PROBES
 LIVE_FINAL_WRAPPER_IDENTITY = "minecraft-eac-k12-live-controlled-recovery/2"
 STOP_POLICY_IDENTITY = "minecraft-k12-live-stop-policy/1"
 
@@ -90,6 +80,8 @@ _FINAL_ADMISSION_KEYS: set[str] = set()
 _FINAL_EVIDENCE_ORIGINS = frozenset(
     {"test_only", RUNTIME_VERIFIED_ORIGIN, INJECTED_FAKE_ORIGIN}
 )
+INJECTED_FAKE_EVIDENCE_ORIGIN = INJECTED_FAKE_ORIGIN
+LIVE_EVIDENCE_ORIGIN = RUNTIME_VERIFIED_ORIGIN
 
 
 def _raw_digest(value: Any) -> bool:
@@ -128,37 +120,6 @@ def _authority_evidence_origin(authority: ActiveFinalAuthority) -> str:
             raise ProvenanceError("authority_origin_mismatch")
         return INJECTED_FAKE_ORIGIN
     raise ProvenanceError("authority_origin_mismatch")
-
-
-def _qualification_binding_origin(evidence_origin: str) -> str:
-    if evidence_origin == RUNTIME_VERIFIED_ORIGIN:
-        return RUNTIME_VERIFIED_ORIGIN
-    if evidence_origin == INJECTED_FAKE_ORIGIN:
-        return INJECTED_TEST_ORIGIN
-    raise ProvenanceError("final_prerequisite_mismatch")
-
-
-def _validate_qualification_ownership(
-    qualification: LiveQualificationAggregate,
-) -> QualificationAggregateOwnershipReceipt:
-    if not isinstance(qualification, LiveQualificationAggregate):
-        raise TypeError("typed live qualification aggregate required")
-    try:
-        receipt = qualification.authenticate_for_final_prerequisites(
-            qualification.authority,
-            qualification.controller,
-        )
-    except (AttributeError, TypeError, ValueError, ProvenanceError) as exc:
-        raise ProvenanceError("final_prerequisite_mismatch") from exc
-    if not isinstance(receipt, QualificationAggregateOwnershipReceipt) or not receipt.authenticates(
-        qualification,
-        authority=qualification.authority,
-        controller=qualification.controller,
-    ) or not qualification.controller.owns_qualification_evidence(
-        qualification, receipt,
-    ):
-        raise ProvenanceError("final_prerequisite_mismatch")
-    return receipt
 
 
 def final_cell_ids() -> tuple[str, ...]:
@@ -477,8 +438,10 @@ def final_common_closure(
     body.pop("detached_artifact_sha256", None)
     required = (
         "qualification_authority_digest",
-        "qualification_aggregate_digest",
-        "probe_aggregate_digest",
+        "qualification_semantic_projection_digest",
+        "qualification_probe_projection_digest",
+        "qualification_terminal_receipt_census_digest",
+        "qualification_terminal_event_digest",
         "qualification_terminal_ledger_digest",
         "source_aggregate",
         "profile_digest",
@@ -495,8 +458,14 @@ def final_common_closure(
             "authority": authority.identity,
             "authority_binding": authority.binding.canonical(),
             "qualification_authority_digest": body["qualification_authority_digest"],
-            "qualification_aggregate_digest": body["qualification_aggregate_digest"],
-            "probe_aggregate_digest": body["probe_aggregate_digest"],
+            "qualification_semantic_projection_digest":
+                body["qualification_semantic_projection_digest"],
+            "qualification_probe_projection_digest":
+                body["qualification_probe_projection_digest"],
+            "qualification_terminal_receipt_census_digest":
+                body["qualification_terminal_receipt_census_digest"],
+            "qualification_terminal_event_digest":
+                body["qualification_terminal_event_digest"],
             "qualification_terminal_ledger_digest": body["qualification_terminal_ledger_digest"],
             "checkout": dict(checkout),
             "source_aggregate": body["source_aggregate"],
@@ -676,8 +645,10 @@ class FinalCampaignAdmission:
     schedule: tuple[str, ...]
     common_closure_digest: str
     profile_digest: str
-    qualification_aggregate_digest: str
-    probe_aggregate_digest: str
+    qualification_semantic_projection_digest: str
+    qualification_probe_projection_digest: str
+    qualification_terminal_receipt_census_digest: str
+    qualification_terminal_event_digest: str
     qualification_terminal_ledger_digest: str
     evidence_origin: str
     identity: str
@@ -695,11 +666,12 @@ class FinalCampaignAdmission:
         campaign_id: str,
         manifest: FinalCampaignManifest,
         common_closure_digest: str,
-        qualification_aggregate_digest: str,
-        probe_aggregate_digest: str,
+        qualification_semantic_projection_digest: str,
+        qualification_probe_projection_digest: str,
+        qualification_terminal_receipt_census_digest: str,
+        qualification_terminal_event_digest: str,
         qualification_terminal_ledger_digest: str,
         evidence_origin: str,
-        observations: tuple[FinalCellEvidence, ...],
         token: object = None,
     ) -> None:
         if token is not _FINAL_ADMISSION_TOKEN:
@@ -714,8 +686,10 @@ class FinalCampaignAdmission:
         if common_closure_digest != expected_closure:
             raise ProvenanceError("final_prerequisite_mismatch")
         if (
-            not _digest(qualification_aggregate_digest)
-            or not _digest(probe_aggregate_digest)
+            not _digest(qualification_semantic_projection_digest)
+            or not _digest(qualification_probe_projection_digest)
+            or not _digest(qualification_terminal_receipt_census_digest)
+            or not _digest(qualification_terminal_event_digest)
             or not _digest(qualification_terminal_ledger_digest)
             or evidence_origin not in _FINAL_EVIDENCE_ORIGINS
             or evidence_origin != expected_origin
@@ -730,13 +704,13 @@ class FinalCampaignAdmission:
         object.__setattr__(self, "schedule", FINAL_SCHEDULE)
         object.__setattr__(self, "common_closure_digest", common_closure_digest)
         object.__setattr__(self, "profile_digest", authority.profile_digest)
-        object.__setattr__(self, "qualification_aggregate_digest", qualification_aggregate_digest)
-        object.__setattr__(self, "probe_aggregate_digest", probe_aggregate_digest)
+        object.__setattr__(self, "qualification_semantic_projection_digest", qualification_semantic_projection_digest)
+        object.__setattr__(self, "qualification_probe_projection_digest", qualification_probe_projection_digest)
+        object.__setattr__(self, "qualification_terminal_receipt_census_digest", qualification_terminal_receipt_census_digest)
+        object.__setattr__(self, "qualification_terminal_event_digest", qualification_terminal_event_digest)
         object.__setattr__(self, "qualification_terminal_ledger_digest", qualification_terminal_ledger_digest)
         object.__setattr__(self, "evidence_origin", evidence_origin)
         object.__setattr__(self, "_state", state)
-        if observations:
-            raise ValueError("terminal final-cell evidence is post-launch")
         object.__setattr__(
             self,
             "identity",
@@ -750,25 +724,15 @@ class FinalCampaignAdmission:
                     "schedule": list(FINAL_SCHEDULE),
                     "common_closure_digest": common_closure_digest,
                     "profile_digest": authority.profile_digest,
-                    "qualification_aggregate_digest": qualification_aggregate_digest,
-                    "probe_aggregate_digest": probe_aggregate_digest,
+                    "qualification_semantic_projection_digest": qualification_semantic_projection_digest,
+                    "qualification_probe_projection_digest": qualification_probe_projection_digest,
+                    "qualification_terminal_receipt_census_digest": qualification_terminal_receipt_census_digest,
+                    "qualification_terminal_event_digest": qualification_terminal_event_digest,
                     "qualification_terminal_ledger_digest": qualification_terminal_ledger_digest,
                     "evidence_origin": evidence_origin,
                 }
             ),
         )
-
-    def _validate_observation_census(
-        self, observations: tuple[FinalCellEvidence, ...]
-    ) -> None:
-        if type(observations) is not tuple or len(observations) != FINAL_CELL_COUNT:
-            raise ValueError("final campaign requires the exact ninety-cell census")
-        if tuple(observation.cell_id for observation in observations) != FINAL_SCHEDULE:
-            raise ValueError("final cell schedule order mismatch")
-        if len({observation.cell_id for observation in observations}) != FINAL_CELL_COUNT:
-            raise ValueError("duplicate final cell evidence")
-        for observation in observations:
-            self._validate_cell_observation(observation, observation.cell_id)
 
     def _validate_cell_observation(self, value: FinalCellEvidence, cell_id: str) -> None:
         if not isinstance(value, FinalCellEvidence):
@@ -853,33 +817,25 @@ class FinalCampaignAdmission:
     def observations(self) -> tuple[FinalCellEvidence, ...]:
         return tuple(self._state.observations[cell_id] for cell_id in FINAL_SCHEDULE if cell_id in self._state.observations)
 
-    def matches_qualification(
-        self, qualification: LiveQualificationAggregate, probes: ProbeAggregate
-    ) -> bool:
-        try:
-            _validate_qualification_ownership(qualification)
-        except (TypeError, ValueError, ProvenanceError):
-            return False
+    def matches_qualification(self, attestation: QualificationSemanticAttestation) -> bool:
         return (
-            isinstance(qualification, LiveQualificationAggregate)
-            and isinstance(probes, ProbeAggregate)
-            and qualification.identity == self.qualification_aggregate_digest
-            and probes.identity == self.probe_aggregate_digest
-            and qualification.probes.identity == probes.identity
-            and qualification.qualification_terminal_ledger_digest
-            == self.qualification_terminal_ledger_digest
-            and qualification.profile_digest == self.profile_digest
+            isinstance(attestation, QualificationSemanticAttestation)
+            and self.authority.owner.owns_qualification_semantic_attestation(attestation)
+            and attestation.semantic_projection_digest
+                == self.qualification_semantic_projection_digest
+            and attestation.probe_terminal_digest
+                == self.qualification_probe_projection_digest
+            and attestation.terminal_receipt_digest
+                == self.qualification_terminal_receipt_census_digest
+            and attestation.terminal_event_digest
+                == self.qualification_terminal_event_digest
+            and attestation.terminal_ledger_digest == self.qualification_terminal_ledger_digest
+            and attestation.profile_digest == self.profile_digest
+            and self.authority.body.get("qualification_semantic_attestation_digest")
+                == attestation.identity
             and self.authority.body.get("qualification_authority_digest")
-            == qualification.authority_binding.authority_digest
-            and qualification.authority_binding.namespace == "live_qualification"
-            and probes.authority_binding.namespace == "qualification_probe"
-            and probes.execution_provenance == QUALIFICATION_PROBE_PROVENANCE
-            and qualification.evidence_origin == self.evidence_origin
-            and probes.evidence_origin == self.evidence_origin
-            and qualification.authority_binding.origin
-            == _qualification_binding_origin(self.evidence_origin)
-            and probes.authority_binding.origin
-            == _qualification_binding_origin(self.evidence_origin)
+                == attestation.qualification_authority_digest
+            and attestation.evidence_origin == self.evidence_origin
         )
 
     def validate(self) -> bool:
@@ -1347,39 +1303,27 @@ FinalCellScope = FinalCellAuthority
 
 def admit_final_campaign(
     authority: ActiveFinalAuthority,
-    qualification: LiveQualificationAggregate | tuple[FinalCellEvidence, ...] | None = None,
-    probes: ProbeAggregate | None = None,
+    qualification: QualificationSemanticAttestation | None = None,
     *,
     manifest: FinalCampaignManifest | Mapping[str, Any] | None = None,
     manifest_identity: str = "",
     manifest_digest: str = "",
     manifest_phase: str = FINAL_PHASE,
     campaign_id: str = "",
-    cell_observations: tuple[FinalCellEvidence, ...] = (),
-    observations: tuple[FinalCellEvidence, ...] | None = None,
     schedule: Sequence[str] | None = None,
     common_closure_digest: str = "",
     evidence_origin: str | None = None,
 ) -> FinalCampaignAdmission:
     """Mint one final campaign admission from an active final authority.
 
-    The typed live qualification aggregate and its separate probe aggregate
-    are required at this boundary.  The final campaign identity must also be
+    The parent-owned semantic attestation is the only qualification input at
+    this boundary. The final campaign identity must also be
     distinct from both qualification campaign identities; omitting it can
     never authorize a launch.
     """
 
     _validate_active_final_authority(authority)
     expected_origin = _authority_evidence_origin(authority)
-    if observations is not None:
-        if cell_observations:
-            raise ValueError("duplicate final observation arguments")
-        cell_observations = observations
-    if isinstance(qualification, tuple) and not cell_observations:
-        cell_observations = qualification
-        qualification = None
-    if cell_observations:
-        raise ValueError("terminal final-cell evidence is post-launch")
     if manifest is None and manifest_identity and manifest_digest:
         manifest = FinalCampaignManifest(
             manifest_phase,
@@ -1397,48 +1341,41 @@ def admit_final_campaign(
     if not isinstance(manifest, FinalCampaignManifest):
         raise TypeError("typed final phase manifest required")
     body = authority.body
-    qualification_digest = body.get("qualification_aggregate_digest", "")
-    probe_digest = body.get("probe_aggregate_digest", "")
+    qualification_digest = body.get("qualification_semantic_projection_digest", "")
+    probe_digest = body.get("qualification_probe_projection_digest", "")
+    receipt_digest = body.get("qualification_terminal_receipt_census_digest", "")
+    terminal_event_digest = body.get("qualification_terminal_event_digest", "")
     terminal_digest = body.get("qualification_terminal_ledger_digest", "")
-    if not isinstance(qualification, LiveQualificationAggregate):
-        raise TypeError("typed live qualification aggregate required")
-    _validate_qualification_ownership(qualification)
-    if not qualification.qualifies():
-        raise ProvenanceError("final_prerequisite_mismatch")
-    if probes is None:
-        probes = qualification.probes
-    if not isinstance(probes, ProbeAggregate):
-        raise TypeError("typed qualification probe aggregate required")
+    if isinstance(qualification, QualificationSemanticAttestation):
+        attestation = qualification
+        if not authority.owner.owns_qualification_semantic_attestation(attestation):
+            raise ProvenanceError("final_prerequisite_mismatch")
+    else:
+        raise TypeError("parent-owned qualification semantic attestation required")
     if (
-        qualification.identity != qualification_digest
-        or probes.identity != probe_digest
-        or qualification.probes.identity != probes.identity
-        or qualification.qualification_terminal_ledger_digest != terminal_digest
-        or qualification.profile_digest != authority.profile_digest
-        or qualification.authority_binding.authority_digest
-        != body.get("qualification_authority_digest")
-        or qualification.evidence_origin != expected_origin
-        or probes.evidence_origin != expected_origin
+        attestation.semantic_projection_digest != qualification_digest
+        or attestation.probe_terminal_digest != probe_digest
+        or attestation.terminal_receipt_digest != receipt_digest
+        or attestation.terminal_event_digest != terminal_event_digest
+        or attestation.terminal_ledger_digest != terminal_digest
+        or attestation.profile_digest != authority.profile_digest
+        or attestation.qualification_authority_digest
+            != body.get("qualification_authority_digest")
+        or attestation.identity != body.get("qualification_semantic_attestation_digest")
+        or attestation.evidence_origin != expected_origin
         or manifest.evidence_origin != expected_origin
     ):
         raise ProvenanceError("final_prerequisite_mismatch")
-    if not (_digest(qualification_digest) and _digest(probe_digest) and _digest(terminal_digest)):
+    if not all(_digest(value) for value in (
+        qualification_digest, probe_digest, receipt_digest,
+        terminal_event_digest, terminal_digest,
+    )):
         raise ProvenanceError("final_prerequisite_mismatch")
     if not campaign_id:
         raise ValueError("final campaign identity is required")
-    if campaign_id in {qualification.campaign_id, probes.campaign_id}:
+    if campaign_id in {attestation.cell_campaign_id, attestation.probe_campaign_id}:
         raise ProvenanceError("final_prerequisite_mismatch")
-    if cell_observations:
-        if type(cell_observations) is not tuple or any(
-            not isinstance(value, FinalCellEvidence) for value in cell_observations
-        ):
-            raise TypeError("typed final cell evidence tuple required")
-        origins = {value.evidence_origin for value in cell_observations}
-        if len(origins) != 1:
-            raise ValueError("mixed final cell evidence origin")
-        observed_origin = origins.pop()
-    else:
-        observed_origin = manifest.evidence_origin
+    observed_origin = manifest.evidence_origin
     if evidence_origin is None:
         evidence_origin = observed_origin
     if evidence_origin not in _FINAL_EVIDENCE_ORIGINS:
@@ -1458,9 +1395,10 @@ def admit_final_campaign(
             closure,
             qualification_digest,
             probe_digest,
+            receipt_digest,
+            terminal_event_digest,
             terminal_digest,
             evidence_origin,
-            tuple(cell_observations),
             _FINAL_ADMISSION_TOKEN,
         )
         _FINAL_ADMISSION_KEYS.add(authority.identity)
@@ -1565,8 +1503,7 @@ class FinalGateInput:
     wrapper: LiveFinalWrapper
     profile_digest: str
     campaign_id: str
-    qualification: QualificationAggregate
-    probes: ProbeAggregate
+    qualification_attestation: QualificationSemanticAttestation
     manifests_clean: bool
     schedule_count: int = FINAL_CELL_COUNT
     retry: bool = False
@@ -1588,8 +1525,8 @@ class FinalGateInput:
                     "wrapper": getattr(self.wrapper, "digest", None),
                     "profile_digest": self.profile_digest,
                     "campaign_id": self.campaign_id,
-                    "qualification": _object_identity(self.qualification),
-                    "probes": _object_identity(self.probes),
+                    "qualification_attestation":
+                        _object_identity(self.qualification_attestation),
                     "manifests_clean": self.manifests_clean,
                     "schedule_count": self.schedule_count,
                     "retry": self.retry,
@@ -1626,8 +1563,8 @@ def final_launch_gate(value: FinalGateInput) -> bool:
             "wrapper": getattr(value.wrapper, "digest", None),
             "profile_digest": value.profile_digest,
             "campaign_id": value.campaign_id,
-            "qualification": _object_identity(value.qualification),
-            "probes": _object_identity(value.probes),
+            "qualification_attestation":
+                _object_identity(value.qualification_attestation),
             "manifests_clean": value.manifests_clean,
             "schedule_count": value.schedule_count,
             "retry": value.retry,
@@ -1644,9 +1581,9 @@ def final_launch_gate(value: FinalGateInput) -> bool:
     )
     if value.authenticated_digest != expected:
         return False
-    if not isinstance(value.qualification, LiveQualificationAggregate):
-        return False
-    if not isinstance(value.probes, ProbeAggregate):
+    if not isinstance(
+        value.qualification_attestation, QualificationSemanticAttestation,
+    ):
         return False
     if not isinstance(value.admission, FinalCampaignAdmission):
         return False
@@ -1657,7 +1594,7 @@ def final_launch_gate(value: FinalGateInput) -> bool:
     active = value.admission.authority
     if (
         not value.admission.runtime_admissible
-        or not value.admission.matches_qualification(value.qualification, value.probes)
+        or not value.admission.matches_qualification(value.qualification_attestation)
         or authority.identity != active.identity
         or binding != active.binding
          or not authority.owns(binding)
@@ -1671,14 +1608,23 @@ def final_launch_gate(value: FinalGateInput) -> bool:
         return False
     if type(value.observed_at) is not int:
         return False
+    attestation = value.qualification_attestation
     if not (
         authority.body["issued_at"] <= value.observed_at <= authority.body["expires_at"]
     ):
         return False
     if (
         authority.body.get("profile_digest") != value.profile_digest
-        or authority.body.get("qualification_aggregate_digest") != value.qualification.identity
-        or authority.body.get("probe_aggregate_digest") != value.probes.identity
+        or authority.body.get("qualification_semantic_projection_digest")
+            != attestation.semantic_projection_digest
+        or authority.body.get("qualification_probe_projection_digest")
+            != attestation.probe_terminal_digest
+        or authority.body.get("qualification_terminal_receipt_census_digest")
+            != attestation.terminal_receipt_digest
+        or authority.body.get("qualification_terminal_event_digest")
+            != attestation.terminal_event_digest
+        or authority.body.get("qualification_semantic_attestation_digest")
+            != attestation.identity
         or value.wrapper.identity != LIVE_FINAL_WRAPPER_IDENTITY
          or value.wrapper.digest
          != LiveFinalWrapper(
@@ -1691,26 +1637,13 @@ def final_launch_gate(value: FinalGateInput) -> bool:
          or value.profile_digest != value.wrapper.profile_digest
          or value.campaign_id != value.wrapper.campaign_id
          or value.admission.campaign_id != value.campaign_id
-         or not value.qualification.qualifies()
-         or value.qualification.profile_digest != value.profile_digest
-         or value.qualification.evidence_origin != LIVE_EVIDENCE_ORIGIN
-         or value.qualification.authority_binding.origin != RUNTIME_VERIFIED_ORIGIN
-         or not value.probes.passed
-         or value.probes.probes != CONTAINMENT_PROBES
-         or value.probes.profile_digest != value.profile_digest
-         or value.probes.execution_provenance != QUALIFICATION_PROBE_PROVENANCE
-         or value.probes.evidence_origin != LIVE_EVIDENCE_ORIGIN
-         or value.probes.authority_binding.origin != RUNTIME_VERIFIED_ORIGIN
-        or any(
-            result.trace.execution_provenance != LIVE_QUALIFICATION_PROVENANCE
-            or result.trace.evidence_origin != LIVE_EVIDENCE_ORIGIN
-            for result in value.qualification.results
-        )
+         or attestation.profile_digest != value.profile_digest
+         or attestation.evidence_origin != LIVE_EVIDENCE_ORIGIN
         or len(
             {
                 value.campaign_id,
-                value.qualification.campaign_id,
-                value.probes.campaign_id,
+                attestation.cell_campaign_id,
+                attestation.probe_campaign_id,
             }
         )
         != 3

@@ -52,6 +52,8 @@ from benchmarks.minecraft.k12_live_qualification import (
     LiveQualificationCellEvidence,
     LiveQualificationProbeEvidence,
     aggregate_live_qualification,
+    issue_live_qualification_capabilities,
+    publish_live_qualification_terminals,
     qualification_ids,
 )
 from benchmarks.minecraft.k12_live_runner import (
@@ -358,6 +360,8 @@ def _qualification_evidence(
     label: str,
     campaign_id: str,
     probe_campaign_id: str,
+    cell_capabilities,
+    probe_capabilities,
 ):
     cells = []
     for ordinal, cell_id in enumerate(qualification_ids(), 1):
@@ -417,6 +421,7 @@ def _qualification_evidence(
                 request_identity=(f"request-{label}-{ordinal}" if arm == "S" else None),
                 permit_identity=(f"permit-{label}-{ordinal}" if arm == "S" else None),
                 effect_identity=(f"effect-{label}-{ordinal}" if arm == "S" else None),
+                terminal_capability=cell_capabilities[ordinal - 1],
             )
         )
     probe_binding = authority.authority.binding("qualification_probe")
@@ -432,8 +437,9 @@ def _qualification_evidence(
             terminal_verified=True,
             authority_binding=probe_binding,
             evidence_origin=INJECTED_FAKE_ORIGIN,
+            terminal_capability=probe_capabilities[index],
         )
-        for probe in PROBES
+        for index, probe in enumerate(PROBES)
     )
     return tuple(cells), probes
 
@@ -502,7 +508,9 @@ class _Graph:
         self.qualification_ledger.close()
 
 
-def _build_qualification(tmp_path: Path, label: str) -> _QualificationFixture:
+def _build_qualification(
+    tmp_path: Path, label: str, *, publish: bool = True,
+) -> _QualificationFixture:
     """Build the graph through active qualification, before aggregation."""
     parent = ParentExecutionAuthority()
     controller = parent.injected_test_controller()
@@ -544,12 +552,21 @@ def _build_qualification(tmp_path: Path, label: str) -> _QualificationFixture:
         now=102,
         ledger=qualification_ledger,
     )
+    cell_capabilities, probe_capabilities = issue_live_qualification_capabilities(
+        active_qualification
+    )
     cells, probes = _qualification_evidence(
         active_qualification,
         label,
         qualification_campaign,
         probe_campaign,
+        cell_capabilities,
+        probe_capabilities,
     )
+    if publish:
+        publish_live_qualification_terminals(
+            active_qualification, cells, probes, ledger=qualification_ledger,
+        )
     return _QualificationFixture(
         label,
         parent,
@@ -612,15 +629,14 @@ def _build_graph(tmp_path: Path, label: str) -> _Graph:
     final_snapshot = final_lock.retained_lease_snapshot()
     assert final_snapshot.acquired is True
     final_lease = controller.retain_target_lease(final_lock, final_reservation)
-    prerequisites = FinalExecutionPrerequisites.from_live_qualification(
+    prerequisites = FinalExecutionPrerequisites.from_semantic_attestation(
         active_qualification,
-        aggregate,
+        aggregate.semantic_attestation,
     )
     final_authority = controller.mint_final(
         prerequisites,
         active_qualification,
         now=103,
-        qualification_evidence=aggregate,
         qualification_ledger=qualification_ledger,
         final_ledger=final_ledger,
         target=_target(final_reservation, final_lease),
@@ -662,8 +678,7 @@ def _build_graph(tmp_path: Path, label: str) -> _Graph:
     manifest = load_final_campaign_manifest(evidence_origin=INJECTED_FAKE_ORIGIN)
     admission = admit_final_campaign(
         active_final,
-        aggregate,
-        aggregate.probes,
+        aggregate.semantic_attestation,
         manifest=manifest,
         campaign_id=final_campaign,
         schedule=FINAL_SCHEDULE,
@@ -973,8 +988,7 @@ def test_expired_final_authority_is_rejected_before_fake_dispatch(tmp_path):
         with pytest.raises(ProvenanceError, match="authority_replay"):
             admit_final_campaign(
                 graph.active_final,
-                graph.aggregate,
-                graph.aggregate.probes,
+                graph.aggregate.semantic_attestation,
                 manifest=graph.manifest,
                 campaign_id=graph.final_campaign,
                 evidence_origin=INJECTED_FAKE_ORIGIN,
@@ -1137,7 +1151,6 @@ def test_final_mint_rejects_cross_target_before_authority(tmp_path):
                 prerequisites,
                 qualification.active_qualification,
                 now=103,
-                qualification_evidence=aggregate,
                 qualification_ledger=qualification.qualification_ledger,
                 final_ledger=final_ledger,
                 target=cross_target,
@@ -1202,7 +1215,9 @@ def test_minecraft_k12_authority_negative_matrix_denies_before_real_entry(
     expected: str,
 ):
     if case == "partial_aggregate":
-        qualification = _build_qualification(tmp_path, f"negative-{case}")
+        qualification = _build_qualification(
+            tmp_path, f"negative-{case}", publish=False,
+        )
         try:
             assert qualification.qualification_ledger.state == "active"
             assert len(qualification.cells) == 15
@@ -1267,8 +1282,7 @@ def test_minecraft_k12_authority_negative_matrix_denies_before_real_entry(
             elif case == "closure_mismatch":
                 admit_final_campaign(
                     graph.active_final,
-                    graph.aggregate,
-                    graph.aggregate.probes,
+                    graph.aggregate.semantic_attestation,
                     manifest=graph.manifest,
                     campaign_id=graph.final_campaign,
                     common_closure_digest=canonical_sha256({"closure": "wrong"}),
@@ -1284,8 +1298,7 @@ def test_minecraft_k12_authority_negative_matrix_denies_before_real_entry(
                 try:
                     admit_final_campaign(
                         graph.active_final,
-                        other.aggregate,
-                        other.aggregate.probes,
+                        other.aggregate.semantic_attestation,
                         manifest=graph.manifest,
                         campaign_id=graph.final_campaign,
                         evidence_origin=INJECTED_FAKE_ORIGIN,

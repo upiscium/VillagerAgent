@@ -41,12 +41,24 @@ from .k12_execution_provenance import (
     QUALIFICATION_PROBE_NAMESPACE,
     PROFILE_V2,
     ProvenanceError,
+    QualificationSemanticAttestation,
     QUALIFICATION_AUTHORITY,
     RUNTIME_VERIFIED_ORIGIN,
     authority_owns_profile,
 )
+from .k12_qualification_semantics import (
+    NormalizedCell,
+    NormalizedProbe,
+    NormalizedRejectionBinding,
+    QualificationCensus,
+    PROBES as FROZEN_QUALIFICATION_PROBES,
+    QUALIFICATION_SCHEDULE,
+    normalized_cell_passes,
+    qualification_cell_clauses,
+    verify_qualification_projection,
+)
 from .k12_live_artifacts import DomainIdentity, LiveArtifact, thaw
-from .k12_live_oracle import RejectionEvidence, Truth, qualification_truth
+from .k12_live_oracle import RejectionEvidence
 from .k12_runtime_profile import (
     LIVE_QUALIFICATION_IDENTITY,
     LIVE_SCHEDULE_IDENTITY,
@@ -56,7 +68,7 @@ from .k12_runtime_profile import (
 )
 
 
-PROBES = ("P1", "P2", "P3", "P4")
+PROBES = FROZEN_QUALIFICATION_PROBES
 STRATA = ("S1", "S2", "S3", "S4", "S5")
 QUALIFICATION_PHASE = "qualification"
 LIVE_QUALIFICATION_PROVENANCE = "live_qualification"
@@ -94,9 +106,7 @@ def _identity(value: Any, label: str) -> str:
 def qualification_ids() -> tuple[str, ...]:
     """Return the authenticated, ordered fifteen-cell qualification census."""
 
-    from .k12_live_fixture import qualification_ids as fixture_ids
-
-    return tuple(fixture_ids())
+    return QUALIFICATION_SCHEDULE
 
 
 def qualification_cells() -> tuple[dict[str, Any], ...]:
@@ -549,20 +559,23 @@ class MockCellQualificationEvidence:
 
 
 def _mock_cell_passes(value: MockCellQualificationEvidence) -> bool:
-    arm = value.cell_id.rsplit("-", 1)[-1]
-    expected_oracle = "not_applicable" if arm == "S" else "true"
-    return (
-        value.cell_id in qualification_ids()
-        and value.fresh_root
-        and value.reset_passed
-        and value.capability_state == "REVOKED"
-        and value.provider_terminal == "success"
-        and value.oracle_value == expected_oracle
-        and value.containment_clean
-        and value.evidence_valid
-        and not value.retry
-        and not value.resumed
-        and not value.replacement
+    return qualification_cell_clauses(
+        cell_id=value.cell_id,
+        fresh_root=value.fresh_root,
+        reset_passed=value.reset_passed,
+        capability_state=value.capability_state,
+        provider_terminal=value.provider_terminal,
+        oracle_value=value.oracle_value,
+        containment_clean=value.containment_clean,
+        evidence_valid=value.evidence_valid,
+        terminal_verified=True,
+        rejection_verified=True,
+        retry=value.retry,
+        resumed=value.resumed,
+        replacement=value.replacement,
+        # Mock evidence predates typed stale-rejection receipts and is barred
+        # from every live/final authority path by its provenance.
+        rejection_matches=True,
     )
 
 
@@ -693,6 +706,7 @@ class LiveQualificationCellEvidence:
     request_identity: str | None = None
     permit_identity: str | None = None
     effect_identity: str | None = None
+    terminal_capability: Any = field(default=None, repr=False, compare=False)
 
 
 LiveCellQualificationEvidence = LiveQualificationCellEvidence
@@ -711,6 +725,7 @@ class LiveQualificationProbeEvidence:
     authority_binding: AuthorityBinding | None = None
     evidence_origin: str = INJECTED_FAKE_EVIDENCE_ORIGIN
     execution_provenance: str = QUALIFICATION_PROBE_PROVENANCE
+    terminal_capability: Any = field(default=None, repr=False, compare=False)
 
 
 LiveProbeEvidence = LiveQualificationProbeEvidence
@@ -787,12 +802,21 @@ def _active_qualification_binding(
         raise ProvenanceError("profile_mismatch")
     if not _raw_digest(authority.profile_digest):
         raise ProvenanceError("profile_mismatch")
-    if not authority_owns_profile(
+    owns_profile = authority_owns_profile(
         authority,
         authority.binding,
         profile_id=PROFILE_V2,
         profile_digest=authority.profile_digest,
-    ):
+    )
+    if not owns_profile:
+        try:
+            owns_profile = authority.owner.owns_qualification_semantic_attestation(
+                authority.owner.qualification_semantic_attestation(authority),
+                authority=authority,
+            )
+        except (AttributeError, TypeError, ValueError, ProvenanceError):
+            owns_profile = False
+    if not owns_profile:
         raise ProvenanceError("authority_replay")
     if not authority.owns(authority.binding):
         raise ProvenanceError("authority_namespace_mismatch")
@@ -877,21 +901,12 @@ def _rejection_binding_matches(
     return True
 
 
-def _live_cell_passes(value: LiveQualificationCellEvidence) -> bool:
-    if value.cell_id not in qualification_ids():
-        return False
-    arm = value.cell_id.rsplit("-", 1)[-1]
-    try:
-        oracle_value = Truth(value.oracle_value)
-    except ValueError:
-        return False
-    # Delegate the A/R/S distinction to the parent oracle.  In particular, S
-    # is a valid stale-rejection control only with typed rejection evidence;
-    # expected rejection is never task success.
-    objective = qualification_truth(
-        arm, oracle_value, rejection_verified=value.rejection_verified
-    )
-    if arm == "S":
+def _live_cell_passes(
+    authority: ActiveQualificationAuthority,
+    value: LiveQualificationCellEvidence,
+    trace: QualificationTrace,
+) -> bool:
+    if value.cell_id.endswith("-S"):
         rejection = value.rejection_evidence
         if not (
             isinstance(rejection, RejectionEvidence)
@@ -906,21 +921,8 @@ def _live_cell_passes(value: LiveQualificationCellEvidence) -> bool:
             and rejection.evidence_origin == value.evidence_origin
         ):
             return False
-    return (
-        value.fresh_root is True
-        and value.reset_passed is True
-        and value.capability_state == "REVOKED"
-        and value.provider_terminal == "success"
-        and objective
-        and value.containment_clean is True
-        and value.evidence_valid is True
-        and value.terminal_verified is True
-        and value.rejection_verified is True
-        and value.evidence_origin in _LIVE_EVIDENCE_ORIGINS
-        and value.execution_provenance == LIVE_QUALIFICATION_PROVENANCE
-        and not value.retry
-        and not value.resumed
-        and not value.replacement
+    return normalized_cell_passes(
+        _normalized_live_cell_from_trace(authority, value, trace)
     )
 
 
@@ -981,7 +983,7 @@ def qualify_live_cell(
     )
     return QualificationCellResult(
         value.cell_id,
-        _live_cell_passes(value),
+        _live_cell_passes(authority, value, trace),
         value.fresh_root,
         value.retry,
         trace,
@@ -997,7 +999,22 @@ def qualify_live_probes(
 ) -> ProbeAggregate:
     """Bind the separate, exhaustive P1--P4 probe campaign."""
 
-    binding = _probe_binding(authority)
+    try:
+        binding = _probe_binding(authority)
+    except ProvenanceError:
+        try:
+            attestation = authority.owner.qualification_semantic_attestation(authority)
+            binding = authority.owner.qualification_probe_binding(authority)
+        except (AttributeError, TypeError, ValueError, ProvenanceError):
+            attestation = None
+            binding = None
+        if (not isinstance(binding, AuthorityBinding)
+                or binding.namespace != QUALIFICATION_PROBE_NAMESPACE
+                or binding.authority_digest != authority.identity
+                or not authority.owner.owns_qualification_semantic_attestation(
+                    attestation, authority=authority,
+                )):
+            raise ProvenanceError("authority_namespace_mismatch")
     expected_origin = _authority_evidence_origin(authority)
     if type(values) is not tuple or any(
         not isinstance(value, LiveQualificationProbeEvidence) for value in values
@@ -1071,80 +1088,6 @@ def _coerce_terminal(
         or terminal.evidence_origin != evidence_origin
     ):
         raise ProvenanceError("first_consume_mismatch")
-    return terminal
-
-
-def _verify_or_append_terminal(
-    authority: ActiveQualificationAuthority,
-    ledger: Any,
-    *,
-    aggregate_digest: str,
-    probe_digest: str,
-    binding: AuthorityBinding,
-    evidence_origin: str,
-    supplied: QualificationTerminalEvidence | Mapping[str, Any] | None,
-) -> QualificationTerminalEvidence:
-    if ledger is not authority.authority.ledger:
-        raise ProvenanceError("authority_replay")
-    if getattr(ledger, "namespace", None) != "qualification":
-        raise ProvenanceError("authority_replay")
-    if getattr(ledger, "reservation_id", None) != authority.reservation_id:
-        raise ProvenanceError("authority_replay")
-    if not getattr(ledger, "verify_chain", lambda: False)():
-        raise ProvenanceError("ledger_corrupt")
-    if ledger.state == "active":
-        if supplied is not None:
-            # A claimed future terminal digest cannot be authenticated before
-            # the parent controller appends the event.
-            raise ProvenanceError("first_consume_mismatch")
-        payload = {
-            "result": "passed",
-            "phase": QUALIFICATION_PHASE,
-            "authority_digest": authority.identity,
-            "qualification_aggregate_digest": aggregate_digest,
-            "probe_aggregate_digest": probe_digest,
-            "evidence_origin": evidence_origin,
-            "terminal_verified": True,
-        }
-        try:
-            authority.owner.ledger_terminal(ledger, payload)
-        except Exception as exc:
-            raise ProvenanceError("authority_replay") from exc
-    if ledger.state != "terminal" or not ledger.events:
-        raise ProvenanceError("first_consume_mismatch")
-    event = ledger.events[-1]
-    payload = dict(event.payload)
-    if (
-        event.state != "terminal"
-        or payload.get("result") != "passed"
-        or payload.get("qualification_aggregate_digest") != aggregate_digest
-        or payload.get("probe_aggregate_digest") != probe_digest
-        or payload.get("phase") != QUALIFICATION_PHASE
-        or payload.get("authority_digest") != authority.identity
-        or payload.get("evidence_origin") != evidence_origin
-        or payload.get("terminal_verified") is not True
-    ):
-        raise ProvenanceError("first_consume_mismatch")
-    terminal = QualificationTerminalEvidence(
-        ledger_digest=ledger.head_digest,
-        aggregate_digest=aggregate_digest,
-        probe_digest=probe_digest,
-        authority_binding=binding,
-        result="passed",
-        state="terminal",
-        verified=True,
-        evidence_origin=evidence_origin,
-    )
-    if supplied is not None:
-        supplied_terminal = _coerce_terminal(
-            supplied,
-            binding=binding,
-            aggregate_digest=aggregate_digest,
-            probe_digest=probe_digest,
-            evidence_origin=evidence_origin,
-        )
-        if supplied_terminal.ledger_digest != terminal.ledger_digest:
-            raise ProvenanceError("first_consume_mismatch")
     return terminal
 
 
@@ -1288,6 +1231,9 @@ class LiveQualificationAggregate(QualificationEvidenceContract):
     authority_binding: AuthorityBinding
     terminal: QualificationTerminalEvidence
     authority: ActiveQualificationAuthority = field(repr=False, compare=False)
+    semantic_attestation: QualificationSemanticAttestation = field(
+        repr=False, compare=False,
+    )
     execution_provenance: str = field(init=False, default=LIVE_QUALIFICATION_PROVENANCE)
     evidence_origin: str = field(init=False)
     identity: str = field(init=False)
@@ -1302,10 +1248,11 @@ class LiveQualificationAggregate(QualificationEvidenceContract):
         authority_binding: AuthorityBinding,
         terminal: QualificationTerminalEvidence,
         authority: ActiveQualificationAuthority,
+        semantic_attestation: QualificationSemanticAttestation,
         token: object = None,
     ) -> None:
         del results, probes, profile_digest, campaign_id, authority_binding
-        del terminal, authority, token
+        del terminal, authority, semantic_attestation, token
         raise TypeError("live qualification aggregates are factory-minted")
 
     def __post_init__(self) -> None:
@@ -1325,6 +1272,10 @@ class LiveQualificationAggregate(QualificationEvidenceContract):
             or self.terminal.probe_digest != self.probes.identity
             or self.terminal.authority_binding != self.authority_binding
             or self.terminal.evidence_origin != self.evidence_origin
+            or not isinstance(self.semantic_attestation, QualificationSemanticAttestation)
+            or not self.authority.owner.owns_qualification_semantic_attestation(
+                self.semantic_attestation, authority=self.authority,
+            )
         ):
             raise ValueError("live qualification aggregate is incomplete")
         object.__setattr__(
@@ -1347,8 +1298,14 @@ class LiveQualificationAggregate(QualificationEvidenceContract):
             raise ValueError("qualification terminal does not bind aggregate")
 
     def qualifies(self) -> bool:
+        # Scientific qualification is decided only by the parent registry's
+        # neutral semantic verifier.  The remaining checks merely ensure this
+        # optional presentation artifact has not drifted from its own fields.
         return (
-            len(self.results) == 15
+            self.authority.owner.owns_qualification_semantic_attestation(
+                self.semantic_attestation, authority=self.authority,
+            )
+            and len(self.results) == len(QUALIFICATION_SCHEDULE)
             and tuple(result.cell_id for result in self.results) == qualification_ids()
             and len({result.identity for result in self.results}) == 15
             and len({result.trace.identity for result in self.results}) == 15
@@ -1434,6 +1391,14 @@ class LiveQualificationAggregate(QualificationEvidenceContract):
         return self.terminal
 
     @property
+    def qualification_semantic_attestation(self) -> QualificationSemanticAttestation:
+        return self.semantic_attestation
+
+    @property
+    def qualification_semantic_attestation_digest(self) -> str:
+        return self.semantic_attestation.identity
+
+    @property
     def qualification_binding(self) -> AuthorityBinding:
         return self.authority_binding
 
@@ -1461,10 +1426,10 @@ class LiveQualificationAggregate(QualificationEvidenceContract):
                 self, authority=authority, controller=resolved_controller)
                 or resolved_controller is not self.controller
                 or not bool(getattr(
-                    resolved_controller,
-                    "owns_qualification_evidence",
-                    lambda _evidence, _receipt: False,
-                )(self, receipt))):
+                resolved_controller,
+                "owns_qualification_semantic_attestation",
+                lambda _attestation, **_kwargs: False,
+            )(self.semantic_attestation, authority=self.authority))):
             raise ProvenanceError("final_prerequisite_mismatch")
         return receipt
 
@@ -1493,6 +1458,158 @@ class LiveQualificationAggregate(QualificationEvidenceContract):
         )
 
     mint = from_authority
+
+
+def _normalized_live_cell(
+    authority: ActiveQualificationAuthority,
+    evidence: LiveQualificationCellEvidence,
+    result: QualificationCellResult,
+) -> NormalizedCell:
+    return _normalized_live_cell_from_trace(authority, evidence, result.trace)
+
+
+def _normalized_live_cell_from_trace(
+    authority: ActiveQualificationAuthority,
+    evidence: LiveQualificationCellEvidence,
+    trace: QualificationTrace,
+) -> NormalizedCell:
+    rejection = evidence.rejection_evidence
+    normalized_rejection = None
+    if isinstance(rejection, RejectionEvidence):
+        normalized_rejection = NormalizedRejectionBinding(
+            arm=rejection.binding.arm,
+            cell_id=rejection.binding.cell,
+            profile_digest=rejection.binding.profile,
+            campaign_id=rejection.binding.campaign,
+            authority=authority.identity,
+            activation=authority.activation_digest,
+            evidence_origin=rejection.evidence_origin,
+            reset_token=rejection.binding.reset_token,
+            generation=rejection.binding.generation,
+            request_identity=rejection.binding.request,
+            permit_identity=rejection.binding.permit,
+            effect_identity=rejection.binding.effect,
+            evidence_digest=rejection.evidence_digest,
+            current_inadmissible=rejection.current_inadmissible,
+            native_entries=rejection.native_entries,
+        )
+    return NormalizedCell(
+        cell_id=evidence.cell_id,
+        authority=authority.identity,
+        activation=authority.activation_digest,
+        profile_digest=evidence.profile_digest,
+        evidence_origin=evidence.evidence_origin,
+        campaign_id=evidence.campaign_id,
+        reset_identity=evidence.reset_identity,
+        evidence_digest=evidence.evidence_digest,
+        fresh_root=evidence.fresh_root,
+        reset_passed=evidence.reset_passed,
+        capability_state=evidence.capability_state,
+        provider_terminal=evidence.provider_terminal,
+        oracle_value=evidence.oracle_value,
+        containment_clean=evidence.containment_clean,
+        evidence_valid=evidence.evidence_valid,
+        terminal_verified=evidence.terminal_verified,
+        rejection_verified=evidence.rejection_verified,
+        execution_provenance=evidence.execution_provenance,
+        retry=evidence.retry,
+        resumed=evidence.resumed,
+        replacement=evidence.replacement,
+        rejection_binding=normalized_rejection,
+        reset_token=trace.reset_token,
+        generation=trace.generation,
+        request_identity=trace.request_identity,
+        permit_identity=trace.permit_identity,
+        effect_identity=trace.effect_identity,
+    )
+
+
+def _normalized_live_probe(
+    authority: ActiveQualificationAuthority,
+    evidence: LiveQualificationProbeEvidence,
+) -> NormalizedProbe:
+    return NormalizedProbe(
+        probe=evidence.probe,
+        authority=authority.identity,
+        activation=authority.activation_digest,
+        profile_digest=evidence.profile_digest,
+        evidence_origin=evidence.evidence_origin,
+        campaign_id=evidence.campaign_id,
+        passed=evidence.passed,
+        terminal_verified=evidence.terminal_verified,
+        evidence_digest=evidence.evidence_digest,
+        execution_provenance=evidence.execution_provenance,
+    )
+
+
+def issue_live_qualification_capabilities(
+    authority: ActiveQualificationAuthority,
+) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    """Issue the parent-owned one-shot coordinate set before terminal work."""
+
+    return authority.owner._issue_qualification_coordinate_capabilities(authority)
+
+
+def publish_live_qualification_terminals(
+    authority: ActiveQualificationAuthority,
+    cells: tuple[LiveQualificationCellEvidence, ...],
+    probes: tuple[LiveQualificationProbeEvidence, ...],
+    *,
+    ledger: Any = None,
+) -> QualificationSemanticAttestation:
+    """Consume coordinate capabilities and finalize the parent semantic census."""
+
+    selected_ledger = ledger or _authority_ledger(authority)
+    if (selected_ledger is not authority.authority.ledger
+            or not authority.owner.owns_ledger(selected_ledger)
+            or getattr(selected_ledger, "namespace", None) != "qualification"
+            or getattr(selected_ledger, "reservation_id", None) != authority.reservation_id
+            or getattr(selected_ledger, "state", None) != "active"):
+        raise ProvenanceError("authority_replay")
+    if (type(cells) is not tuple
+            or tuple(value.cell_id for value in cells) != qualification_ids()
+            or type(probes) is not tuple
+            or tuple(value.probe for value in probes) != PROBES):
+        raise ValueError("exact qualification terminal domains are required")
+    results = tuple(qualify_live_cell(authority, value) for value in cells)
+    if not all(result.passed for result in results):
+        raise ValueError("qualification cell evidence does not qualify")
+    probe_aggregate = qualify_live_probes(authority, probes)
+    if probe_aggregate.passed is not True:
+        aggregate_identity = canonical_sha256({
+            "artifact": "minecraft-k12-live-qualification-aggregate/3",
+            "results": [result.identity for result in results],
+            "probes": probe_aggregate.identity,
+            "profile": authority.profile_digest,
+            "campaign": cells[0].campaign_id,
+            "authority_binding": authority.binding.canonical(),
+            "execution_provenance": LIVE_QUALIFICATION_PROVENANCE,
+            "evidence_origin": cells[0].evidence_origin,
+        })
+        _terminalize_failed_qualification(
+            authority,
+            selected_ledger,
+            aggregate_digest=aggregate_identity,
+            probe_digest=probe_aggregate.identity,
+            evidence_origin=cells[0].evidence_origin,
+            reason="qualification_probe_failed",
+        )
+        raise ValueError("qualification probes failed")
+    for evidence, result in zip(cells, results):
+        receipt = authority.owner._observe_qualification_coordinate_terminal(
+            authority,
+            evidence.terminal_capability,
+            _normalized_live_cell(authority, evidence, result),
+        )
+        authority.owner._publish_qualification_coordinate_terminal(authority, receipt)
+    for evidence in probes:
+        receipt = authority.owner._observe_qualification_coordinate_terminal(
+            authority,
+            evidence.terminal_capability,
+            _normalized_live_probe(authority, evidence),
+        )
+        authority.owner._publish_qualification_coordinate_terminal(authority, receipt)
+    return authority.owner.finalize_qualification_semantics(authority)
 
 
 def aggregate_live_qualification(
@@ -1529,19 +1646,14 @@ def aggregate_live_qualification(
     campaign_ids = {value.campaign_id for value in cells}
     if len(campaign_ids) != 1:
         raise ValueError("qualification campaign binding mismatch")
+    if type(probes) is not tuple or any(
+        not isinstance(value, LiveQualificationProbeEvidence) for value in probes
+    ):
+        raise TypeError("parent terminal registry requires raw P1-P4 observations")
     results = tuple(qualify_live_cell(authority, value) for value in cells)
     if not all(result.passed for result in results):
         raise ValueError("qualification cell evidence does not qualify")
-    if isinstance(probes, ProbeAggregate):
-        probe_aggregate = probes
-        if (
-            probe_aggregate.authority_binding != _probe_binding(authority)
-            or probe_aggregate.profile_digest != authority.profile_digest
-            or probe_aggregate.probes != PROBES
-        ):
-            raise ProvenanceError("authority_namespace_mismatch")
-    else:
-        probe_aggregate = qualify_live_probes(authority, probes)
+    probe_aggregate = qualify_live_probes(authority, probes)
     if probe_aggregate.evidence_origin != expected_origin:
         raise ValueError("mixed qualification/probe evidence origin")
     if probe_aggregate.campaign_id == next(iter(campaign_ids)):
@@ -1558,7 +1670,6 @@ def aggregate_live_qualification(
         aggregate_origin,
         require_probe_passed=False,
     )
-
     # Compute the aggregate identity once, without a terminal object.  The
     # terminal event records this identity; including the event in the
     # aggregate would create an unresolvable digest cycle.
@@ -1585,6 +1696,25 @@ def aggregate_live_qualification(
             reason="qualification_probe_failed",
         )
         raise ValueError("qualification probes failed")
+    semantic_attestation = authority.owner.qualification_semantic_attestation(authority)
+    presentation_census = QualificationCensus(
+        tuple(
+            _normalized_live_cell(authority, evidence, result)
+            for evidence, result in zip(cells, results)
+        ),
+        tuple(_normalized_live_probe(authority, evidence) for evidence in probes),
+    )
+    presentation_verdict = verify_qualification_projection(presentation_census)
+    if (
+        not presentation_verdict.passed
+        or presentation_verdict.aggregate_digest
+            != semantic_attestation.semantic_projection_digest
+        or presentation_verdict.probe_digest
+            != semantic_attestation.probe_terminal_digest
+        or next(iter(campaign_ids)) != semantic_attestation.cell_campaign_id
+        or probe_aggregate.campaign_id != semantic_attestation.probe_campaign_id
+    ):
+        raise ProvenanceError("final_prerequisite_mismatch")
     aggregate = object.__new__(LiveQualificationAggregate)
     for name, value in (
         ("results", results),
@@ -1599,25 +1729,34 @@ def aggregate_live_qualification(
         ("_ownership_marker", object()),
     ):
         object.__setattr__(aggregate, name, value)
-    authority.owner._preclaim_qualification_evidence(
-        aggregate,
-        authority,
-        aggregate_identity=aggregate_identity,
-        probe_aggregate_digest=probe_digest,
-        authority_binding=binding,
-        evidence_origin=aggregate_origin,
-    )
     try:
-        terminal = _verify_or_append_terminal(
-            authority,
-            selected_ledger,
+        if (selected_ledger is not authority.authority.ledger
+                or getattr(selected_ledger, "state", None) != "terminal"
+                or getattr(selected_ledger, "head_digest", None)
+                    != semantic_attestation.terminal_ledger_digest):
+            raise ProvenanceError("first_consume_mismatch")
+        terminal = QualificationTerminalEvidence(
+            ledger_digest=selected_ledger.head_digest,
             aggregate_digest=aggregate_identity,
             probe_digest=probe_digest,
-            binding=binding,
+            authority_binding=binding,
+            result="passed",
+            state="terminal",
+            verified=True,
             evidence_origin=aggregate_origin,
-            supplied=terminal_evidence,
         )
+        if terminal_evidence is not None:
+            supplied_terminal = _coerce_terminal(
+                terminal_evidence,
+                binding=binding,
+                aggregate_digest=aggregate_identity,
+                probe_digest=probe_digest,
+                evidence_origin=aggregate_origin,
+            )
+            if supplied_terminal.ledger_digest != terminal.ledger_digest:
+                raise ProvenanceError("first_consume_mismatch")
         object.__setattr__(aggregate, "terminal", terminal)
+        object.__setattr__(aggregate, "semantic_attestation", semantic_attestation)
         aggregate.__post_init__()
         install_qualification_evidence_contract(
             aggregate,
@@ -1636,14 +1775,9 @@ def aggregate_live_qualification(
             aggregate_marker=aggregate._ownership_marker,
             token=_CONTRACT_MINT_TOKEN,
         )
-        authority.owner._fulfill_qualification_evidence(
-            aggregate,
-            QualificationEvidenceContract.ownership_receipt.fget(aggregate),
-        )
         if aggregate.identity != aggregate_identity or not aggregate.qualifies():
             raise ValueError("live qualification aggregate failed terminal verification")
     except Exception:
-        authority.owner._abandon_qualification_evidence(aggregate, authority)
         raise
     with _LIVE_AGGREGATE_LOCK:
         if authority.identity in _LIVE_AGGREGATES:
@@ -1716,6 +1850,8 @@ __all__ = [
     "qualify_mock_probes",
     "qualify_live_cell",
     "qualify_live_probes",
+    "issue_live_qualification_capabilities",
+    "publish_live_qualification_terminals",
     "aggregate_live_qualification",
     "build_live_qualification_aggregate",
     "qualify_live_campaign",

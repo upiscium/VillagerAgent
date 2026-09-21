@@ -39,6 +39,7 @@
     {"path": "benchmarks/minecraft/k12_model.py", "git_mode": "100644", "semantic_class": "python"},
     {"path": "benchmarks/minecraft/k12_protocol.py", "git_mode": "100644", "semantic_class": "python"},
     {"path": "benchmarks/minecraft/k12_protocol_v1.json", "git_mode": "100644", "semantic_class": "contract"},
+    {"path": "benchmarks/minecraft/k12_qualification_semantics.py", "git_mode": "100644", "semantic_class": "python"},
     {"path": "benchmarks/minecraft/k12_request.py", "git_mode": "100644", "semantic_class": "python"},
     {"path": "benchmarks/minecraft/k12_request_schema_v1.json", "git_mode": "100644", "semantic_class": "contract"},
     {"path": "benchmarks/minecraft/k12_result_schema_v1.json", "git_mode": "100644", "semantic_class": "contract"},
@@ -96,5 +97,5 @@
   ],
   "unlisted_executable_input": "reject",
   "observed_hashes_stored_in_policy": false,
-  "detached_artifact_sha256": "79fc4b86bc011ed99f99b7dba4d65c8cbaa3371a361ac5a646c6ba44e8d126c7"
+  "detached_artifact_sha256": "f3bd98f45013ecd06faeca513db92253d1bcd0854a7f1b497c65a5fe86ac01ad"
 }

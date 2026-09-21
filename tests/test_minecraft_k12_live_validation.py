@@ -19,6 +19,7 @@ from benchmarks.minecraft.k12_guarded_backend import K12AuthenticatedProfile
 from benchmarks.minecraft.k12_live_qualification import (MockCellQualificationEvidence,
     LiveQualificationCellEvidence, LiveQualificationProbeEvidence, MockProbeEvidence,
     LIVE_QUALIFICATION_PROVENANCE, PROBES, aggregate_live_qualification, qualification_ids,
+    issue_live_qualification_capabilities, publish_live_qualification_terminals,
     qualify_live_cell, qualify_mock_campaign, qualify_mock_probes)
 from benchmarks.minecraft.k12_live_oracle import LiveBinding, RejectionEvidence
 from benchmarks.minecraft.k12_live_state import (
@@ -122,11 +123,11 @@ def test_typed_final_gate_rejects_mock_qualification_even_when_all_mock_gates_pa
         "probe-campaign","evidence-"+probe) for probe in ("P1","P2","P3","P4")))
     wrapper=LiveFinalWrapper(90,profile.profile_digest,"final-campaign")
     value=FinalGateInput(wrapper,profile.profile_digest,"final-campaign",
-                         qualification,probes,True)
+                         None,True)
     assert not final_launch_gate(value)
     assert not final_launch_gate({"schedule_count":90})
     assert not final_launch_gate(FinalGateInput(wrapper,profile.profile_digest,
-        "final-campaign",qualification,probes,False))
+        "final-campaign",None,False))
 
 
 def test_final_schedule_and_manifest_are_phase_specific():
@@ -194,6 +195,7 @@ def test_injected_controller_mints_typed_final_scope_but_not_runtime_scope(tmp_p
         active_q = injected.verify_qualification_first_consume(
             qauthority, helpers._first(preflight), now=102, ledger=qledger,
         )
+        cell_capabilities, probe_capabilities = issue_live_qualification_capabilities(active_q)
         cells = []
         for ordinal, cell_id in enumerate(qualification_ids(), 1):
             arm = cell_id.rsplit("-", 1)[-1]
@@ -251,6 +253,7 @@ def test_injected_controller_mints_typed_final_scope_but_not_runtime_scope(tmp_p
                     request_identity=f"request-{ordinal}",
                     permit_identity=f"permit-{ordinal}",
                     effect_identity=f"effect-{ordinal}",
+                    terminal_capability=cell_capabilities[ordinal - 1],
                 )
             )
         probes = tuple(
@@ -262,8 +265,9 @@ def test_injected_controller_mints_typed_final_scope_but_not_runtime_scope(tmp_p
                 evidence_digest=f"probe-{probe}",
                 authority_binding=active_q.authority.binding("qualification_probe"),
                 evidence_origin=INJECTED_FAKE_ORIGIN,
+                terminal_capability=probe_capabilities[index],
             )
-            for probe in ("P1", "P2", "P3", "P4")
+            for index, probe in enumerate(("P1", "P2", "P3", "P4"))
         )
         s_index = next(index for index, value in enumerate(cells) if value.cell_id.endswith("-S"))
         s_cell = cells[s_index]
@@ -292,6 +296,7 @@ def test_injected_controller_mints_typed_final_scope_but_not_runtime_scope(tmp_p
                 effect_identity=None,
             ),
         ).passed
+        publish_live_qualification_terminals(active_q, tuple(cells), probes, ledger=qledger)
         aggregate = aggregate_live_qualification(
             active_q, tuple(cells), probes, ledger=qledger,
         )
@@ -315,7 +320,6 @@ def test_injected_controller_mints_typed_final_scope_but_not_runtime_scope(tmp_p
             prerequisites,
             active_q,
             now=103,
-            qualification_evidence=aggregate,
             qualification_ledger=qledger,
             final_ledger=fledger,
             target=final_target,
@@ -349,8 +353,7 @@ def test_injected_controller_mints_typed_final_scope_but_not_runtime_scope(tmp_p
         )
         admission = admit_final_campaign(
             active_final,
-            aggregate,
-            aggregate.probes,
+            aggregate.semantic_attestation,
             manifest=manifest,
             campaign_id="final-campaign",
             evidence_origin=INJECTED_FAKE_ORIGIN,
@@ -412,8 +415,7 @@ def test_injected_controller_mints_typed_final_scope_but_not_runtime_scope(tmp_p
         with pytest.raises(ProvenanceError, match="final_prerequisite_mismatch"):
             admit_final_campaign(
                 active_final,
-                aggregate,
-                aggregate.probes,
+                aggregate.semantic_attestation,
                 manifest=load_final_campaign_manifest(),
                 campaign_id="runtime-substitution",
                 evidence_origin=RUNTIME_VERIFIED_ORIGIN,
@@ -470,6 +472,7 @@ def test_failed_probe_durably_terminalizes_without_passed_event(tmp_path):
         active = injected.verify_qualification_first_consume(
             authority, helpers._first(preflight), now=102, ledger=ledger,
         )
+        cell_capabilities, probe_capabilities = issue_live_qualification_capabilities(active)
         cells = []
         for ordinal, cell_id in enumerate(qualification_ids(), 1):
             arm = cell_id.rsplit("-", 1)[-1]
@@ -525,6 +528,7 @@ def test_failed_probe_durably_terminalizes_without_passed_event(tmp_path):
                     request_identity=f"failed-request-{ordinal}",
                     permit_identity=f"failed-permit-{ordinal}",
                     effect_identity=f"failed-effect-{ordinal}",
+                    terminal_capability=cell_capabilities[ordinal - 1],
                 )
             )
         probes = tuple(
@@ -536,11 +540,12 @@ def test_failed_probe_durably_terminalizes_without_passed_event(tmp_path):
                 evidence_digest=f"failed-probe-{probe}",
                 authority_binding=active.authority.binding("qualification_probe"),
                 evidence_origin=INJECTED_FAKE_ORIGIN,
+                terminal_capability=probe_capabilities[index],
             )
-            for probe in PROBES
+            for index, probe in enumerate(PROBES)
         )
         with pytest.raises(ValueError, match="qualification probes failed"):
-            aggregate_live_qualification(active, tuple(cells), probes, ledger=ledger)
+            publish_live_qualification_terminals(active, tuple(cells), probes, ledger=ledger)
         assert ledger.state == "terminal"
         payload = dict(ledger.events[-1].payload)
         assert payload["result"] == "failed"
