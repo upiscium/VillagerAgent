@@ -1,4 +1,5 @@
 from dataclasses import replace
+import hashlib
 import pytest
 from types import SimpleNamespace
 
@@ -196,14 +197,25 @@ def test_injected_controller_mints_typed_final_scope_but_not_runtime_scope(tmp_p
             qauthority, helpers._first(preflight), now=102, ledger=qledger,
         )
         cell_capabilities, probe_capabilities = issue_live_qualification_capabilities(active_q)
+        cell_execution_receipts, probe_execution_receipts = (
+            injected.mint_injected_qualification_execution_receipts(
+                active_q,
+                cell_capabilities,
+                probe_capabilities,
+                cell_campaign_id="qualification-campaign",
+                probe_campaign_id="probe-campaign",
+                execution_identity="validation",
+            )
+        )
         cells = []
         for ordinal, cell_id in enumerate(qualification_ids(), 1):
             arm = cell_id.rsplit("-", 1)[-1]
-            reset = f"reset-{ordinal}"
-            evidence_digest = f"{ordinal:064x}"
+            reset = f"reset-validation-{ordinal}"
+            evidence_digest = hashlib.sha256(
+                f"validation:qualification:{ordinal}".encode("utf-8")
+            ).hexdigest()
             rejection = None
             if arm == "S":
-                reset = f"reset-{ordinal}"
                 plan_authority, before, after = _rejection_states(
                     active_q,
                     K12AuthenticatedProfile.from_runtime_profile(profile),
@@ -219,9 +231,9 @@ def test_injected_controller_mints_typed_final_scope_but_not_runtime_scope(tmp_p
                         cell_id,
                         reset,
                         1,
-                        f"request-{ordinal}",
-                        f"permit-{ordinal}",
-                        f"effect-{ordinal}",
+                        f"request-validation-{ordinal}",
+                        f"permit-validation-{ordinal}",
+                        f"effect-validation-{ordinal}",
                         plan_authority.authority_id,
                         "S",
                     ),
@@ -248,12 +260,13 @@ def test_injected_controller_mints_typed_final_scope_but_not_runtime_scope(tmp_p
                     evidence_origin=INJECTED_FAKE_ORIGIN,
                     execution_provenance=LIVE_QUALIFICATION_PROVENANCE,
                     rejection_evidence=rejection,
-                    reset_token=reset,
-                    generation=1,
-                    request_identity=f"request-{ordinal}",
-                    permit_identity=f"permit-{ordinal}",
-                    effect_identity=f"effect-{ordinal}",
+                    reset_token=reset if arm == "S" else None,
+                    generation=1 if arm == "S" else None,
+                    request_identity=(f"request-validation-{ordinal}" if arm == "S" else None),
+                    permit_identity=(f"permit-validation-{ordinal}" if arm == "S" else None),
+                    effect_identity=(f"effect-validation-{ordinal}" if arm == "S" else None),
                     terminal_capability=cell_capabilities[ordinal - 1],
+                    execution_receipt=cell_execution_receipts[ordinal - 1],
                 )
             )
         probes = tuple(
@@ -262,10 +275,13 @@ def test_injected_controller_mints_typed_final_scope_but_not_runtime_scope(tmp_p
                 passed=True,
                 profile_digest=profile.profile_digest,
                 campaign_id="probe-campaign",
-                evidence_digest=f"probe-{probe}",
+                evidence_digest=hashlib.sha256(
+                    f"validation:probe:{probe}".encode("utf-8")
+                ).hexdigest(),
                 authority_binding=active_q.authority.binding("qualification_probe"),
                 evidence_origin=INJECTED_FAKE_ORIGIN,
                 terminal_capability=probe_capabilities[index],
+                execution_receipt=probe_execution_receipts[index],
             )
             for index, probe in enumerate(("P1", "P2", "P3", "P4"))
         )
@@ -426,6 +442,31 @@ def test_injected_controller_mints_typed_final_scope_but_not_runtime_scope(tmp_p
         fledger.close()
 
 
+def test_receipt_minting_keeps_injected_and_runtime_adapters_separate():
+    runtime = ParentExecutionAuthority()
+    with pytest.raises(ProvenanceError, match="authority_origin_mismatch"):
+        runtime.mint_injected_qualification_execution_receipts(
+            None,
+            tuple(),
+            tuple(),
+            cell_campaign_id="qualification-campaign",
+            probe_campaign_id="probe-campaign",
+            execution_identity="injected-only",
+        )
+
+    injected = runtime.injected_test_controller()
+    with pytest.raises(ProvenanceError, match="authority_origin_mismatch"):
+        injected.mint_runtime_qualification_execution_receipts(
+            None,
+            tuple(),
+            tuple(),
+            tuple(),
+            cell_campaign_id="qualification-campaign",
+            probe_campaign_id="probe-campaign",
+            probe_boundary_artifacts=tuple(),
+        )
+
+
 def test_runtime_qualification_rejects_injected_source_closure(tmp_path):
     helpers = pytest.importorskip("test_minecraft_k12_execution_provenance")
     verifier_key = b"k" * 32
@@ -473,11 +514,24 @@ def test_failed_probe_durably_terminalizes_without_passed_event(tmp_path):
             authority, helpers._first(preflight), now=102, ledger=ledger,
         )
         cell_capabilities, probe_capabilities = issue_live_qualification_capabilities(active)
+        cell_execution_receipts, probe_execution_receipts = (
+            injected.mint_injected_qualification_execution_receipts(
+                active,
+                cell_capabilities,
+                probe_capabilities,
+                cell_campaign_id="failed-qualification-campaign",
+                probe_campaign_id="failed-probe-campaign",
+                execution_identity="failed",
+                failed_coordinate="P3",
+            )
+        )
         cells = []
         for ordinal, cell_id in enumerate(qualification_ids(), 1):
             arm = cell_id.rsplit("-", 1)[-1]
-            reset = f"failed-reset-{ordinal}"
-            evidence_digest = f"{ordinal + 100:064x}"
+            reset = f"reset-failed-{ordinal}"
+            evidence_digest = hashlib.sha256(
+                f"failed:qualification:{ordinal}".encode("utf-8")
+            ).hexdigest()
             rejection = None
             if arm == "S":
                 plan_authority, before, after = _rejection_states(
@@ -495,9 +549,9 @@ def test_failed_probe_durably_terminalizes_without_passed_event(tmp_path):
                         cell_id,
                         reset,
                         1,
-                        f"failed-request-{ordinal}",
-                        f"failed-permit-{ordinal}",
-                        f"failed-effect-{ordinal}",
+                        f"request-failed-{ordinal}",
+                        f"permit-failed-{ordinal}",
+                        f"effect-failed-{ordinal}",
                         plan_authority.authority_id,
                         "S",
                     ),
@@ -523,12 +577,13 @@ def test_failed_probe_durably_terminalizes_without_passed_event(tmp_path):
                     authority_binding=active.binding,
                     evidence_origin=INJECTED_FAKE_ORIGIN,
                     rejection_evidence=rejection,
-                    reset_token=reset,
-                    generation=1,
-                    request_identity=f"failed-request-{ordinal}",
-                    permit_identity=f"failed-permit-{ordinal}",
-                    effect_identity=f"failed-effect-{ordinal}",
+                    reset_token=reset if arm == "S" else None,
+                    generation=1 if arm == "S" else None,
+                    request_identity=(f"request-failed-{ordinal}" if arm == "S" else None),
+                    permit_identity=(f"permit-failed-{ordinal}" if arm == "S" else None),
+                    effect_identity=(f"effect-failed-{ordinal}" if arm == "S" else None),
                     terminal_capability=cell_capabilities[ordinal - 1],
+                    execution_receipt=cell_execution_receipts[ordinal - 1],
                 )
             )
         probes = tuple(
@@ -537,10 +592,13 @@ def test_failed_probe_durably_terminalizes_without_passed_event(tmp_path):
                 passed=probe != "P3",
                 profile_digest=profile.profile_digest,
                 campaign_id="failed-probe-campaign",
-                evidence_digest=f"failed-probe-{probe}",
+                evidence_digest=hashlib.sha256(
+                    f"failed:probe:{probe}".encode("utf-8")
+                ).hexdigest(),
                 authority_binding=active.authority.binding("qualification_probe"),
                 evidence_origin=INJECTED_FAKE_ORIGIN,
                 terminal_capability=probe_capabilities[index],
+                execution_receipt=probe_execution_receipts[index],
             )
             for index, probe in enumerate(PROBES)
         )

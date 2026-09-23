@@ -135,48 +135,29 @@ def test_optional_probe_binding_survives_post_terminal_presentation(tmp_path):
         fixture.close()
 
 
-def test_parent_registry_snapshots_normalized_records_before_publication(tmp_path):
-    fixture = _qualification(tmp_path, "normalized-snapshot", publish=False)
+def test_parent_registry_ignores_caller_authored_semantic_fields(tmp_path):
+    fixture = _qualification(tmp_path, "parent-normalization", publish=False)
     try:
-        first_evidence = fixture.cells[0]
-        first_result = qualify_live_cell(fixture.active_qualification, first_evidence)
-        caller_record = _normalized_live_cell(
-            fixture.active_qualification, first_evidence, first_result,
+        cells = list(fixture.cells)
+        cells[0] = replace(
+            cells[0], fresh_root=False, reset_passed=False,
+            capability_state="CREATED", provider_terminal="error",
+            oracle_value="false", containment_clean=False,
+            evidence_valid=False, terminal_verified=False,
         )
-        receipt = fixture.controller._observe_qualification_coordinate_terminal(
+        attestation = publish_live_qualification_terminals(
             fixture.active_qualification,
-            first_evidence.terminal_capability,
-            caller_record,
-        )
-        object.__setattr__(caller_record, "oracle_value", "false")
-        fixture.controller._publish_qualification_coordinate_terminal(
-            fixture.active_qualification, receipt,
-        )
-        object.__setattr__(receipt, "capability_identity", "sha256:" + "e" * 64)
-        assert not fixture.controller.owns_qualification_terminal_receipt(receipt)
-        for evidence in fixture.cells[1:]:
-            result = qualify_live_cell(fixture.active_qualification, evidence)
-            observed = fixture.controller._observe_qualification_coordinate_terminal(
-                fixture.active_qualification,
-                evidence.terminal_capability,
-                _normalized_live_cell(fixture.active_qualification, evidence, result),
-            )
-            fixture.controller._publish_qualification_coordinate_terminal(
-                fixture.active_qualification, observed,
-            )
-        for evidence in fixture.probes:
-            observed = fixture.controller._observe_qualification_coordinate_terminal(
-                fixture.active_qualification,
-                evidence.terminal_capability,
-                _normalized_live_probe(fixture.active_qualification, evidence),
-            )
-            fixture.controller._publish_qualification_coordinate_terminal(
-                fixture.active_qualification, observed,
-            )
-        attestation = fixture.controller.finalize_qualification_semantics(
-            fixture.active_qualification,
+            tuple(cells),
+            fixture.probes,
+            ledger=fixture.qualification_ledger,
         )
         assert attestation.semantic_result == "passed"
+        aggregate = aggregate_live_qualification(
+            fixture.active_qualification, tuple(cells), fixture.probes,
+            ledger=fixture.qualification_ledger,
+        )
+        assert aggregate.qualifies()
+        assert aggregate.results[0].passed is True
     finally:
         fixture.close()
 
@@ -185,17 +166,17 @@ def test_parent_registry_rejects_stale_normalized_record_identity(tmp_path):
     fixture = _qualification(tmp_path, "normalized-stale-identity", publish=False)
     try:
         evidence = fixture.cells[0]
-        record = _normalized_live_cell(
+        fabricated_record = _normalized_live_cell(
             fixture.active_qualification,
             evidence,
             qualify_live_cell(fixture.active_qualification, evidence),
         )
-        object.__setattr__(record, "oracle_value", "false")
-        with pytest.raises(ProvenanceError, match="final_prerequisite_mismatch"):
+        object.__setattr__(fabricated_record, "oracle_value", "false")
+        with pytest.raises(ProvenanceError, match="authority_replay"):
             fixture.controller._observe_qualification_coordinate_terminal(
                 fixture.active_qualification,
                 evidence.terminal_capability,
-                record,
+                fabricated_record,
             )
     finally:
         fixture.close()
@@ -208,16 +189,11 @@ def test_parent_registry_rejects_mutated_coordinate_capability(tmp_path):
         object.__setattr__(
             evidence.terminal_capability, "nonce", "caller-mutated-nonce",
         )
-        record = _normalized_live_cell(
-            fixture.active_qualification,
-            evidence,
-            qualify_live_cell(fixture.active_qualification, evidence),
-        )
         with pytest.raises(ProvenanceError, match="authority_replay"):
             fixture.controller._observe_qualification_coordinate_terminal(
                 fixture.active_qualification,
                 evidence.terminal_capability,
-                record,
+                evidence.execution_receipt,
             )
     finally:
         fixture.close()
@@ -296,13 +272,14 @@ def test_descriptive_aggregate_must_present_the_attested_census(tmp_path):
     try:
         cells = list(fixture.cells)
         cells[0] = replace(cells[0], evidence_digest="sha256:" + "d" * 64)
-        with pytest.raises(ProvenanceError, match="final_prerequisite_mismatch"):
-            aggregate_live_qualification(
-                fixture.active_qualification,
-                tuple(cells),
-                fixture.probes,
-                ledger=fixture.qualification_ledger,
-            )
+        aggregate = aggregate_live_qualification(
+            fixture.active_qualification,
+            tuple(cells),
+            fixture.probes,
+            ledger=fixture.qualification_ledger,
+        )
+        assert aggregate.results[0].trace.evidence_digest \
+            == fixture.cells[0].evidence_digest
     finally:
         fixture.close()
 
@@ -363,11 +340,10 @@ def test_terminal_registry_requires_exact_parent_observation_receipt(tmp_path):
     fixture = _qualification(tmp_path, "receipt-publication", publish=False)
     try:
         evidence = fixture.cells[0]
-        result = qualify_live_cell(fixture.active_qualification, evidence)
         receipt = fixture.controller._observe_qualification_coordinate_terminal(
             fixture.active_qualification,
             evidence.terminal_capability,
-            _normalized_live_cell(fixture.active_qualification, evidence, result),
+            evidence.execution_receipt,
         )
         copied = object.__new__(type(receipt))
         for item in fields(type(receipt)):

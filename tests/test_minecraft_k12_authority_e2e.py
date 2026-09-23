@@ -54,6 +54,7 @@ from benchmarks.minecraft.k12_live_qualification import (
     aggregate_live_qualification,
     issue_live_qualification_capabilities,
     publish_live_qualification_terminals,
+    qualify_live_probes,
     qualification_ids,
 )
 from benchmarks.minecraft.k12_live_runner import (
@@ -362,6 +363,10 @@ def _qualification_evidence(
     probe_campaign_id: str,
     cell_capabilities,
     probe_capabilities,
+    cell_execution_receipts,
+    probe_execution_receipts,
+    *,
+    failed_coordinate: str | None = None,
 ):
     cells = []
     for ordinal, cell_id in enumerate(qualification_ids(), 1):
@@ -422,13 +427,14 @@ def _qualification_evidence(
                 permit_identity=(f"permit-{label}-{ordinal}" if arm == "S" else None),
                 effect_identity=(f"effect-{label}-{ordinal}" if arm == "S" else None),
                 terminal_capability=cell_capabilities[ordinal - 1],
+                execution_receipt=cell_execution_receipts[ordinal - 1],
             )
         )
     probe_binding = authority.authority.binding("qualification_probe")
     probes = tuple(
         LiveQualificationProbeEvidence(
             probe=probe,
-            passed=True,
+            passed=probe != failed_coordinate,
             profile_digest=PROFILE.profile_digest,
             campaign_id=probe_campaign_id,
             evidence_digest=hashlib.sha256(
@@ -438,6 +444,7 @@ def _qualification_evidence(
             authority_binding=probe_binding,
             evidence_origin=INJECTED_FAKE_ORIGIN,
             terminal_capability=probe_capabilities[index],
+            execution_receipt=probe_execution_receipts[index],
         )
         for index, probe in enumerate(PROBES)
     )
@@ -510,6 +517,7 @@ class _Graph:
 
 def _build_qualification(
     tmp_path: Path, label: str, *, publish: bool = True,
+    failed_coordinate: str | None = None,
 ) -> _QualificationFixture:
     """Build the graph through active qualification, before aggregation."""
     parent = ParentExecutionAuthority()
@@ -555,6 +563,17 @@ def _build_qualification(
     cell_capabilities, probe_capabilities = issue_live_qualification_capabilities(
         active_qualification
     )
+    cell_execution_receipts, probe_execution_receipts = (
+        controller.mint_injected_qualification_execution_receipts(
+            active_qualification,
+            cell_capabilities,
+            probe_capabilities,
+            cell_campaign_id=qualification_campaign,
+            probe_campaign_id=probe_campaign,
+            execution_identity=label,
+            failed_coordinate=failed_coordinate,
+        )
+    )
     cells, probes = _qualification_evidence(
         active_qualification,
         label,
@@ -562,6 +581,9 @@ def _build_qualification(
         probe_campaign,
         cell_capabilities,
         probe_capabilities,
+        cell_execution_receipts,
+        probe_execution_receipts,
+        failed_coordinate=failed_coordinate,
     )
     if publish:
         publish_live_qualification_terminals(
@@ -582,6 +604,24 @@ def _build_qualification(
         qualification_campaign,
         ExternalEntryFence("injected_fake"),
     )
+
+
+def test_aggregate_accepts_parent_bound_probe_aggregate(tmp_path):
+    fixture = _build_qualification(tmp_path, "probe-aggregate-input")
+    try:
+        probe_aggregate = qualify_live_probes(
+            fixture.active_qualification, fixture.probes,
+        )
+        aggregate = aggregate_live_qualification(
+            fixture.active_qualification,
+            fixture.cells,
+            probe_aggregate,
+            ledger=fixture.qualification_ledger,
+        )
+        assert aggregate.probes.probes == PROBES
+        assert aggregate.probes.campaign_id == fixture.probes[0].campaign_id
+    finally:
+        fixture.close()
 
 
 def _build_graph(tmp_path: Path, label: str) -> _Graph:
