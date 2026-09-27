@@ -4962,8 +4962,6 @@ class ParentExecutionAuthority:
             stored_event_digest = session.get("terminal_event_digest")
             if stored_event_digest is not None and stored_event_digest != event_digest:
                 raise ProvenanceError("final_prerequisite_mismatch")
-            if stored_event_digest is None:
-                session["terminal_event_digest"] = event_digest
             if (
                 getattr(ledger, "state", None) != "terminal"
                 or payload.get("result") != "passed"
@@ -4978,7 +4976,10 @@ class ParentExecutionAuthority:
                 or payload.get("semantic_verifier_identity")
                     != SEMANTIC_VERIFIER_IDENTITY
                 or not isinstance(snapshot, Mapping)
-                or session.get("terminal_event_digest") != event_digest
+                or (
+                    session.get("terminal_event_digest") is not None
+                    and session.get("terminal_event_digest") != event_digest
+                )
             ):
                 raise ProvenanceError("final_prerequisite_mismatch")
 
@@ -4995,7 +4996,10 @@ class ParentExecutionAuthority:
                         entry.get("record"), Mapping
                     ):
                         raise ProvenanceError("final_prerequisite_mismatch")
-                    record = _normalized_record_from_snapshot(domain, entry["record"])
+                    try:
+                        record = _normalized_record_from_snapshot(domain, entry["record"])
+                    except (TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+                        raise ProvenanceError("final_prerequisite_mismatch") from exc
                     if (
                         getattr(record, "cell_id", getattr(record, "probe", None))
                             != coordinate
@@ -5030,6 +5034,10 @@ class ParentExecutionAuthority:
             for (domain, coordinate), entry in zip(expected_keys, receipt_entries):
                 if not isinstance(entry, Mapping):
                     raise ProvenanceError("final_prerequisite_mismatch")
+                try:
+                    stage_identities = tuple(entry.get("execution_stages", ()))
+                except (TypeError, ValueError) as exc:
+                    raise ProvenanceError("final_prerequisite_mismatch") from exc
                 receipt = object.__new__(QualificationCoordinateTerminalReceipt)
                 values = {
                     "authority_digest": entry.get("authority"),
@@ -5040,9 +5048,7 @@ class ParentExecutionAuthority:
                     "capability_identity": entry.get("capability"),
                     "record_identity": entry.get("record"),
                     "execution_receipt_identity": entry.get("execution_receipt"),
-                    "execution_stage_receipt_identities": tuple(
-                        entry.get("execution_stages", ())
-                    ),
+                    "execution_stage_receipt_identities": stage_identities,
                     "_owner": self,
                 }
                 if (
@@ -5085,8 +5091,11 @@ class ParentExecutionAuthority:
                     raise ProvenanceError("final_prerequisite_mismatch")
                 restored_receipts.append(receipt)
 
-            census = QualificationCensus(cells, probes)
-            verdict = verify_qualification_projection(census)
+            try:
+                census = QualificationCensus(cells, probes)
+                verdict = verify_qualification_projection(census)
+            except (TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+                raise ProvenanceError("final_prerequisite_mismatch") from exc
             if (
                 verdict.passed is not True
                 or payload.get("semantic_projection_digest") != census.aggregate_digest
@@ -5134,6 +5143,7 @@ class ParentExecutionAuthority:
             }
             for receipt_id in interrupted_terminal_ids:
                 self.__qualification_coordinate_observations.pop(receipt_id, None)
+            session["terminal_event_digest"] = event_digest
             session.update({"census": census, "verdict": verdict, "state": "terminal"})
             self._discard_qualification_execution_scope(
                 authority, session, clear_registry=False,
@@ -5501,9 +5511,19 @@ class ParentExecutionAuthority:
                         )
                         or terminal_payload.get("terminal_verified") is not True):
                     raise ProvenanceError("final_prerequisite_mismatch")
+                expected_payload = self._qualification_pass_payload(
+                    session["authority"],
+                    census,
+                    verdict,
+                    _terminal_receipt_census_digest(session),
+                    tuple(session["receipts"].values()),
+                )
+                if terminal_payload != expected_payload:
+                    raise ProvenanceError("final_prerequisite_mismatch")
                 digest = self._append_current_qualification_terminal(
                     session["authority"], ledger, terminal_payload,
                 )
+                session["terminal_event_digest"] = digest
                 session["state"] = "terminal"
                 return digest
         if (

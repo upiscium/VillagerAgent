@@ -9,6 +9,7 @@ from benchmarks.minecraft.k12_execution_provenance import (
     ProvenanceError,
     QualificationCoordinateExecutionReceipt,
     QualificationExecutionStageReceipt,
+    _terminal_receipt_census_digest,
     _coordinate_execution_receipt_identity,
 )
 from benchmarks.minecraft.k12_live_qualification import (
@@ -571,6 +572,49 @@ def test_qualification_ledger_rejects_unrecognized_terminal_payload(
         with pytest.raises(ProvenanceError, match="final_prerequisite_mismatch"):
             fixture.controller.ledger_terminal(fixture.qualification_ledger, payload)
         assert fixture.qualification_ledger.state == "active"
+    finally:
+        fixture.close()
+
+
+def test_parent_public_pass_terminal_requires_exact_payload_and_records_event(tmp_path):
+    fixture = _fixture(tmp_path, "public-pass-terminal")
+    try:
+        verdict = fixture.controller._publish_qualification_terminal_batch(
+            fixture.active_qualification,
+            tuple(
+                (evidence.terminal_capability, evidence.execution_receipt)
+                for evidence in (*fixture.cells, *fixture.probes)
+            ),
+        )
+        assert verdict.passed is True
+        census, verified_verdict = fixture.controller._prepare_qualification_semantics(
+            fixture.active_qualification,
+        )
+        session = fixture.controller._ParentExecutionAuthority__qualification_semantic_sessions[
+            fixture.active_qualification.identity
+        ]
+        payload = fixture.controller._qualification_pass_payload(
+            fixture.active_qualification,
+            census,
+            verified_verdict,
+            _terminal_receipt_census_digest(session),
+            tuple(session["receipts"].values()),
+        )
+        with pytest.raises(ProvenanceError, match="final_prerequisite_mismatch"):
+            fixture.controller.ledger_terminal(
+                fixture.qualification_ledger,
+                {**payload, "unexpected": True},
+            )
+        assert fixture.qualification_ledger.state == "active"
+        digest = fixture.controller.ledger_terminal(
+            fixture.qualification_ledger, payload,
+        )
+        assert fixture.qualification_ledger.state == "terminal"
+        assert session["terminal_event_digest"] == digest
+        attestation = fixture.controller.finalize_qualification_semantics(
+            fixture.active_qualification,
+        )
+        assert attestation.semantic_result == "passed"
     finally:
         fixture.close()
 
