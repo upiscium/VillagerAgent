@@ -3090,7 +3090,7 @@ class ParentExecutionAuthority:
         self.__qualification_coordinate_execution_receipts: dict[
             int, tuple[
                 QualificationCoordinateExecutionReceipt,
-                NormalizedCell | NormalizedProbe,
+                NormalizedCell | NormalizedProbe | None,
                 tuple[QualificationExecutionStageReceipt, ...],
             ]
         ] = {}
@@ -3714,6 +3714,24 @@ class ParentExecutionAuthority:
                     effect_identity=effect["effect_identity"] if arm == "S" else None,
                 )
 
+            def normalized_from_receipt(
+                capability: _QualificationCoordinateCapability,
+                campaign_id: str,
+                receipt: QualificationCoordinateExecutionReceipt,
+            ) -> NormalizedCell | NormalizedProbe:
+                owned = self.__qualification_coordinate_execution_receipts.get(
+                    id(receipt)
+                )
+                if (
+                    owned is None
+                    or owned[0] is not receipt
+                    or receipt._owner is not self
+                    or _coordinate_execution_receipt_identity(receipt)
+                    != receipt.identity
+                ):
+                    raise ProvenanceError("authority_replay")
+                return normalized_from_stages(capability, campaign_id, owned[2])
+
             def close_coordinate(
                 capability: _QualificationCoordinateCapability,
                 campaign_id: str,
@@ -3764,7 +3782,6 @@ class ParentExecutionAuthority:
                     ):
                         raise ProvenanceError("final_prerequisite_mismatch")
                     predecessor = stage.identity
-                normalized = normalized_from_stages(capability, campaign_id, stages)
                 receipt = object.__new__(QualificationCoordinateExecutionReceipt)
                 values = {
                     "authority_digest": authority.identity,
@@ -3785,12 +3802,26 @@ class ParentExecutionAuthority:
                     receipt, "identity", _coordinate_execution_receipt_identity(receipt),
                 )
                 self.__qualification_coordinate_execution_receipts[id(receipt)] = (
-                    receipt, normalized, stages,
+                    receipt, None, stages,
                 )
                 self.__qualification_coordinate_execution_identities[id(receipt)] = (
                     receipt.identity
                 )
                 session["execution_object_ids"].add(id(receipt))
+                try:
+                    normalized = normalized_from_receipt(capability, campaign_id, receipt)
+                except BaseException:
+                    self.__qualification_coordinate_execution_receipts.pop(
+                        id(receipt), None,
+                    )
+                    self.__qualification_coordinate_execution_identities.pop(
+                        id(receipt), None,
+                    )
+                    session["execution_object_ids"].discard(id(receipt))
+                    raise
+                self.__qualification_coordinate_execution_receipts[id(receipt)] = (
+                    receipt, normalized, stages,
+                )
                 session["record_identities"][(capability.domain, capability.coordinate)] = (
                     normalized.identity
                 )
@@ -4584,6 +4615,8 @@ class ParentExecutionAuthority:
                 terminal_receipt_digest,
                 terminal_receipts,
             )
+            if not authority.current_at() or authority.lifecycle != "active":
+                raise ProvenanceError("authority_replay")
             event_digest = self._ledger_controller(ledger).terminal(payload)
             session["terminal_event_digest"] = event_digest
             return event_digest

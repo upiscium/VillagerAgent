@@ -447,6 +447,38 @@ def test_stale_authority_rejects_owned_execution_receipts(tmp_path):
         fixture.close()
 
 
+def test_authority_expiry_before_durable_pass_event_keeps_ledger_active(
+    tmp_path, monkeypatch,
+):
+    fixture = _fixture(tmp_path, "stale-before-pass-event")
+    original_terminal = fixture.controller._ledger_terminal_qualification_batch
+
+    def expire_before_append(*args, **kwargs):
+        fixture.controller.advance_trusted_time(400)
+        return original_terminal(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fixture.controller,
+        "_ledger_terminal_qualification_batch",
+        expire_before_append,
+    )
+    try:
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            from benchmarks.minecraft.k12_live_qualification import (
+                publish_live_qualification_terminals,
+            )
+
+            publish_live_qualification_terminals(
+                fixture.active_qualification,
+                fixture.cells,
+                fixture.probes,
+                ledger=fixture.qualification_ledger,
+            )
+        assert fixture.qualification_ledger.state == "active"
+    finally:
+        fixture.close()
+
+
 def test_copied_or_rehashed_active_authority_cannot_open_receipt_scope(tmp_path):
     fixture = _fixture(tmp_path, "copied-active")
     try:
