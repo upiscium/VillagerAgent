@@ -3071,7 +3071,7 @@ class ParentExecutionAuthority:
         self.__external_revisions: dict[int, ExternalRevisionAuthorization] = {}
         self.__external_revision_identities: set[str] = set()
         self.__qualification_semantic_lock = threading.RLock()
-        self.__qualification_terminalization_lock = threading.Lock()
+        self.__qualification_terminalization_lock = threading.RLock()
         self.__qualification_semantic_sessions: dict[str, dict[str, Any]] = {}
         self.__qualification_coordinate_capabilities: dict[int, _QualificationCoordinateCapability] = {}
         self.__qualification_coordinate_observations: dict[
@@ -3123,14 +3123,16 @@ class ParentExecutionAuthority:
 
     def current_time(self) -> int:
         """Return the parent-owned trusted time for a live boundary."""
-        return self.__trusted_clock.now()
+        with self.__qualification_terminalization_lock:
+            return self.__trusted_clock.now()
 
     trusted_now = current_time
 
     def _resolve_time(self, now: int | None) -> int:
-        if now is None:
-            return self.current_time()
-        return self.__trusted_clock.observe_explicit(now)
+        with self.__qualification_terminalization_lock:
+            if now is None:
+                return self.__trusted_clock.now()
+            return self.__trusted_clock.observe_explicit(now)
 
     def validate_current_authority(
             self, authority: Any, *, now: int | None = None,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import fields, replace
+import threading
 
 import pytest
 
@@ -506,6 +507,57 @@ def test_authority_expiry_before_durable_failed_event_keeps_ledger_active(
                 ledger=fixture.qualification_ledger,
             )
         assert fixture.qualification_ledger.state == "active"
+    finally:
+        fixture.close()
+
+
+def test_explicit_time_update_waits_for_durable_terminal_append(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, "explicit-time-terminalization-race")
+    original_controller = fixture.controller._ledger_controller
+    updater_started = threading.Event()
+    updater_finished = threading.Event()
+    updater_errors = []
+    updater_threads = []
+
+    def update_explicit_time():
+        updater_started.set()
+        try:
+            fixture.controller.validate_current_authority(
+                fixture.active_qualification, now=200,
+            )
+        except BaseException as exc:  # pragma: no cover - diagnostic assertion below
+            updater_errors.append(exc)
+        finally:
+            updater_finished.set()
+
+    def guarded_controller(ledger):
+        updater = threading.Thread(target=update_explicit_time)
+        updater_threads.append(updater)
+        updater.start()
+        assert updater_started.wait(1)
+        assert not updater_finished.wait(0.05)
+        return original_controller(ledger)
+
+    monkeypatch.setattr(fixture.controller, "_ledger_controller", guarded_controller)
+    try:
+        try:
+            from benchmarks.minecraft.k12_live_qualification import (
+                publish_live_qualification_terminals,
+            )
+
+            publish_live_qualification_terminals(
+                fixture.active_qualification,
+                fixture.cells,
+                fixture.probes,
+                ledger=fixture.qualification_ledger,
+            )
+        except ProvenanceError:
+            pass
+        for updater in updater_threads:
+            updater.join(timeout=1)
+        assert updater_finished.is_set()
+        assert updater_errors == []
+        assert fixture.qualification_ledger.state == "terminal"
     finally:
         fixture.close()
 
