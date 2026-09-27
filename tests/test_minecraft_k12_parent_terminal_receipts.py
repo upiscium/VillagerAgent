@@ -377,6 +377,37 @@ def test_durable_pass_event_recovers_interrupted_registry_commit(tmp_path, monke
         fixture.close()
 
 
+def test_pass_recovery_requires_parent_recorded_event_digest(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, "missing-recovery-event-digest")
+    try:
+        def fail_commit(*_args, **_kwargs):
+            raise ProvenanceError("authority_replay")
+
+        monkeypatch.setattr(
+            fixture.controller,
+            "_register_qualification_terminal",
+            fail_commit,
+        )
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            publish_live_qualification_terminals(
+                fixture.active_qualification,
+                fixture.cells,
+                fixture.probes,
+                ledger=fixture.qualification_ledger,
+            )
+        session = fixture.controller._ParentExecutionAuthority__qualification_semantic_sessions[
+            fixture.active_qualification.identity
+        ]
+        session["terminal_event_digest"] = None
+        with pytest.raises(ProvenanceError, match="final_prerequisite_mismatch"):
+            fixture.controller.recover_qualification_semantics(
+                fixture.active_qualification,
+            )
+        assert fixture.qualification_ledger.state == "terminal"
+    finally:
+        fixture.close()
+
+
 def test_durable_failed_event_recovers_interrupted_cleanup(tmp_path, monkeypatch):
     helpers = pytest.importorskip("test_minecraft_k12_authority_e2e")
     fixture = helpers._build_qualification(

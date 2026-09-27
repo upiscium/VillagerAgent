@@ -4960,7 +4960,10 @@ class ParentExecutionAuthority:
             snapshot = _deep_thaw(payload.get("terminal_registry_snapshot"))
             event_digest = events[-1].digest if events else None
             stored_event_digest = session.get("terminal_event_digest")
-            if stored_event_digest is not None and stored_event_digest != event_digest:
+            if (
+                not isinstance(stored_event_digest, str)
+                or stored_event_digest != event_digest
+            ):
                 raise ProvenanceError("final_prerequisite_mismatch")
             if (
                 getattr(ledger, "state", None) != "terminal"
@@ -4976,10 +4979,7 @@ class ParentExecutionAuthority:
                 or payload.get("semantic_verifier_identity")
                     != SEMANTIC_VERIFIER_IDENTITY
                 or not isinstance(snapshot, Mapping)
-                or (
-                    session.get("terminal_event_digest") is not None
-                    and session.get("terminal_event_digest") != event_digest
-                )
+                or session.get("terminal_event_digest") != event_digest
             ):
                 raise ProvenanceError("final_prerequisite_mismatch")
 
