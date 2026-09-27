@@ -3071,6 +3071,7 @@ class ParentExecutionAuthority:
         self.__external_revisions: dict[int, ExternalRevisionAuthorization] = {}
         self.__external_revision_identities: set[str] = set()
         self.__qualification_semantic_lock = threading.RLock()
+        self.__qualification_terminalization_lock = threading.Lock()
         self.__qualification_semantic_sessions: dict[str, dict[str, Any]] = {}
         self.__qualification_coordinate_capabilities: dict[int, _QualificationCoordinateCapability] = {}
         self.__qualification_coordinate_observations: dict[
@@ -4615,9 +4616,9 @@ class ParentExecutionAuthority:
                 terminal_receipt_digest,
                 terminal_receipts,
             )
-            if not authority.current_at() or authority.lifecycle != "active":
-                raise ProvenanceError("authority_replay")
-            event_digest = self._ledger_controller(ledger).terminal(payload)
+            event_digest = self._append_current_qualification_terminal(
+                authority, ledger, payload,
+            )
             session["terminal_event_digest"] = event_digest
             return event_digest
 
@@ -5392,7 +5393,8 @@ class ParentExecutionAuthority:
         """Advance only an injected controller's deterministic trusted clock."""
         if not self.is_injected_test_controller:
             raise ProvenanceError("injected clock is required")
-        return self.__trusted_clock.advance(seconds)
+        with self.__qualification_terminalization_lock:
+            return self.__trusted_clock.advance(seconds)
 
     advance_test_time = advance_trusted_time
     advance_logical_time = advance_trusted_time
@@ -5497,7 +5499,9 @@ class ParentExecutionAuthority:
                         )
                         or terminal_payload.get("terminal_verified") is not True):
                     raise ProvenanceError("final_prerequisite_mismatch")
-                digest = self._ledger_controller(ledger).terminal(terminal_payload)
+                digest = self._append_current_qualification_terminal(
+                    session["authority"], ledger, terminal_payload,
+                )
                 session["state"] = "terminal"
                 return digest
         if (
@@ -5555,10 +5559,27 @@ class ParentExecutionAuthority:
                     or getattr(ledger, "state", None) != "active"
                 ):
                     raise ProvenanceError("final_prerequisite_mismatch")
-                digest = self._ledger_controller(ledger).terminal(terminal_payload)
+                digest = self._append_current_qualification_terminal(
+                    authority, ledger, terminal_payload,
+                )
                 session["terminal_event_digest"] = digest
                 return digest
+        if getattr(ledger, "namespace", None) == "qualification":
+            raise ProvenanceError("final_prerequisite_mismatch")
         return self._ledger_controller(ledger).terminal(terminal_payload)
+
+    def _append_current_qualification_terminal(
+        self,
+        authority: ActiveQualificationAuthority,
+        ledger: Any,
+        payload: Mapping[str, Any],
+    ) -> str:
+        """Linearize a qualification terminal event with authority freshness."""
+
+        with self.__qualification_terminalization_lock:
+            if not authority.current_at() or authority.lifecycle != "active":
+                raise ProvenanceError("authority_replay")
+            return self._ledger_controller(ledger).terminal(dict(payload))
 
     def quarantine_ledger(self, ledger: Any, payload: Mapping[str, Any]) -> str:
         return self._ledger_controller(ledger).quarantine(payload)

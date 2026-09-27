@@ -479,6 +479,50 @@ def test_authority_expiry_before_durable_pass_event_keeps_ledger_active(
         fixture.close()
 
 
+def test_authority_expiry_before_durable_failed_event_keeps_ledger_active(
+    tmp_path, monkeypatch,
+):
+    helpers = pytest.importorskip("test_minecraft_k12_authority_e2e")
+    fixture = helpers._build_qualification(
+        tmp_path, "stale-before-failed-event", publish=False, failed_coordinate="P3",
+    )
+    original_terminal = fixture.controller.ledger_terminal
+
+    def expire_before_append(*args, **kwargs):
+        fixture.controller.advance_trusted_time(400)
+        return original_terminal(*args, **kwargs)
+
+    monkeypatch.setattr(fixture.controller, "ledger_terminal", expire_before_append)
+    try:
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            from benchmarks.minecraft.k12_live_qualification import (
+                publish_live_qualification_terminals,
+            )
+
+            publish_live_qualification_terminals(
+                fixture.active_qualification,
+                fixture.cells,
+                fixture.probes,
+                ledger=fixture.qualification_ledger,
+            )
+        assert fixture.qualification_ledger.state == "active"
+    finally:
+        fixture.close()
+
+
+@pytest.mark.parametrize("payload", ({}, {"result": "passed-ish"}, {"result": None}))
+def test_qualification_ledger_rejects_unrecognized_terminal_payload(
+    tmp_path, payload,
+):
+    fixture = _fixture(tmp_path, "unrecognized-terminal-payload")
+    try:
+        with pytest.raises(ProvenanceError, match="final_prerequisite_mismatch"):
+            fixture.controller.ledger_terminal(fixture.qualification_ledger, payload)
+        assert fixture.qualification_ledger.state == "active"
+    finally:
+        fixture.close()
+
+
 def test_copied_or_rehashed_active_authority_cannot_open_receipt_scope(tmp_path):
     fixture = _fixture(tmp_path, "copied-active")
     try:
