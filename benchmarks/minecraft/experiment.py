@@ -484,7 +484,22 @@ def _run_minecraft_experiment_attempt(
                 runtime_target_lock_unavailable_reason = "unknown_error"
                 runtime_target_lock_metadata_valid = None
         finally:
-            server_lock_released = not target_lock.acquired
+            server_lock_released = (
+                server_lock_acquired
+                and
+                not target_lock.acquired
+                and target_lock.release_succeeded is not False
+            )
+            if target_lock.release_succeeded is False:
+                runtime_target_quarantined = True
+                runtime_target_quarantine = runtime_target_quarantine or {
+                    "status": "incomplete",
+                    "reasons": ["lock_release_incomplete"],
+                    "diagnostics": {},
+                }
+                if error is None:
+                    error = "Minecraft target lock release could not be verified"
+                    error_type = "MinecraftTargetLockReleaseError"
         action_log_available = isinstance(runtime_result.get("action_log"), dict)
         action_log = runtime_result.get("action_log") if action_log_available else {}
         score = runtime_result.get("score") if isinstance(runtime_result.get("score"), dict) else {}

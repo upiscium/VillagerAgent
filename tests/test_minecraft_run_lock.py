@@ -32,6 +32,112 @@ def _lock(tmp_path, attempt_id, *, port=25565):
     )
 
 
+@pytest.mark.parametrize("poll_interval", [-1, float("nan"), float("inf")])
+def test_poll_interval_must_be_finite_and_non_negative(tmp_path, poll_interval):
+    with pytest.raises(ValueError, match="poll_interval_seconds"):
+        MinecraftTargetLock(
+            lock_root=tmp_path / "locks",
+            host="127.0.0.1",
+            port=25565,
+            world_id="world-a",
+            attempt_id="attempt-invalid-poll",
+            poll_interval_seconds=poll_interval,
+        )
+
+
+def test_acquire_rejects_symlink_lock_path(tmp_path):
+    lock = _lock(tmp_path, "attempt-symlink-acquire")
+    target = tmp_path / "target.lock"
+    target.write_text("sentinel", encoding="utf-8")
+    lock.path.parent.mkdir(parents=True, exist_ok=True)
+    lock.path.symlink_to(target)
+
+    with pytest.raises(MinecraftTargetLockUnavailableError):
+        lock.acquire()
+    assert target.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_release_does_not_downgrade_replaced_lock_inode(tmp_path):
+    lock = _lock(tmp_path, "attempt-release-drift").acquire()
+    replacement = lock.path.with_name("replacement-release.lock")
+    try:
+        replacement.write_bytes(lock.path.read_bytes())
+        os.replace(replacement, lock.path)
+        assert lock.release() is False
+        assert lock._quarantine_uncertain is True
+        assert json.loads(lock.path.read_text(encoding="utf-8"))["status"] == "acquired"
+    finally:
+        if lock.path.exists():
+            lock.path.unlink()
+
+
+def test_quarantine_serialization_failure_does_not_destroy_metadata(tmp_path):
+    lock = _lock(tmp_path, "attempt-serialization").acquire()
+    try:
+        before = lock.path.read_bytes()
+        with pytest.raises(MinecraftTargetLockMetadataError, match="JSON serializable"):
+            lock.quarantine(
+                run_name="run-serialization",
+                reasons=("metadata_failure",),
+                diagnostics={"unsupported": b"bytes"},
+            )
+        assert lock.path.read_bytes() == before
+        assert lock.acquired is True
+        assert lock.quarantined is False
+    finally:
+        lock.release()
+
+
+def test_release_unlocks_and_closes_after_metadata_write_failure(tmp_path, monkeypatch):
+    lock = _lock(tmp_path, "attempt-release-failure").acquire()
+    monkeypatch.setattr(
+        lock,
+        "_write_metadata",
+        lambda _payload: (_ for _ in ()).throw(OSError("fsync failed")),
+    )
+
+    with pytest.raises(OSError, match="fsync failed"):
+        lock.release()
+
+    assert lock._stream is None
+    assert lock.acquired is False
+    replacement = _lock(tmp_path, "attempt-after-release-failure")
+    # An unverified release leaves a durable guard quarantine until an
+    # operator explicitly acknowledges the target.
+    with pytest.raises(MinecraftTargetQuarantinedError):
+        replacement.acquire()
+    clear_minecraft_target_quarantine(
+        lock_root=tmp_path / "locks",
+        host="127.0.0.1",
+        port=25565,
+        reason="release-failure-test",
+        acknowledge_target_safe=True,
+    )
+    replacement.acquire()
+    replacement.release()
+
+
+def test_release_never_downgrades_quarantine_after_fsync_uncertainty(
+    tmp_path, monkeypatch,
+):
+    lock = _lock(tmp_path, "attempt-quarantine-fsync").acquire()
+
+    def fail_fsync(_fd):
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr("benchmarks.minecraft.run_lock.os.fsync", fail_fsync)
+    with pytest.raises(OSError, match="fsync failed"):
+        lock.quarantine(
+            run_name="run-fsync",
+            reasons=("metadata_failure",),
+            diagnostics={},
+        )
+
+    lock.release()
+    persisted = json.loads(lock.path.read_text(encoding="utf-8"))
+    assert persisted["status"] == "quarantined"
+
+
 def test_retained_lease_snapshot_exposes_immutable_lease_identity(tmp_path):
     lock = _lock(tmp_path, "attempt-snapshot").acquire()
     try:
@@ -115,6 +221,26 @@ def test_retained_lease_snapshot_surfaces_path_inode_drift(tmp_path):
             os.lstat(lock.path).st_dev,
             os.lstat(lock.path).st_ino,
         )
+    finally:
+        lock.release()
+        if lock.path.exists():
+            lock.path.unlink()
+
+
+def test_quarantine_rejects_path_inode_drift(tmp_path):
+    lock = _lock(tmp_path, "attempt-quarantine-inode-drift").acquire()
+    replacement = lock.path.with_name("replacement-quarantine.lock")
+    try:
+        replacement.write_bytes(lock.path.read_bytes())
+        os.replace(replacement, lock.path)
+
+        with pytest.raises(MinecraftTargetLockMetadataError, match="path"):
+            lock.quarantine(
+                run_name="run-inode-drift",
+                reasons=("target_lock_loss",),
+                diagnostics={},
+            )
+        assert lock.quarantined is False
     finally:
         lock.release()
         if lock.path.exists():
@@ -581,6 +707,32 @@ def test_clear_allows_new_owner_after_explicit_acknowledgement(tmp_path):
     assert cleared["last_quarantine"]["attempt_id"] == "attempt-a"
     with _lock(tmp_path, "attempt-b") as replacement:
         assert replacement.acquired is True
+
+
+def test_clear_rejects_symlink_lock_path(tmp_path):
+    first = _lock(tmp_path, "attempt-clear-symlink").acquire()
+    first.quarantine(
+        run_name="run-clear-symlink",
+        reasons=["bridge_cleanup_incomplete"],
+        diagnostics={},
+    )
+    first.release()
+    target = tmp_path / "target-clear.lock"
+    target.write_bytes(first.path.read_bytes())
+    first.path.unlink()
+    first.path.symlink_to(target)
+    try:
+        with pytest.raises(MinecraftTargetLockMetadataError, match="symlink"):
+            clear_minecraft_target_quarantine(
+                lock_root=tmp_path / "locks",
+                host="127.0.0.1",
+                port=25565,
+                reason="Verified cleanup",
+                acknowledge_target_safe=True,
+            )
+    finally:
+        if first.path.is_symlink():
+            first.path.unlink()
 
 
 def test_clear_rejects_active_owner(tmp_path):

@@ -995,12 +995,139 @@ def test_minecraft_k12_authority_graph_uses_final_scope_launch_and_completion(tm
         stopped = runner.stop(controller, graph.cell_authority)
         assert stopped.active_state == "inactive"
         assert controller.state is LiveState.CLEAN
+        with pytest.raises(ContainmentError, match="terminally closed"):
+            runner.stop(controller, graph.cell_authority)
         assert graph.fence.real_counts == _zero_counts()
         assert graph.fence.external_counters == _zero_counts()
         assert graph.fence.entry_counts == _zero_counts()
         assert graph.fence.real_entry_counts == _zero_counts()
         graph.fence.assert_no_real_entries()
         assert runner.closed is True
+    finally:
+        graph.close()
+
+
+def test_final_dispatch_failure_quarantines_ledger_and_target(tmp_path, monkeypatch):
+    graph = _build_graph(tmp_path, "dispatch-failure-quarantine")
+    try:
+        graph.runner.prepare(
+            graph.cell_authority,
+            graph.state,
+            "launch-dispatch-failure",
+            graph.argv,
+        )
+
+        def fail_dispatch(*_args, **_kwargs):
+            raise RuntimeError("dispatch failed")
+
+        monkeypatch.setattr(graph.transport, "dispatch", fail_dispatch)
+        with pytest.raises(RuntimeError, match="dispatch failed"):
+            graph.runner.launch(
+                graph.cell_authority,
+                graph.state,
+                "launch-dispatch-failure",
+                graph.argv,
+            )
+
+        assert graph.final_ledger.state == "quarantined"
+        assert graph.final_lock.quarantined is True
+        assert graph.final_lock.quarantine_record["status"] == "quarantined"
+        assert graph.runner.closed is True
+        assert graph.transport.dispatches == []
+    finally:
+        graph.close()
+
+
+def test_final_stop_mismatch_quarantines_stored_boundary(tmp_path):
+    graph = _build_graph(tmp_path, "stop-mismatch-quarantine")
+    try:
+        graph.runner.prepare(
+            graph.cell_authority,
+            graph.state,
+            "launch-stop-mismatch",
+            graph.argv,
+        )
+        launched = graph.runner.launch(
+            graph.cell_authority,
+            graph.state,
+            "launch-stop-mismatch",
+            graph.argv,
+        )
+        # LiveContainment is intentionally constructible only after terminal
+        # cell completion; exercise the runner's pre-stop identity rejection
+        # with the smallest typed controller-shaped object instead.
+        mismatched = object.__new__(LiveContainment)
+        mismatched.io = graph.executor
+        mismatched.unit = "wrong-unit"
+        mismatched.cgroup = launched.cgroup_id
+        with pytest.raises(ContainmentError, match="containment authority mismatch"):
+            graph.runner.stop(mismatched, graph.cell_authority)
+        assert graph.final_ledger.state == "quarantined"
+        assert graph.final_lock.quarantined is True
+        assert graph.runner.closed is True
+    finally:
+        graph.close()
+
+
+def test_final_stop_without_authority_quarantines_stored_boundary(tmp_path):
+    graph = _build_graph(tmp_path, "stop-missing-authority-quarantine")
+    try:
+        graph.runner.prepare(
+            graph.cell_authority,
+            graph.state,
+            "launch-stop-missing-authority",
+            graph.argv,
+        )
+        launched = graph.runner.launch(
+            graph.cell_authority,
+            graph.state,
+            "launch-stop-missing-authority",
+            graph.argv,
+        )
+        with pytest.raises(ContainmentError, match="exact final-cell authority"):
+            graph.runner.stop(None)
+        assert graph.final_ledger.state == "quarantined"
+        assert graph.final_lock.quarantined is True
+        assert graph.runner.closed is True
+    finally:
+        graph.close()
+
+
+def test_final_quarantine_failure_is_not_downgraded_to_local_block(tmp_path, monkeypatch):
+    graph = _build_graph(tmp_path, "dispatch-cleanup-failure")
+    try:
+        graph.runner.prepare(
+            graph.cell_authority,
+            graph.state,
+            "launch-cleanup-failure",
+            graph.argv,
+        )
+
+        monkeypatch.setattr(
+            graph.transport,
+            "dispatch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("dispatch failed")
+            ),
+        )
+        monkeypatch.setattr(
+            graph.controller,
+            "quarantine_ledger",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("ledger quarantine failed")
+            ),
+        )
+
+        with pytest.raises(ContainmentError, match="cleanup incomplete"):
+            graph.runner.launch(
+                graph.cell_authority,
+                graph.state,
+                "launch-cleanup-failure",
+                graph.argv,
+            )
+        assert graph.final_ledger.state == "active"
+        assert graph.final_lock.quarantined is True
+        assert graph.runner.closed is True
     finally:
         graph.close()
 

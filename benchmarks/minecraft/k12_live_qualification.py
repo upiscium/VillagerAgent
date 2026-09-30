@@ -153,6 +153,8 @@ def _authority_evidence_origin(authority: ActiveQualificationAuthority) -> str:
 
     if not isinstance(authority, ActiveQualificationAuthority):
         raise TypeError("active parent qualification authority required")
+    if not authority.current_at():
+        raise ProvenanceError("authority_replay")
     origin = authority.origin
     if origin == RUNTIME_VERIFIED_ORIGIN:
         if not authority.runtime_admissible:
@@ -831,6 +833,10 @@ def _active_qualification_binding(
 
 
 def _probe_binding(authority: ActiveQualificationAuthority) -> AuthorityBinding:
+    owns_active = getattr(getattr(authority, "owner", None), "owns_active_authority", None)
+    if (not callable(owns_active) or owns_active(authority) is not True
+            or not authority.current_at()):
+        raise ProvenanceError("authority_replay")
     binding = authority.authority.binding(QUALIFICATION_PROBE_NAMESPACE)
     if (
         not authority.owns(binding)
@@ -1006,6 +1012,10 @@ def qualify_live_probes(
 ) -> ProbeAggregate:
     """Build a diagnostic P1--P4 aggregate; never mint a terminal receipt."""
 
+    owns_active = getattr(getattr(authority, "owner", None), "owns_active_handle", None)
+    if (not callable(owns_active) or owns_active(authority) is not True
+            or not authority.current_at()):
+        raise ProvenanceError("authority_replay")
     try:
         binding = _probe_binding(authority)
     except ProvenanceError:
@@ -1102,6 +1112,8 @@ def _terminalize_failed_qualification(
     authority: ActiveQualificationAuthority,
     ledger: Any,
     *,
+    census: QualificationCensus,
+    verdict: Any,
     aggregate_digest: str,
     probe_digest: str,
     evidence_origin: str,
@@ -1119,18 +1131,20 @@ def _terminalize_failed_qualification(
         raise ProvenanceError("ledger_corrupt")
     if ledger.state != "active":
         raise ProvenanceError("first_consume_mismatch")
-    payload = {
-        "result": "failed",
-        "phase": QUALIFICATION_PHASE,
-        "authority_digest": authority.identity,
-        "qualification_aggregate_digest": aggregate_digest,
-        "probe_aggregate_digest": probe_digest,
-        "evidence_origin": evidence_origin,
-        "terminal_verified": False,
-        "failure_reason": reason,
-    }
+    payload = authority.owner.qualification_failed_payload(
+        authority, census, verdict,
+    )
+    if (
+        payload["qualification_aggregate_digest"] != aggregate_digest
+        or payload["probe_aggregate_digest"] != probe_digest
+        or payload["evidence_origin"] != evidence_origin
+        or payload["failure_reason"] != reason
+    ):
+        raise ProvenanceError("final_prerequisite_mismatch")
     try:
         event_digest = authority.owner.ledger_terminal(ledger, payload)
+    except ProvenanceError:
+        raise
     except Exception as exc:
         raise ProvenanceError("authority_replay") from exc
     if ledger.state != "terminal" or not ledger.events:
@@ -1656,6 +1670,8 @@ def publish_live_qualification_terminals(
         return _terminalize_failed_qualification(
             authority,
             selected_ledger,
+            census=census,
+            verdict=verdict,
             aggregate_digest=verdict.aggregate_digest,
             probe_digest=verdict.probe_digest,
             evidence_origin=(
@@ -1680,6 +1696,8 @@ def publish_live_qualification_terminals(
                 terminal_receipts,
                 _validated_batch=validated_batch,
             )
+        except ProvenanceError:
+            raise
         except Exception as exc:
             raise ProvenanceError("authority_replay") from exc
 
@@ -1814,14 +1832,6 @@ def aggregate_live_qualification(
     )
     selected_ledger = _authority_ledger(authority) if ledger is None else ledger
     if probe_aggregate.passed is not True:
-        _terminalize_failed_qualification(
-            authority,
-            selected_ledger,
-            aggregate_digest=aggregate_identity,
-            probe_digest=probe_digest,
-            evidence_origin=aggregate_origin,
-            reason="qualification_probe_failed",
-        )
         raise ValueError("qualification probes failed")
     presentation_census = parent_census
     presentation_verdict = verify_qualification_projection(presentation_census)

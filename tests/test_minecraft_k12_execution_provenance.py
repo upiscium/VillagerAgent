@@ -1,13 +1,16 @@
 import dataclasses
 import hashlib
 import hmac
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from benchmarks.common.eac.canonical import canonical_bytes, canonical_sha256
-from benchmarks.minecraft.k12_execution_capsule import CapsuleRecord, DurableLedger, attest_capsule
+from benchmarks.minecraft.k12_execution_capsule import (
+    CapsuleRecord, DurableLedger, attest_capsule,
+)
 from benchmarks.minecraft.k12_execution_provenance import (
     PROFILE_V2,
     INJECTED_FAKE_ORIGIN,
@@ -38,12 +41,15 @@ from benchmarks.minecraft.k12_execution_provenance import (
     durable_ledger_root_digest,
     git_blob_oid,
     retained_target_binding,
+    verify_first_consume,
     source_closure_from_observations,
     verify_final_first_consume,
     verify_qualification_first_consume,
+    _quarantine_retained_target,
 )
 from benchmarks.minecraft.k12_guarded_backend import authority_binding_is_current
 from benchmarks.minecraft.k12_runtime_profile import (
+    K12RuntimeProfileError,
     load_k12_live_runtime_profile,
     load_k12_live_source_policy,
 )
@@ -291,6 +297,115 @@ def test_injected_only_source_collector_reads_missing_tree_paths_but_is_non_runt
         )
 
 
+def test_source_collector_rejects_rehashed_policy_object():
+    injected = ParentExecutionAuthority().injected_test_controller()
+    forged_policy = dataclasses.replace(POLICY, digest="f" * 64)
+    with pytest.raises(ProvenanceError, match="source_closure_incomplete"):
+        injected.collect_source_closure(
+            root=SOURCE_ROOT, policy=forged_policy, injected_only=True,
+        )
+
+
+def test_profile_and_policy_loaders_bind_to_the_supplied_source_root(tmp_path):
+    profile = load_k12_live_runtime_profile(
+        SOURCE_ROOT / "benchmarks/minecraft/k12_live_runtime_profile_v2.json",
+        source_root=SOURCE_ROOT,
+    )
+    policy = load_k12_live_source_policy(
+        SOURCE_ROOT / "configs/minecraft/k12-live-source-closure-policy-v2.json",
+        source_root=SOURCE_ROOT,
+    )
+    assert profile.values == PROFILE.values
+    assert policy == POLICY
+    with pytest.raises(K12RuntimeProfileError, match="outside the source root"):
+        load_k12_live_runtime_profile(
+            SOURCE_ROOT / "benchmarks/minecraft/k12_live_runtime_profile_v2.json",
+            source_root=tmp_path,
+        )
+    with pytest.raises(K12RuntimeProfileError):
+        load_k12_live_source_policy(
+            SOURCE_ROOT / "configs/minecraft/k12-live-source-closure-policy-v2.json",
+            source_root=tmp_path,
+        )
+
+
+def test_durable_ledger_fails_closed_after_post_append_storage_failure(tmp_path, monkeypatch):
+    root = tmp_path / "post-append-ledger"
+    root.mkdir(mode=0o700)
+    key = b"l" * 32
+    ledger = DurableLedger.create_parent_owned(
+        controller_key=key,
+        root=root,
+        namespace="qualification",
+        reservation_id="9" * 64,
+        output_root_identity="qualification-output",
+    )
+    try:
+        controller = ledger.acquire_parent_controller(key)
+        authority_digest = "sha256:" + "a" * 64
+        observation_digest = "sha256:" + "b" * 64
+        controller.authority_minted(authority_digest)
+        controller.first_consume_verified(authority_digest, observation_digest)
+        controller.activate(authority_digest)
+        original_append = ledger._storage._append_bytes_locked
+
+        def append_then_fail(data):
+            original_append(data)
+            raise OSError("post-append acknowledgement failure")
+
+        monkeypatch.setattr(ledger._storage, "_append_bytes_locked", append_then_fail)
+        payload = {"result": "failed", "phase": "qualification"}
+        with pytest.raises(OSError, match="post-append acknowledgement failure"):
+            controller.terminal(payload)
+        assert not ledger.verify_chain()
+    finally:
+        ledger.close()
+
+
+def test_qualification_preflight_rejects_replaced_runtime_profile(tmp_path):
+    controller = ParentExecutionAuthority().injected_test_controller()
+    root = tmp_path / "forged-profile"
+    root.mkdir(mode=0o700)
+    ledger = controller.create_ledger(
+        root=root,
+        namespace="qualification",
+        reservation_id="8" * 64,
+        output_root_identity="qualification-output",
+    )
+    preflight = _preflight(controller, ledger)
+    try:
+        forged_values = tuple(
+            (
+                key,
+                "f" * 64 if key == "detached_artifact_sha256" else value,
+            )
+            for key, value in PROFILE.values
+        )
+        forged_profile = object.__new__(type(PROFILE))
+        object.__setattr__(forged_profile, "values", forged_values)
+        forged_auth = controller.mint_qualification_run_authorization(
+            reservation_id=ledger.reservation_id,
+            output_root_identity=ledger.output_root_identity,
+            profile_digest="f" * 64,
+            ledger=ledger,
+            now=100,
+            external_revision_authorization=preflight.external_revision_authorization,
+        )
+        forged_preflight = dataclasses.replace(
+            preflight,
+            authenticated_profile=forged_profile,
+            profile_digest="f" * 64,
+            run_authorization=forged_auth,
+            run_authorization_digest=forged_auth.identity,
+        )
+        with pytest.raises(ProvenanceError, match="profile_mismatch"):
+            controller.mint_qualification(forged_preflight, now=101, ledger=ledger)
+        assert ledger.state == "quarantined"
+    finally:
+        preflight.target_lease.lock.release()
+        ledger.close()
+
+
 def test_injected_trusted_clock_expires_active_authority_at_guard_boundary(tmp_path):
     controller = ParentExecutionAuthority().injected_test_controller()
     root = tmp_path / "qualification"
@@ -332,6 +447,134 @@ def test_injected_trusted_clock_expires_active_authority_at_guard_boundary(tmp_p
         ledger.close()
 
 
+def test_first_consume_clock_rollback_quarantines_bound_resources(tmp_path):
+    parent = ParentExecutionAuthority().injected_test_controller()
+    root = tmp_path / "qualification"
+    root.mkdir(mode=0o700)
+    ledger = parent.create_ledger(
+        root=root,
+        namespace="qualification",
+        reservation_id="b" * 64,
+        output_root_identity="qualification-output",
+    )
+    try:
+        preflight = _preflight(parent, ledger)
+        authority = parent.mint_qualification(preflight, now=101, ledger=ledger)
+        with pytest.raises(ProvenanceError, match="trusted_clock_rollback"):
+            verify_qualification_first_consume(
+                authority,
+                _first(preflight),
+                now=100,
+                ledger=ledger,
+            )
+        assert ledger.state == "quarantined"
+        assert preflight.target_lease.lock.quarantined is True
+    finally:
+        preflight.target_lease.lock.release()
+        ledger.close()
+
+
+def test_ledger_quarantine_failure_still_quarantines_first_consume_target(
+    tmp_path, monkeypatch,
+):
+    parent = ParentExecutionAuthority().injected_test_controller()
+    root = tmp_path / "qualification"
+    root.mkdir(mode=0o700)
+    ledger = parent.create_ledger(
+        root=root,
+        namespace="qualification",
+        reservation_id="a" * 64,
+        output_root_identity="qualification-output",
+    )
+    try:
+        preflight = _preflight(parent, ledger)
+        authority = parent.mint_qualification(preflight, now=101, ledger=ledger)
+        monkeypatch.setattr(
+            parent,
+            "quarantine_ledger",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OSError("ledger quarantine unavailable")
+            ),
+        )
+        with pytest.raises(ProvenanceError, match="quarantine_incomplete"):
+            verify_qualification_first_consume(
+                authority,
+                _first(preflight),
+                now=100,
+                ledger=ledger,
+            )
+        assert ledger.state == "authority_minted"
+        assert preflight.target_lease.lock.quarantined is True
+    finally:
+        preflight.target_lease.lock.release()
+        ledger.close()
+
+
+def test_first_consume_after_ledger_quarantine_quarantines_bound_target(tmp_path):
+    parent = ParentExecutionAuthority().injected_test_controller()
+    root = tmp_path / "qualification"
+    root.mkdir(mode=0o700)
+    ledger = parent.create_ledger(
+        root=root,
+        namespace="qualification",
+        reservation_id="c" * 64,
+        output_root_identity="qualification-output",
+    )
+    try:
+        preflight = _preflight(parent, ledger)
+        authority = parent.mint_qualification(preflight, now=101, ledger=ledger)
+        parent.quarantine_ledger(ledger, {"reason": "preexisting_revoke"})
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            verify_qualification_first_consume(
+                authority,
+                _first(preflight),
+                now=102,
+                ledger=ledger,
+            )
+        assert ledger.state == "quarantined"
+        assert preflight.target_lease.lock.quarantined is True
+    finally:
+        preflight.target_lease.lock.release()
+        ledger.close()
+
+
+def test_first_consume_alternate_parent_ledger_quarantines_bound_resources(tmp_path):
+    parent = ParentExecutionAuthority().injected_test_controller()
+    root = tmp_path / "qualification"
+    alternate_root = tmp_path / "alternate"
+    root.mkdir(mode=0o700)
+    alternate_root.mkdir(mode=0o700)
+    ledger = parent.create_ledger(
+        root=root,
+        namespace="qualification",
+        reservation_id="f" * 64,
+        output_root_identity="qualification-output",
+    )
+    alternate = parent.create_ledger(
+        root=alternate_root,
+        namespace="qualification",
+        reservation_id="0" * 64,
+        output_root_identity="alternate-output",
+    )
+    try:
+        preflight = _preflight(parent, ledger)
+        authority = parent.mint_qualification(preflight, now=101, ledger=ledger)
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            verify_qualification_first_consume(
+                authority,
+                _first(preflight),
+                now=102,
+                ledger=alternate,
+            )
+        assert ledger.state == "quarantined"
+        assert alternate.state == "reserved"
+        assert preflight.target_lease.lock.quarantined is True
+    finally:
+        preflight.target_lease.lock.release()
+        alternate.close()
+        ledger.close()
+
+
 def test_parent_mints_typed_run_authorization_and_active_qualification(tmp_path):
     parent = ParentExecutionAuthority().injected_test_controller()
     root = tmp_path / "qualification"
@@ -353,6 +596,9 @@ def test_parent_mints_typed_run_authorization_and_active_qualification(tmp_path)
         assert not active.runtime_admissible
         assert active.binding.origin == INJECTED_TEST_ORIGIN
         assert not active.binding.runtime_admissible
+        assert active.sealed_source[preflight.source.records[0].path]
+        with pytest.raises(TypeError):
+            active.sealed_source[preflight.source.records[0].path] = b"drift"  # type: ignore[index]
         assert authority_owns_profile(
             active,
             active.binding,
@@ -387,6 +633,97 @@ def test_foreign_parent_capsule_cannot_authorize_qualification(tmp_path):
                 ledger=ledger,
             )
         assert ledger.state == "quarantined"
+    finally:
+        preflight.target_lease.lock.release()
+        ledger.close()
+
+
+def test_foreign_ledger_argument_cleans_up_bound_parent_resources(tmp_path):
+    parent = ParentExecutionAuthority().injected_test_controller()
+    foreign = ParentExecutionAuthority().injected_test_controller()
+    root = tmp_path / "qualification"
+    foreign_root = tmp_path / "foreign"
+    root.mkdir(mode=0o700)
+    foreign_root.mkdir(mode=0o700)
+    ledger = parent.create_ledger(
+        root=root,
+        namespace="qualification",
+        reservation_id="9" * 64,
+        output_root_identity="qualification-output",
+    )
+    foreign_ledger = foreign.create_ledger(
+        root=foreign_root,
+        namespace="qualification",
+        reservation_id="a" * 64,
+        output_root_identity="foreign-output",
+    )
+    try:
+        preflight = _preflight(parent, ledger)
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            parent.mint_qualification(preflight, now=101, ledger=foreign_ledger)
+        assert ledger.state == "quarantined"
+        assert foreign_ledger.state == "reserved"
+        assert preflight.target_lease.lock.quarantined is True
+    finally:
+        preflight.target_lease.lock.release()
+        foreign_ledger.close()
+        ledger.close()
+
+
+def test_same_parent_ledger_mismatch_quarantines_bound_resources(tmp_path):
+    parent = ParentExecutionAuthority().injected_test_controller()
+    root = tmp_path / "qualification"
+    other_root = tmp_path / "other"
+    root.mkdir(mode=0o700)
+    other_root.mkdir(mode=0o700)
+    ledger = parent.create_ledger(
+        root=root,
+        namespace="qualification",
+        reservation_id="d" * 64,
+        output_root_identity="qualification-output",
+    )
+    other = parent.create_ledger(
+        root=other_root,
+        namespace="qualification",
+        reservation_id="e" * 64,
+        output_root_identity="other-output",
+    )
+    try:
+        preflight = _preflight(parent, ledger)
+        with pytest.raises(ProvenanceError, match="target_lock_loss"):
+            parent.mint_qualification(preflight, now=101, ledger=other)
+        assert ledger.state == "quarantined"
+        assert other.state == "reserved"
+        assert preflight.target_lease.lock.quarantined is True
+    finally:
+        preflight.target_lease.lock.release()
+        other.close()
+        ledger.close()
+
+
+def test_qualification_mint_wrong_output_observation_still_cleans_bound_resources(tmp_path):
+    parent = ParentExecutionAuthority().injected_test_controller()
+    root = tmp_path / "qualification"
+    root.mkdir(mode=0o700)
+    ledger = parent.create_ledger(
+        root=root,
+        namespace="qualification",
+        reservation_id="1" * 64,
+        output_root_identity="qualification-output",
+    )
+    try:
+        preflight = _preflight(parent, ledger)
+        forged = dataclasses.replace(
+            preflight,
+            output=dataclasses.replace(
+                preflight.output,
+                root_identity="syntactically-valid-but-wrong-output",
+            ),
+        )
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            parent.mint_qualification(forged, now=101, ledger=ledger)
+        assert ledger.state == "quarantined"
+        assert preflight.target_lease.lock.quarantined is True
     finally:
         preflight.target_lease.lock.release()
         ledger.close()
@@ -522,6 +859,139 @@ def test_retained_target_lease_uses_only_public_snapshot_and_revalidates(tmp_pat
             K12RetainedTargetLease(lock, "lease-attempt")
     finally:
         lock.release()
+
+
+def test_retained_target_quarantine_rejects_post_quarantine_inode_drift(tmp_path):
+    lock = MinecraftTargetLock(
+        lock_root=tmp_path / "locks",
+        host="127.0.0.1",
+        port=25575,
+        world_id="world/1",
+        attempt_id="post-quarantine-drift",
+    ).acquire()
+    parent = ParentExecutionAuthority().injected_test_controller()
+    lease = parent.retain_target_lease(lock, "post-quarantine-drift")
+    replacement = lock.path.with_name("replacement.lock")
+    try:
+        lock.quarantine(
+            run_name="post-quarantine-drift",
+            reasons=("target_lock_loss",),
+            diagnostics={},
+        )
+        replacement.write_bytes(lock.path.read_bytes())
+        os.replace(replacement, lock.path)
+        assert _quarantine_retained_target(
+            lease,
+            reason="target_lock_loss",
+            authority_identity="authority",
+            run_name="post-quarantine-drift",
+        ) is False
+    finally:
+        lock.release()
+        if lock.path.exists():
+            lock.path.unlink()
+
+
+def test_activation_rechecks_the_parent_source_seal(tmp_path, monkeypatch):
+    import benchmarks.minecraft.k12_execution_provenance as provenance
+
+    parent = ParentExecutionAuthority().injected_test_controller()
+    root = tmp_path / "qualification"
+    root.mkdir(mode=0o700)
+    ledger = parent.create_ledger(
+        root=root, namespace="qualification", reservation_id="a" * 64,
+        output_root_identity="qualification-output",
+    )
+    try:
+        preflight = _preflight(parent, ledger)
+        authority = parent.mint_qualification(preflight, now=101, ledger=ledger)
+        verify_first_consume(authority, _first(preflight), now=102, ledger=ledger)
+
+        def drift_after_consume(*args, **kwargs):
+            del args, kwargs
+            raise ProvenanceError("source_content_mismatch")
+
+        monkeypatch.setattr(
+            provenance, "_revalidate_parent_source_closure", drift_after_consume,
+        )
+        with pytest.raises(ProvenanceError, match="source_content_mismatch"):
+            parent.activate_qualification(authority, ledger=ledger)
+        assert ledger.state == "first_consume_verified"
+    finally:
+        preflight.target_lease.lock.release()
+        ledger.close()
+
+
+def test_activation_rejects_a_released_parent_target_lease(tmp_path):
+    parent = ParentExecutionAuthority().injected_test_controller()
+    root = tmp_path / "qualification"
+    root.mkdir(mode=0o700)
+    ledger = parent.create_ledger(
+        root=root, namespace="qualification", reservation_id="c" * 64,
+        output_root_identity="qualification-output",
+    )
+    try:
+        preflight = _preflight(parent, ledger)
+        authority = parent.mint_qualification(preflight, now=101, ledger=ledger)
+        verify_first_consume(authority, _first(preflight), now=102, ledger=ledger)
+        preflight.target_lease.lock.release()
+        with pytest.raises(ProvenanceError, match="target_lock_loss"):
+            parent.activate_qualification(authority, ledger=ledger)
+        assert ledger.state == "first_consume_verified"
+    finally:
+        preflight.target_lease.lock.release()
+        ledger.close()
+
+
+def test_authority_currentness_refreshes_a_second_durable_ledger_handle(tmp_path):
+    parent = ParentExecutionAuthority().injected_test_controller()
+    root = tmp_path / "qualification"
+    root.mkdir(mode=0o700)
+    ledger = parent.create_ledger(
+        root=root, namespace="qualification", reservation_id="d" * 64,
+        output_root_identity="qualification-output",
+    )
+    second = None
+    try:
+        preflight = _preflight(parent, ledger)
+        authority = parent.mint_qualification(preflight, now=101, ledger=ledger)
+        active = parent.verify_qualification_first_consume(
+            authority, _first(preflight), now=102, ledger=ledger,
+        )
+        second = parent.open_ledger(
+            root=root, namespace="qualification", reservation_id=ledger.reservation_id,
+            output_root_identity=ledger.output_root_identity, nonce=ledger.nonce,
+        )
+        parent.quarantine_ledger(second, {"reason": "external_parent_revoke"})
+        assert active.current_at() is False
+        assert parent.validate_current_authority(active) is False
+    finally:
+        preflight.target_lease.lock.release()
+        if second is not None:
+            second.close()
+        ledger.close()
+
+
+def test_active_authority_currentness_rejects_target_lease_loss(tmp_path):
+    parent = ParentExecutionAuthority().injected_test_controller()
+    root = tmp_path / "qualification"
+    root.mkdir(mode=0o700)
+    ledger = parent.create_ledger(
+        root=root, namespace="qualification", reservation_id="e" * 64,
+        output_root_identity="qualification-output",
+    )
+    try:
+        preflight = _preflight(parent, ledger)
+        authority = parent.mint_qualification(preflight, now=101, ledger=ledger)
+        active = parent.verify_qualification_first_consume(
+            authority, _first(preflight), now=102, ledger=ledger,
+        )
+        preflight.target_lease.lock.release()
+        assert active.current_at() is False
+        assert parent.validate_current_authority(active) is False
+    finally:
+        preflight.target_lease.lock.release()
+        ledger.close()
 
 
 def test_first_consume_revalidates_pr_semantics_and_quarantines(tmp_path):

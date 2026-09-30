@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import fields, replace
 import threading
+from types import MappingProxyType
 
 import pytest
 
+from benchmarks.common.eac.canonical import canonical_sha256
 from benchmarks.minecraft.k12_execution_provenance import (
     ProvenanceError,
     QualificationCoordinateExecutionReceipt,
     QualificationExecutionStageReceipt,
     _terminal_receipt_census_digest,
+    _terminal_receipt_census_digest_from_identities,
     _coordinate_execution_receipt_identity,
 )
 from benchmarks.minecraft.k12_live_qualification import (
@@ -17,6 +21,7 @@ from benchmarks.minecraft.k12_live_qualification import (
     issue_live_qualification_capabilities,
     publish_live_qualification_terminals,
     qualify_live_cell,
+    qualify_live_probes,
 )
 
 
@@ -30,6 +35,62 @@ def _copy(value):
     for item in fields(type(value)):
         object.__setattr__(copied, item.name, getattr(value, item.name))
     return copied
+
+
+def _thaw(value):
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw(item) for item in value]
+    return value
+
+
+def _terminal_snapshot_identity(entry):
+    return canonical_sha256({
+        "artifact": "minecraft-k12-qualification-coordinate-terminal-receipt/2",
+        "authority": entry["authority"],
+        "activation": entry["activation"],
+        "reservation": entry["reservation"],
+        "domain": entry["domain"],
+        "coordinate": entry["coordinate"],
+        "capability": entry["capability"],
+        "record": entry["record"],
+        "execution_receipt": entry["execution_receipt"],
+        "execution_stages": list(entry["execution_stages"]),
+    })
+
+
+def _replace_last_ledger_payload(ledger, monkeypatch, payload):
+    event = ledger.events[-1]
+    ledger._events[-1] = replace(
+        event, payload=MappingProxyType(payload),
+    )
+    monkeypatch.setattr(ledger, "verify_chain", lambda: True)
+
+
+def _recovery_registry_snapshot(controller):
+    names = (
+        "_ParentExecutionAuthority__qualification_coordinate_capabilities",
+        "_ParentExecutionAuthority__qualification_coordinate_observations",
+        "_ParentExecutionAuthority__qualification_execution_stage_receipts",
+        "_ParentExecutionAuthority__qualification_execution_stage_identities",
+        "_ParentExecutionAuthority__qualification_execution_stage_observations",
+        "_ParentExecutionAuthority__qualification_execution_boundary_artifacts",
+        "_ParentExecutionAuthority__qualification_execution_boundary_identities",
+        "_ParentExecutionAuthority__qualification_coordinate_execution_receipts",
+        "_ParentExecutionAuthority__qualification_coordinate_execution_identities",
+        "_ParentExecutionAuthority__qualification_semantic_attestations",
+    )
+    return {name: dict(getattr(controller, name)) for name in names}
+
+
+def _session_snapshot(session):
+    return {
+        key: dict(value) if isinstance(value, dict)
+        else set(value) if isinstance(value, set)
+        else value
+        for key, value in session.items()
+    }
 
 
 def test_exact_parent_execution_receipts_mint_one_attestation(tmp_path):
@@ -56,6 +117,149 @@ def test_exact_parent_execution_receipts_mint_one_attestation(tmp_path):
             ledger=fixture.qualification_ledger,
         )
         assert attestation.semantic_result == "passed"
+    finally:
+        fixture.close()
+
+
+def test_passed_terminal_append_retains_qualification_target_lease(
+    tmp_path, monkeypatch,
+):
+    fixture = _fixture(tmp_path, "terminal-target-lease-linearization")
+    terminal_entered = threading.Event()
+    release_contended = threading.Event()
+    release_uncontended = threading.Event()
+    release_finished = threading.Event()
+    continue_terminal = threading.Event()
+    errors = []
+    release_thread = None
+    publisher = None
+
+    class _ObservedRLock:
+        def __init__(self, lock):
+            self.lock = lock
+
+        def __enter__(self):
+            if threading.current_thread().name == "qualification-target-release":
+                if self.lock.acquire(blocking=False):
+                    release_uncontended.set()
+                else:
+                    release_contended.set()
+                    self.lock.acquire()
+                return self
+            self.lock.acquire()
+            return self
+
+        def __exit__(self, _type, _value, _traceback):
+            self.lock.release()
+
+    fixture.qualification_lock._lifecycle_lock = _ObservedRLock(
+        fixture.qualification_lock._lifecycle_lock
+    )
+    original_controller = fixture.controller._ledger_controller(
+        fixture.qualification_ledger
+    )
+
+    class _PausingController:
+        def terminal(self, payload):
+            nonlocal release_thread
+
+            def release_target():
+                try:
+                    fixture.qualification_lock.release()
+                except BaseException as exc:  # pragma: no cover - diagnostic capture
+                    errors.append(exc)
+                finally:
+                    release_finished.set()
+
+            terminal_entered.set()
+            release_thread = threading.Thread(
+                target=release_target,
+                name="qualification-target-release",
+                daemon=True,
+            )
+            release_thread.start()
+            if not continue_terminal.wait(timeout=30):
+                raise AssertionError("terminal append was not released")
+            return original_controller.terminal(payload)
+
+    monkeypatch.setattr(
+        fixture.controller,
+        "_ledger_controller",
+        lambda _ledger: _PausingController(),
+    )
+
+    def publish():
+        try:
+            publish_live_qualification_terminals(
+                fixture.active_qualification,
+                fixture.cells,
+                fixture.probes,
+                ledger=fixture.qualification_ledger,
+            )
+        except BaseException as exc:  # pragma: no cover - diagnostic capture
+            errors.append(exc)
+
+    released_during_append = False
+    try:
+        publisher = threading.Thread(target=publish, daemon=True)
+        publisher.start()
+        assert terminal_entered.wait(timeout=60)
+        assert release_contended.wait(timeout=5) or release_uncontended.wait(timeout=5)
+        released_during_append = release_finished.wait(timeout=0.2)
+    finally:
+        continue_terminal.set()
+        if publisher is not None:
+            publisher.join(timeout=30)
+        if release_thread is not None:
+            release_thread.join(timeout=5)
+        fixture.close()
+
+    assert not released_during_append
+    assert publisher is not None and not publisher.is_alive()
+    assert release_thread is not None and not release_thread.is_alive()
+    assert release_contended.is_set()
+    assert not release_uncontended.is_set()
+    assert not errors
+    assert fixture.qualification_ledger.state == "terminal"
+    assert release_finished.is_set()
+
+
+def test_passed_terminal_anchor_failure_quarantines_target(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, "terminal-anchor-failure-quarantine")
+
+    def fail_anchor(**_kwargs):
+        raise OSError("head anchor fsync failed")
+
+    monkeypatch.setattr(
+        fixture.qualification_ledger._storage,
+        "_write_head_anchor_locked",
+        fail_anchor,
+    )
+    try:
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            publish_live_qualification_terminals(
+                fixture.active_qualification,
+                fixture.cells,
+                fixture.probes,
+                ledger=fixture.qualification_ledger,
+            )
+        assert fixture.qualification_ledger._durability_unknown is True
+        assert fixture.qualification_lock.quarantined is True
+        assert fixture.qualification_lock.quarantine_record["status"] == "quarantined"
+    finally:
+        fixture.close()
+
+
+def test_copied_active_qualification_handle_is_not_parent_owned(tmp_path):
+    fixture = _fixture(tmp_path, "copied-active-qualification")
+    try:
+        copied = _copy(fixture.active_qualification)
+        assert not copied.current_at()
+        assert not fixture.controller.validate_current_authority(copied)
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            issue_live_qualification_capabilities(copied)
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            qualify_live_probes(copied, fixture.probes)
     finally:
         fixture.close()
 
@@ -408,6 +612,191 @@ def test_pass_recovery_requires_parent_recorded_event_digest(tmp_path, monkeypat
         fixture.close()
 
 
+def test_pass_recovery_requires_registered_parent_execution_receipt(
+    tmp_path, monkeypatch,
+):
+    fixture = _fixture(tmp_path, "unregistered-recovery-receipt")
+    try:
+        def fail_commit(*_args, **_kwargs):
+            raise ProvenanceError("authority_replay")
+
+        monkeypatch.setattr(
+            fixture.controller,
+            "_register_qualification_terminal",
+            fail_commit,
+        )
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            publish_live_qualification_terminals(
+                fixture.active_qualification,
+                fixture.cells,
+                fixture.probes,
+                ledger=fixture.qualification_ledger,
+            )
+        payload = _thaw(fixture.qualification_ledger.events[-1].payload)
+        snapshot = payload["terminal_registry_snapshot"]
+        forged = snapshot["receipts"][0]
+        forged["execution_receipt"] = "sha256:" + "f" * 64
+        forged["identity"] = _terminal_snapshot_identity(forged)
+        payload["terminal_receipt_digest"] = (
+            _terminal_receipt_census_digest_from_identities(
+                tuple(item["identity"] for item in snapshot["receipts"])
+            )
+        )
+        _replace_last_ledger_payload(
+            fixture.qualification_ledger, monkeypatch, payload,
+        )
+
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            fixture.controller.recover_qualification_semantics(
+                fixture.active_qualification,
+            )
+        session = fixture.controller._ParentExecutionAuthority__qualification_semantic_sessions[
+            fixture.active_qualification.identity
+        ]
+        assert session["state"] == "collecting"
+        assert fixture.controller.owns_qualification_coordinate_execution_receipt(
+            fixture.cells[0].execution_receipt,
+        )
+    finally:
+        fixture.close()
+
+
+def test_pass_recovery_requires_parent_capability_identity(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, "unbound-recovery-capability")
+    try:
+        def fail_commit(*_args, **_kwargs):
+            raise ProvenanceError("authority_replay")
+
+        monkeypatch.setattr(
+            fixture.controller,
+            "_register_qualification_terminal",
+            fail_commit,
+        )
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            publish_live_qualification_terminals(
+                fixture.active_qualification,
+                fixture.cells,
+                fixture.probes,
+                ledger=fixture.qualification_ledger,
+            )
+        payload = _thaw(fixture.qualification_ledger.events[-1].payload)
+        snapshot = payload["terminal_registry_snapshot"]
+        forged = snapshot["receipts"][0]
+        forged["capability"] = "sha256:" + "e" * 64
+        forged["identity"] = _terminal_snapshot_identity(forged)
+        payload["terminal_receipt_digest"] = (
+            _terminal_receipt_census_digest_from_identities(
+                tuple(item["identity"] for item in snapshot["receipts"])
+            )
+        )
+        _replace_last_ledger_payload(
+            fixture.qualification_ledger, monkeypatch, payload,
+        )
+
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            fixture.controller.recover_qualification_semantics(
+                fixture.active_qualification,
+            )
+        session = fixture.controller._ParentExecutionAuthority__qualification_semantic_sessions[
+            fixture.active_qualification.identity
+        ]
+        assert session["state"] == "collecting"
+    finally:
+        fixture.close()
+
+
+def test_pass_recovery_rolls_back_when_attestation_mint_fails(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, "atomic-recovery-mint")
+    try:
+        def fail_commit(*_args, **_kwargs):
+            raise ProvenanceError("authority_replay")
+
+        monkeypatch.setattr(
+            fixture.controller,
+            "_register_qualification_terminal",
+            fail_commit,
+        )
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            publish_live_qualification_terminals(
+                fixture.active_qualification,
+                fixture.cells,
+                fixture.probes,
+                ledger=fixture.qualification_ledger,
+            )
+        monkeypatch.undo()
+        original_receipt = fixture.cells[0].execution_receipt
+
+        def fail_mint(*_args, **_kwargs):
+            raise ProvenanceError("authority_replay")
+
+        monkeypatch.setattr(
+            fixture.controller,
+            "_mint_qualification_semantic_attestation",
+            fail_mint,
+        )
+        session = fixture.controller._ParentExecutionAuthority__qualification_semantic_sessions[
+            fixture.active_qualification.identity
+        ]
+        before_registries = _recovery_registry_snapshot(fixture.controller)
+        before_session = _session_snapshot(session)
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            fixture.controller.recover_qualification_semantics(
+                fixture.active_qualification,
+            )
+        assert _recovery_registry_snapshot(fixture.controller) == before_registries
+        assert _session_snapshot(session) == before_session
+        assert session["state"] == "collecting"
+        assert fixture.controller.owns_qualification_coordinate_execution_receipt(
+            original_receipt,
+        )
+        monkeypatch.undo()
+        attestation = fixture.controller.recover_qualification_semantics(
+            fixture.active_qualification,
+        )
+        assert attestation.semantic_result == "passed"
+    finally:
+        fixture.close()
+
+
+def test_pass_recovery_uses_parent_terminal_registry_after_late_failure(
+    tmp_path, monkeypatch,
+):
+    fixture = _fixture(tmp_path, "late-attestation-recovery")
+    try:
+        original_mint = fixture.controller._mint_qualification_semantic_attestation
+
+        def fail_mint(*_args, **_kwargs):
+            raise ProvenanceError("authority_replay")
+
+        monkeypatch.setattr(
+            fixture.controller,
+            "_mint_qualification_semantic_attestation",
+            fail_mint,
+        )
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            publish_live_qualification_terminals(
+                fixture.active_qualification,
+                fixture.cells,
+                fixture.probes,
+                ledger=fixture.qualification_ledger,
+            )
+        assert fixture.qualification_ledger.state == "terminal"
+        assert not fixture.controller.owns_qualification_coordinate_execution_receipt(
+            fixture.cells[0].execution_receipt,
+        )
+        monkeypatch.setattr(
+            fixture.controller,
+            "_mint_qualification_semantic_attestation",
+            original_mint,
+        )
+        attestation = fixture.controller.qualification_semantic_attestation(
+            fixture.active_qualification,
+        )
+        assert attestation.semantic_result == "passed"
+    finally:
+        fixture.close()
+
+
 def test_durable_failed_event_recovers_interrupted_cleanup(tmp_path, monkeypatch):
     helpers = pytest.importorskip("test_minecraft_k12_authority_e2e")
     fixture = helpers._build_qualification(
@@ -438,6 +827,124 @@ def test_durable_failed_event_recovers_interrupted_cleanup(tmp_path, monkeypatch
         assert not fixture.controller.owns_qualification_coordinate_execution_receipt(
             fixture.cells[0].execution_receipt,
         )
+    finally:
+        fixture.close()
+
+
+def test_failed_recovery_requires_parent_recorded_event_digest(tmp_path, monkeypatch):
+    helpers = pytest.importorskip("test_minecraft_k12_authority_e2e")
+    fixture = helpers._build_qualification(
+        tmp_path, "missing-failed-recovery-event-digest", publish=False,
+        failed_coordinate="P3",
+    )
+    try:
+        def fail_cleanup(*_args, **_kwargs):
+            raise ProvenanceError("authority_replay")
+
+        monkeypatch.setattr(
+            fixture.controller,
+            "_discard_qualification_execution_scope",
+            fail_cleanup,
+        )
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            publish_live_qualification_terminals(
+                fixture.active_qualification,
+                fixture.cells,
+                fixture.probes,
+                ledger=fixture.qualification_ledger,
+            )
+        monkeypatch.undo()
+        session = fixture.controller._ParentExecutionAuthority__qualification_semantic_sessions[
+            fixture.active_qualification.identity
+        ]
+        session["terminal_event_digest"] = None
+        with pytest.raises(ProvenanceError, match="final_prerequisite_mismatch"):
+            fixture.controller.recover_qualification_semantics(
+                fixture.active_qualification,
+            )
+        assert session["state"] == "failed"
+        assert fixture.controller.owns_qualification_coordinate_execution_receipt(
+            fixture.cells[0].execution_receipt,
+        )
+    finally:
+        fixture.close()
+
+
+def test_failed_recovery_requires_exact_durable_payload(tmp_path, monkeypatch):
+    helpers = pytest.importorskip("test_minecraft_k12_authority_e2e")
+    fixture = helpers._build_qualification(
+        tmp_path, "malformed-failed-recovery-payload", publish=False,
+        failed_coordinate="P3",
+    )
+    try:
+        def fail_cleanup(*_args, **_kwargs):
+            raise ProvenanceError("authority_replay")
+
+        monkeypatch.setattr(
+            fixture.controller,
+            "_discard_qualification_execution_scope",
+            fail_cleanup,
+        )
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            publish_live_qualification_terminals(
+                fixture.active_qualification,
+                fixture.cells,
+                fixture.probes,
+                ledger=fixture.qualification_ledger,
+            )
+        monkeypatch.undo()
+        payload = _thaw(fixture.qualification_ledger.events[-1].payload)
+        payload["failure_reason"] = "forged-failure"
+        _replace_last_ledger_payload(
+            fixture.qualification_ledger, monkeypatch, payload,
+        )
+        with pytest.raises(ProvenanceError, match="final_prerequisite_mismatch"):
+            fixture.controller.recover_qualification_semantics(
+                fixture.active_qualification,
+            )
+        session = fixture.controller._ParentExecutionAuthority__qualification_semantic_sessions[
+            fixture.active_qualification.identity
+        ]
+        assert session["state"] == "failed"
+        assert fixture.controller.owns_qualification_coordinate_execution_receipt(
+            fixture.cells[0].execution_receipt,
+        )
+    finally:
+        fixture.close()
+
+
+def test_failed_recovery_rejects_tampered_activation_binding(tmp_path, monkeypatch):
+    helpers = pytest.importorskip("test_minecraft_k12_authority_e2e")
+    fixture = helpers._build_qualification(
+        tmp_path, "tampered-failed-recovery-binding", publish=False,
+        failed_coordinate="P3",
+    )
+    try:
+        def fail_cleanup(*_args, **_kwargs):
+            raise ProvenanceError("authority_replay")
+
+        monkeypatch.setattr(
+            fixture.controller,
+            "_discard_qualification_execution_scope",
+            fail_cleanup,
+        )
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            publish_live_qualification_terminals(
+                fixture.active_qualification,
+                fixture.cells,
+                fixture.probes,
+                ledger=fixture.qualification_ledger,
+            )
+        monkeypatch.undo()
+        object.__setattr__(
+            fixture.active_qualification,
+            "activation_digest",
+            "sha256:" + "f" * 64,
+        )
+        with pytest.raises(ProvenanceError, match="final_prerequisite_mismatch"):
+            fixture.controller.recover_qualification_semantics(
+                fixture.active_qualification,
+            )
     finally:
         fixture.close()
 

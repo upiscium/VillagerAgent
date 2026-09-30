@@ -12,6 +12,7 @@ separate: runtime chains use ``runtime_verified`` and deterministic chains use
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 import hashlib
 import hmac
 import math
@@ -87,6 +88,43 @@ _MISSING_TREE_ENTRY = object()
 
 _LEDGER_ROOT_ARTIFACT = "minecraft-k12-live-execution-ledger-root/1"
 
+
+def _trusted_k12_source_root(source_root: str | Path | None) -> Path:
+    from .k12_runtime_profile import ROOT
+
+    try:
+        return (ROOT if source_root is None else Path(source_root)).resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ProvenanceError("source_closure_incomplete") from exc
+
+
+def _trusted_k12_source_policy(source_root: str | Path | None = None) -> Any:
+    """Load the authenticated source policy for one exact checkout root."""
+
+    from .k12_runtime_profile import (
+        load_k12_live_source_policy,
+    )
+
+    root = _trusted_k12_source_root(source_root)
+    return load_k12_live_source_policy(source_root=root)
+
+
+def _trusted_k12_profile_and_source_policy(
+        source_root: str | Path | None = None,
+) -> tuple[Any, Any]:
+    """Load the authenticated K12 roots for one exact checkout root."""
+
+    from .k12_runtime_profile import load_k12_live_runtime_profile
+
+    root = _trusted_k12_source_root(source_root)
+    return (
+        load_k12_live_runtime_profile(
+            root / "benchmarks/minecraft/k12_live_runtime_profile_v2.json",
+            source_root=root,
+        ),
+        _trusted_k12_source_policy(root),
+    )
+
 SOURCE_SEMANTIC_CLASSES = frozenset({
     "python", "config", "contract", "documentation", "dependency", "javascript",
 })
@@ -135,6 +173,7 @@ MISMATCH_CLASSIFICATION = MappingProxyType({
     "authority_origin_mismatch": MismatchClass.PRELAUNCH_STOP,
     "parent_controller_required": MismatchClass.PRELAUNCH_STOP,
     "ledger_corrupt": MismatchClass.PRELAUNCH_STOP,
+    "ledger_durability_unknown": MismatchClass.PRELAUNCH_STOP,
     "final_prerequisite_mismatch": MismatchClass.PRELAUNCH_STOP,
     "fresh_root_violation": MismatchClass.PRELAUNCH_STOP,
     "authority_replay": MismatchClass.PRELAUNCH_STOP,
@@ -246,11 +285,13 @@ class SourceClosure:
     _collector_marker: object = field(repr=False, compare=False)
     _origin: str = field(repr=False, compare=False)
     _collector_owner: Any = field(repr=False, compare=False)
+    _collector_root: Path = field(repr=False, compare=False)
 
     def __init__(self, policy_identity: str, policy_digest: str,
-                  records: Sequence[SourceRecord], token: object = None,
-                  marker: object = None, origin: str = RUNTIME_VERIFIED_ORIGIN,
-                  owner: Any = None, head_commit: str = "", head_tree: str = "") -> None:
+                   records: Sequence[SourceRecord], token: object = None,
+                   marker: object = None, origin: str = RUNTIME_VERIFIED_ORIGIN,
+                   owner: Any = None, head_commit: str = "", head_tree: str = "",
+                   root: str | Path | None = None) -> None:
         if token is not _SOURCE_CLOSURE_TOKEN or marker is None or owner is None:
             raise TypeError("source closures are parent-collected")
         _require_identity(policy_identity, "source_closure_incomplete")
@@ -292,6 +333,11 @@ class SourceClosure:
         object.__setattr__(self, "_collector_marker", marker)
         object.__setattr__(self, "_origin", normalized_origin)
         object.__setattr__(self, "_collector_owner", owner)
+        try:
+            collector_root = Path(root).resolve(strict=True)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise ProvenanceError("source_closure_incomplete") from exc
+        object.__setattr__(self, "_collector_root", collector_root)
 
     @property
     def origin(self) -> str:
@@ -321,6 +367,83 @@ class SourceClosure:
                 "head_tree": self.head_tree,
                 "records": [item.canonical() for item in self.records],
                 "aggregate_sha256": self.aggregate_sha256}
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceSeal:
+    """Private immutable bytes captured at a first-consume boundary."""
+
+    aggregate_sha256: str
+    head_commit: str
+    head_tree: str
+    records: tuple[SourceRecord, ...]
+    blobs: tuple[bytes, ...]
+    source: SourceClosure = field(repr=False, compare=False)
+    checkout: CheckoutObservation = field(repr=False, compare=False)
+    revision_authorization: ExternalRevisionAuthorization = field(
+        repr=False, compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        _require_sha256(self.aggregate_sha256, "source_content_mismatch")
+        if (len(self.records) != len(self.blobs)
+                or any(type(blob) is not bytes for blob in self.blobs)):
+            raise ProvenanceError("source_content_mismatch")
+        if (
+            not isinstance(self.source, SourceClosure)
+            or not isinstance(self.checkout, CheckoutObservation)
+            or not isinstance(self.revision_authorization, ExternalRevisionAuthorization)
+        ):
+            raise ProvenanceError("source_content_mismatch")
+        if any(
+            raw_sha256(blob) != record.sha256
+            or git_blob_oid(blob) != record.git_blob_oid
+            for record, blob in zip(self.records, self.blobs)
+        ):
+            raise ProvenanceError("source_content_mismatch")
+        if raw_sha256(canonical_bytes({
+            "head_commit": self.head_commit,
+            "head_tree": self.head_tree,
+            "records": [record.canonical() for record in self.records],
+        })) != self.aggregate_sha256:
+            raise ProvenanceError("source_content_mismatch")
+
+    def revalidate(self, owner: Any) -> None:
+        """Prove that the authenticated source root still contains the seal.
+
+        The captured blobs remain the execution snapshot.  The live checkout is
+        checked again immediately before activation so a mutable worktree cannot
+        silently replace the bytes between first consume and launch.
+        """
+        current = _revalidate_parent_source_closure(
+            self.source,
+            checkout=self.checkout,
+            revision_authorization=self.revision_authorization,
+            owner=owner,
+        )
+        if (
+            current.aggregate_sha256 != self.aggregate_sha256
+            or current.head_commit != self.head_commit
+            or current.head_tree != self.head_tree
+            or current.records != self.records
+            or current.blobs != self.blobs
+        ):
+            raise ProvenanceError("source_content_mismatch")
+
+    def snapshot(self) -> Mapping[str, bytes]:
+        """Return the immutable bytes that an active runner must execute."""
+        return MappingProxyType({
+            record.path: blob for record, blob in zip(self.records, self.blobs)
+        })
+
+
+def _freeze_source_snapshot(value: Mapping[str, bytes]) -> Mapping[str, bytes]:
+    if not isinstance(value, Mapping) or not value or any(
+        type(path) is not str or type(blob) is not bytes
+        for path, blob in value.items()
+    ):
+        raise ProvenanceError("source_content_mismatch")
+    return MappingProxyType(dict(value))
 
 
 def source_closure_from_observations(
@@ -622,28 +745,28 @@ def _open_trusted_source_root(root: str | Path) -> int:
         raise ProvenanceError("source_closure_incomplete") from exc
     try:
         absolute = Path(os.path.abspath(os.fspath(supplied)))
-        current = Path(absolute.anchor)
-        for component in absolute.parts[1:]:
-            current /= component
-            if current.is_symlink():
-                raise ProvenanceError("source_closure_incomplete")
+        parts = absolute.parts
+        if not parts or not absolute.anchor:
+            raise ProvenanceError("source_closure_incomplete")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        current = os.open(absolute.anchor, flags)
+        try:
+            for component in parts[1:]:
+                child = os.open(component, flags, dir_fd=current)
+                os.close(current)
+                current = child
+            metadata = os.fstat(current)
+        except BaseException:
+            os.close(current)
+            raise
     except ProvenanceError:
         raise
     except (OSError, ValueError) as exc:
         raise ProvenanceError("source_closure_incomplete") from exc
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-    fd: int | None = None
-    try:
-        fd = os.open(os.fspath(supplied), flags)
-        metadata = os.fstat(fd)
-    except (OSError, ValueError) as exc:
-        if fd is not None:
-            os.close(fd)
-        raise ProvenanceError("source_closure_incomplete") from exc
     if not stat.S_ISDIR(metadata.st_mode):
-        os.close(fd)
+        os.close(current)
         raise ProvenanceError("source_closure_incomplete")
-    return fd
+    return current
 
 
 def _open_source_path(root_fd: int, path: str) -> int:
@@ -857,7 +980,8 @@ def _collect_source_closure(*, policy: Any, root: str | Path,
                             expected_tree: Any, injected_only: bool,
                             marker: object, origin: str, owner: Any,
                             revision_authorization: ExternalRevisionAuthorization | None = None,
-                            head_commit: str = "", head_tree: str = "") -> SourceClosure:
+                            head_commit: str = "", head_tree: str = "",
+                            _seal_sink: list[bytes] | None = None) -> SourceClosure:
     from .k12_runtime_profile import K12SourcePolicy
 
     if not isinstance(policy, K12SourcePolicy):
@@ -910,11 +1034,13 @@ def _collect_source_closure(*, policy: Any, root: str | Path,
                 git_mode = tree_mode
             records.append(SourceRecord(path, git_mode, observed_blob, observed_sha256,
                                         entry.semantic_class))
+            if _seal_sink is not None:
+                _seal_sink.append(data)
     finally:
         os.close(root_fd)
     return SourceClosure(policy.identity, policy.digest, tuple(records),
-                         _SOURCE_CLOSURE_TOKEN, marker, origin, owner,
-                         head_commit, head_tree)
+                          _SOURCE_CLOSURE_TOKEN, marker, origin, owner,
+                          head_commit, head_tree, root)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1358,6 +1484,13 @@ class K12RetainedTargetLease:
             raise ProvenanceError("target_lock_loss")
         return self._evidence
 
+    def commit_guard(self) -> Any:
+        """Hold the target lock while a parent commits a receipt transition."""
+        guard = getattr(self.lock, "lifecycle_guard", None)
+        if not callable(guard):
+            raise ProvenanceError("target_lock_loss")
+        return guard()
+
 
 def retained_target_binding(lease: K12RetainedTargetLease) -> Mapping[str, Any]:
     """Return the exact target-lock fields authenticated by a retained lease.
@@ -1526,10 +1659,23 @@ class QualificationPreflight:
     target_lease: K12RetainedTargetLease
 
     def validate(self, *, now: int) -> None:
-        from .k12_runtime_profile import K12RuntimeProfile, K12SourcePolicy
+        from .k12_runtime_profile import (
+            K12RuntimeProfile,
+            K12SourcePolicy,
+            K12RuntimeProfileError,
+        )
         from .k12_execution_capsule import ExecutionCapsule
 
         _require_sha256(self.reservation_id, "authority_replay")
+        if not isinstance(self.run_authorization, K12QualificationRunAuthorization):
+            raise TypeError("typed qualification run authorization required")
+        if not isinstance(self.source, SourceClosure):
+            raise ProvenanceError("source_closure_incomplete")
+        if (
+            not self.source.owned_by(self.run_authorization.owner)
+            or self.source.origin != self.run_authorization.owner.origin
+        ):
+            raise ProvenanceError("source_closure_incomplete")
         _require_sha256(self.ledger_root_digest, "authority_replay")
         if not isinstance(
             self.external_revision_authorization, ExternalRevisionAuthorization
@@ -1543,8 +1689,6 @@ class QualificationPreflight:
             raise ProvenanceError("authority_replay")
         if self.ledger_identity != "minecraft-k12-live-execution-ledger/1":
             raise ProvenanceError("authority_replay")
-        if not isinstance(self.source, SourceClosure):
-            raise ProvenanceError("source_closure_incomplete")
         self.checkout.validate(self.external_revision_authorization)
         if self.source.runtime_admissible and (
             self.source.head_commit != self.checkout.head_commit
@@ -1560,6 +1704,41 @@ class QualificationPreflight:
                 or self.profile_identity != self.authenticated_profile.profile_id
                 or self.profile_digest != self.authenticated_profile.profile_digest):
             raise ProvenanceError("profile_mismatch")
+        try:
+            expected_profile, expected_source_policy = (
+                _trusted_k12_profile_and_source_policy(self.source._collector_root)
+            )
+        except (K12RuntimeProfileError, OSError, TypeError, ValueError) as exc:
+            raise ProvenanceError("profile_mismatch") from exc
+        if self.authenticated_profile.values != expected_profile.values:
+            raise ProvenanceError("profile_mismatch")
+        if self.authenticated_source_policy != expected_source_policy:
+            raise ProvenanceError("source_closure_incomplete")
+        try:
+            expected_tree = (
+                _authenticated_git_tree(
+                    self.source._collector_root, self.checkout, expected_source_policy,
+                )
+                if self.source.runtime_admissible else None
+            )
+            refreshed_source = _collect_source_closure(
+                policy=expected_source_policy,
+                root=self.source._collector_root,
+                expected_tree=expected_tree,
+                injected_only=not self.source.runtime_admissible,
+                marker=self.source._collector_marker,
+                origin=self.source.origin,
+                owner=self.run_authorization.owner,
+                revision_authorization=self.external_revision_authorization,
+                head_commit=self.source.head_commit,
+                head_tree=self.source.head_tree,
+            )
+        except ProvenanceError:
+            raise
+        except (OSError, TypeError, ValueError) as exc:
+            raise ProvenanceError("source_content_mismatch") from exc
+        if refreshed_source.canonical() != self.source.canonical():
+            raise ProvenanceError("source_content_mismatch")
         _require_sha256(self.profile_digest, "profile_mismatch")
         _require_sha256(self.schedule_digest, "contract_mismatch")
         if (not self.contracts
@@ -1628,8 +1807,6 @@ class QualificationPreflight:
                     self.target, self.target_lease, self.reservation_id
                 )):
             raise ProvenanceError("target_lock_loss")
-        if not isinstance(self.run_authorization, K12QualificationRunAuthorization):
-            raise TypeError("typed qualification run authorization required")
         if (self.run_authorization.reservation_id != self.reservation_id
                 or self.run_authorization.profile_digest != self.profile_digest
                 or self.run_authorization.external_revision_authorization
@@ -2716,12 +2893,18 @@ class ActiveQualificationAuthority:
     authority: QualificationExecutionAuthority
     activation_digest: str
     binding: AuthorityBinding
+    sealed_source: Mapping[str, bytes] = field(repr=False, compare=False)
+    target_lease: K12RetainedTargetLease = field(repr=False, compare=False)
     ownership_token: object = field(repr=False, compare=False)
 
     def __init__(self, authority: QualificationExecutionAuthority, activation_digest: str,
-                 ownership_token: object, token: object = None) -> None:
+                 ownership_token: object, token: object = None,
+                 sealed_source: Mapping[str, bytes] | None = None,
+                 target_lease: K12RetainedTargetLease | None = None) -> None:
         if token is not _ACTIVE_TOKEN or ownership_token is None or not isinstance(authority, QualificationExecutionAuthority):
             raise TypeError("active qualification authority is parent-minted")
+        if not isinstance(target_lease, K12RetainedTargetLease):
+            raise TypeError("active qualification target lease is required")
         _require_canonical_digest(activation_digest, "authority_replay")
         binding = AuthorityBinding(QUALIFICATION_AUTHORITY, "live_qualification", authority.identity,
                                    "live_qualification", _BINDING_TOKEN, ownership_token,
@@ -2730,6 +2913,8 @@ class ActiveQualificationAuthority:
         object.__setattr__(self, "authority", authority)
         object.__setattr__(self, "activation_digest", activation_digest)
         object.__setattr__(self, "binding", binding)
+        object.__setattr__(self, "sealed_source", _freeze_source_snapshot(sealed_source or {}))
+        object.__setattr__(self, "target_lease", target_lease)
         object.__setattr__(self, "ownership_token", ownership_token)
 
     @property
@@ -2753,7 +2938,25 @@ class ActiveQualificationAuthority:
         return self.authority.owner
 
     def current_at(self, now: int | None = None) -> bool:
-        return self.authority.current_at(now)
+        owner = self.owner
+        owns_active = getattr(owner, "owns_active_handle", None)
+        if not callable(owns_active) or owns_active(self) is not True:
+            return False
+        try:
+            # Qualification target ownership is required through active
+            # execution.  Once its passed terminal receipt is durable, the
+            # target lease may be intentionally handed off to final minting.
+            terminal_guard = getattr(owner, "_terminalization_guard", None)
+            parent_guard = terminal_guard() if callable(terminal_guard) else nullcontext()
+            with parent_guard:
+                if self.authority.lifecycle != "terminal":
+                    if not self.target_lease.owned_by(owner):
+                        return False
+                    with self.target_lease.commit_guard():
+                        self.target_lease.revalidate()
+                return self.authority.current_at(now)
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError, ProvenanceError):
+            return False
 
     @property
     def origin(self) -> str:
@@ -2792,12 +2995,18 @@ class ActiveFinalAuthority:
     authority: FinalExecutionAuthority
     activation_digest: str
     binding: AuthorityBinding
+    sealed_source: Mapping[str, bytes] = field(repr=False, compare=False)
+    target_lease: K12RetainedTargetLease = field(repr=False, compare=False)
     ownership_token: object = field(repr=False, compare=False)
 
     def __init__(self, authority: FinalExecutionAuthority, activation_digest: str,
-                 ownership_token: object, token: object = None) -> None:
+                 ownership_token: object, token: object = None,
+                 sealed_source: Mapping[str, bytes] | None = None,
+                 target_lease: K12RetainedTargetLease | None = None) -> None:
         if token is not _ACTIVE_TOKEN or ownership_token is None or not isinstance(authority, FinalExecutionAuthority):
             raise TypeError("active final authority is parent-minted")
+        if not isinstance(target_lease, K12RetainedTargetLease):
+            raise TypeError("active final target lease is required")
         _require_canonical_digest(activation_digest, "authority_replay")
         binding = AuthorityBinding(FINAL_AUTHORITY, "live_final", authority.identity, "live_final",
                                    _BINDING_TOKEN, ownership_token, lifecycle="active",
@@ -2806,6 +3015,8 @@ class ActiveFinalAuthority:
         object.__setattr__(self, "authority", authority)
         object.__setattr__(self, "activation_digest", activation_digest)
         object.__setattr__(self, "binding", binding)
+        object.__setattr__(self, "sealed_source", _freeze_source_snapshot(sealed_source or {}))
+        object.__setattr__(self, "target_lease", target_lease)
         object.__setattr__(self, "ownership_token", ownership_token)
 
     @property
@@ -2829,7 +3040,21 @@ class ActiveFinalAuthority:
         return self.authority.owner
 
     def current_at(self, now: int | None = None) -> bool:
-        return self.authority.current_at(now)
+        owner = self.owner
+        owns_active = getattr(owner, "owns_active_handle", None)
+        if not callable(owns_active) or owns_active(self) is not True:
+            return False
+        try:
+            terminal_guard = getattr(owner, "_terminalization_guard", None)
+            parent_guard = terminal_guard() if callable(terminal_guard) else nullcontext()
+            with parent_guard:
+                if not self.target_lease.owned_by(owner):
+                    return False
+                with self.target_lease.commit_guard():
+                    self.target_lease.revalidate()
+                return self.authority.current_at(now)
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError, ProvenanceError):
+            return False
 
     @property
     def origin(self) -> str:
@@ -2896,9 +3121,16 @@ def durable_ledger_root_digest(ledger: Any) -> str:
             root = Path(root)
         except (TypeError, ValueError) as exc:
             raise ProvenanceError("authority_replay") from exc
+    try:
+        root = root.resolve(strict=True)
+        metadata = root.stat()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ProvenanceError("authority_replay") from exc
     return raw_sha256(canonical_bytes({
         "artifact": _LEDGER_ROOT_ARTIFACT,
-        "root": str(root.resolve(strict=True)),
+        "root": str(root),
+        "root_device": metadata.st_dev,
+        "root_inode": metadata.st_ino,
     }))
 
 
@@ -2909,24 +3141,10 @@ def durable_ledger_snapshot(ledger: Any) -> Mapping[str, Any]:
     if not isinstance(ledger, DurableLedger):
         raise TypeError("typed durable ledger required")
     try:
-        if not ledger.verify_chain():
-            raise ProvenanceError("ledger_corrupt")
-        root = ledger.root.resolve(strict=True)
-        snapshot = {
-            "identity": ledger.identity,
-            "root": str(root),
-            "root_digest": durable_ledger_root_digest(ledger),
-            "namespace": ledger.namespace,
-            "reservation_id": ledger.reservation_id,
-            "output_root_identity": ledger.output_root_identity,
-            "nonce": ledger.nonce,
-            "state": ledger.state,
-            "head_digest": ledger.head_digest,
-            "reservation_record_digest": ledger.events[0].digest,
-        }
+        snapshot = ledger.snapshot()
     except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
         raise ProvenanceError("ledger_corrupt") from exc
-    return MappingProxyType(snapshot)
+    return snapshot
 
 
 def authority_owns_profile(authority: Any, binding: AuthorityBinding, *,
@@ -2934,6 +3152,16 @@ def authority_owns_profile(authority: Any, binding: AuthorityBinding, *,
     """Bind a downstream capability to an active parent authority/profile."""
     if not isinstance(binding, AuthorityBinding) or profile_id != PROFILE_V2:
         return False
+    if isinstance(authority, (ActiveQualificationAuthority, ActiveFinalAuthority)):
+        owner = getattr(authority, "owner", None)
+        owns_active = getattr(owner, "owns_active_authority", None)
+        if not callable(owns_active):
+            return False
+        try:
+            if owns_active(authority) is not True:
+                return False
+        except (AttributeError, TypeError, ValueError, ProvenanceError):
+            return False
     execution = authority.authority if isinstance(authority, (ActiveQualificationAuthority,
                                                                ActiveFinalAuthority)) else authority
     owner = getattr(execution, "owner", None)
@@ -2975,11 +3203,26 @@ def refresh_pull_request_observation(authority: Any, observation: PullRequestObs
 
 
 def _ledger_is(ledger: Any, *, namespace: str, state: str, reservation: str | None = None) -> bool:
-    return (getattr(ledger, "identity", None) == "minecraft-k12-live-execution-ledger/1"
+    try:
+        snapshot_method = getattr(ledger, "snapshot", None)
+        if callable(snapshot_method):
+            snapshot = snapshot_method()
+            return (
+                snapshot.get("identity") == "minecraft-k12-live-execution-ledger/1"
+                and snapshot.get("namespace") == namespace
+                and snapshot.get("state") == state
+                and (reservation is None or snapshot.get("reservation_id") == reservation)
+            )
+        return (
+            getattr(ledger, "identity", None)
+            == "minecraft-k12-live-execution-ledger/1"
             and getattr(ledger, "namespace", None) == namespace
             and getattr(ledger, "state", None) == state
             and (reservation is None or getattr(ledger, "reservation_id", None) == reservation)
-            and getattr(ledger, "verify_chain", lambda: False)())
+            and getattr(ledger, "verify_chain", lambda: False)()
+        )
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError, ProvenanceError):
+        return False
 
 
 class _TrustedClock:
@@ -3065,8 +3308,11 @@ class ParentExecutionAuthority:
         self.__active_qualification_authorities: dict[
             int, ActiveQualificationAuthority
         ] = {}
+        self.__active_final_authorities: dict[int, ActiveFinalAuthority] = {}
         self.__leases: dict[int, K12RetainedTargetLease] = {}
+        self.__authority_leases: dict[int, K12RetainedTargetLease] = {}
         self.__source_closures: dict[int, SourceClosure] = {}
+        self.__source_seals: dict[str, _SourceSeal] = {}
         self.__capsules: dict[int, Any] = {}
         self.__external_revisions: dict[int, ExternalRevisionAuthorization] = {}
         self.__external_revision_identities: set[str] = set()
@@ -3148,11 +3394,132 @@ class ParentExecutionAuthority:
             state=getattr(ledger, "state", None),
         )
 
+    def _find_owned_ledger(
+            self, *, namespace: str, reservation_id: str,
+            output_root_identity: str | None = None,
+            root_digest: str | None = None,
+    ) -> Any | None:
+        """Find the parent-owned durable resource bound to a cleanup receipt."""
+        matches: list[tuple[Any, Mapping[str, Any]]] = []
+        for ledger in tuple(self.__ledgers.values()):
+            try:
+                snapshot = durable_ledger_snapshot(ledger)
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                continue
+            if (
+                snapshot.get("namespace") == namespace
+                and snapshot.get("reservation_id") == reservation_id
+                and (
+                    output_root_identity is None
+                    or snapshot.get("output_root_identity") == output_root_identity
+                )
+                and (root_digest is None or snapshot.get("root_digest") == root_digest)
+            ):
+                matches.append((ledger, snapshot))
+        if not matches:
+            return None
+        roots = {snapshot.get("root_digest") for _, snapshot in matches}
+        if len(roots) != 1:
+            # Multiple distinct durable roots with the same logical reservation
+            # cannot be safely disambiguated from a failed caller argument.
+            return None
+        return matches[0][0]
+
+    def _qualification_cleanup_ledger(
+            self, preflight: Any, supplied_ledger: Any,
+    ) -> Any | None:
+        try:
+            if self.owns_ledger(supplied_ledger):
+                supplied_snapshot = durable_ledger_snapshot(supplied_ledger)
+                if (
+                    supplied_snapshot.get("namespace") == "qualification"
+                    and supplied_snapshot.get("reservation_id")
+                        == preflight.reservation_id
+                    and supplied_snapshot.get("output_root_identity")
+                        == preflight.output.root_identity
+                    and supplied_snapshot.get("root_digest")
+                        == preflight.ledger_root_digest
+                ):
+                    return supplied_ledger
+            run_authorization = preflight.run_authorization
+            if (
+                not isinstance(run_authorization, K12QualificationRunAuthorization)
+                or run_authorization.owner is not self
+                or run_authorization.ownership_token is not self.__ownership_token
+            ):
+                return None
+            bound = run_authorization.body["ledger"]
+            if not isinstance(bound, Mapping):
+                return None
+            if (
+                bound.get("reservation_id") != preflight.reservation_id
+                or bound.get("root_digest") != preflight.ledger_root_digest
+            ):
+                return None
+            return self._find_owned_ledger(
+                namespace="qualification",
+                reservation_id=bound["reservation_id"],
+                output_root_identity=bound["output_root_identity"],
+                root_digest=bound["root_digest"],
+            )
+        except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return None
+
+    def _final_cleanup_ledger(self, target_lease: Any, supplied_ledger: Any) -> Any | None:
+        try:
+            if self.owns_ledger(supplied_ledger):
+                supplied_snapshot = durable_ledger_snapshot(supplied_ledger)
+                if (
+                    supplied_snapshot.get("namespace") == "final"
+                    and supplied_snapshot.get("reservation_id")
+                        == target_lease.reservation_id
+                ):
+                    return supplied_ledger
+            candidate = self._find_owned_ledger(
+                namespace="final",
+                reservation_id=target_lease.reservation_id,
+            )
+            if candidate is None or not self.owns_ledger(candidate):
+                return None
+            return candidate
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            return None
+
+    def _find_owned_target_lease(
+            self, target: Any, reservation_id: str,
+    ) -> K12RetainedTargetLease | None:
+        """Resolve cleanup to the exact parent lease matching the target receipt."""
+        matches: list[K12RetainedTargetLease] = []
+        for lease in tuple(self.__leases.values()):
+            if (
+                isinstance(lease, K12RetainedTargetLease)
+                and lease.owned_by(self)
+                and lease.reservation_id == reservation_id
+            ):
+                try:
+                    if _target_matches_retained_lease(target, lease, reservation_id):
+                        matches.append(lease)
+                except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                    continue
+        if len(matches) != 1:
+            return None
+        return matches[0]
+
     def owns_authority(self, authority: Any) -> bool:
         return self.__authorities.get(id(authority)) is authority
 
     def owns_target_lease(self, lease: Any) -> bool:
         return self.__leases.get(id(lease)) is lease
+
+    def _require_authority_target_lease(self, authority: Any) -> K12RetainedTargetLease:
+        lease = self.__authority_leases.get(id(authority))
+        if (
+            not isinstance(lease, K12RetainedTargetLease)
+            or not lease.owned_by(self)
+            or lease.reservation_id != getattr(authority, "reservation_id", None)
+        ):
+            raise ProvenanceError("target_lock_loss")
+        return lease
 
     def owns_source_closure(self, closure: Any) -> bool:
         return self.__source_closures.get(id(closure)) is closure
@@ -3164,7 +3531,7 @@ class ParentExecutionAuthority:
         return self.__external_revisions.get(id(authorization)) is authorization
 
     def _owns_active_qualification_authority(
-        self, authority: Any,
+            self, authority: Any,
     ) -> bool:
         """Authenticate the exact active handle and its live activation."""
 
@@ -3192,6 +3559,60 @@ class ParentExecutionAuthority:
             and binding.reservation == authority.reservation_id
             and binding.activation == activation
             and binding.origin == authority.origin
+        )
+
+    def _owns_active_final_authority(self, authority: Any) -> bool:
+        """Authenticate the exact active final handle and its live activation."""
+
+        if (
+            not isinstance(authority, ActiveFinalAuthority)
+            or self.__active_final_authorities.get(id(authority)) is not authority
+            or authority.owner is not self
+            or authority.ownership_token is not self.__ownership_token
+            or not self.owns_authority(authority.authority)
+        ):
+            return False
+        try:
+            lifecycle, activation = self.lifecycle_for(authority.authority.ledger)
+        except (AttributeError, ProvenanceError):
+            return False
+        binding = authority.binding
+        return (
+            lifecycle == "active"
+            and activation == authority.activation_digest
+            and binding._ownership_token is self.__ownership_token
+            and binding.authority_type == FINAL_AUTHORITY
+            and binding.namespace == LIVE_FINAL_NAMESPACE
+            and binding.authority_digest == authority.identity
+            and binding.lifecycle == "active"
+            and binding.reservation == authority.reservation_id
+            and binding.activation == activation
+            and binding.origin == authority.origin
+        )
+
+    def owns_active_authority(self, authority: Any) -> bool:
+        """Authenticate an exact parent-minted active qualification/final handle."""
+
+        if isinstance(authority, ActiveQualificationAuthority):
+            return self._owns_active_qualification_authority(authority)
+        if isinstance(authority, ActiveFinalAuthority):
+            return self._owns_active_final_authority(authority)
+        return False
+
+    def owns_active_handle(self, authority: Any) -> bool:
+        """Authenticate an exact active handle across its terminal transition."""
+
+        if isinstance(authority, ActiveQualificationAuthority):
+            registry = self.__active_qualification_authorities
+        elif isinstance(authority, ActiveFinalAuthority):
+            registry = self.__active_final_authorities
+        else:
+            return False
+        return (
+            registry.get(id(authority)) is authority
+            and authority.owner is self
+            and authority.ownership_token is self.__ownership_token
+            and self.owns_authority(authority.authority)
         )
 
     def _boundary_artifact_for_stage(
@@ -3296,6 +3717,8 @@ class ParentExecutionAuthority:
                 raise ProvenanceError("authority_replay")
             session: dict[str, Any] = {
                 "authority": authority,
+                "activation_digest": authority.activation_digest,
+                "authority_binding": authority.binding.canonical(),
                 "cells": {},
                 "probes": {},
                 "receipts": {},
@@ -4411,40 +4834,41 @@ class ParentExecutionAuthority:
         if not isinstance(authority, ActiveQualificationAuthority) or authority.owner is not self:
             raise TypeError("active parent qualification authority required")
         with self.__qualification_semantic_lock:
-            session = self.__qualification_semantic_sessions.get(authority.identity)
-            observed = self.__qualification_coordinate_observations.get(id(receipt))
-            if (session is None or session["state"] != "collecting"
-                    or observed is None or observed[0] is not receipt
-                    or receipt._owner is not self
-                    or receipt.authority_digest != authority.identity
-                    or receipt.activation_digest != authority.activation_digest
-                    or receipt.reservation_id != authority.reservation_id
-                    or session["receipts"].get((receipt.domain, receipt.coordinate)) is not receipt
-                    or receipt.identity != session["receipt_identities"].get(
-                        (receipt.domain, receipt.coordinate)
-                    )
-                    or _coordinate_terminal_receipt_identity(receipt)
-                        != receipt.identity
-                    or not authority.current_at()
-                    or authority.lifecycle != "active"):
-                raise ProvenanceError("authority_replay")
-            record = observed[1]
-            if receipt.domain == LIVE_QUALIFICATION_NAMESPACE:
-                target = session["cells"]
-            elif receipt.domain == QUALIFICATION_PROBE_NAMESPACE:
-                target = session["probes"]
-            else:
-                raise ProvenanceError("final_prerequisite_mismatch")
-            if (receipt.coordinate in target
-                    or receipt.record_identity != record.identity):
-                raise ProvenanceError("final_prerequisite_mismatch")
-            self._commit_registered_qualification_terminal(
-                session,
-                receipt.domain,
-                receipt.coordinate,
-                receipt,
-                record,
-            )
+            with self.__qualification_terminalization_lock:
+                session = self.__qualification_semantic_sessions.get(authority.identity)
+                observed = self.__qualification_coordinate_observations.get(id(receipt))
+                if (session is None or session["state"] != "collecting"
+                        or observed is None or observed[0] is not receipt
+                        or receipt._owner is not self
+                        or receipt.authority_digest != authority.identity
+                        or receipt.activation_digest != authority.activation_digest
+                        or receipt.reservation_id != authority.reservation_id
+                        or session["receipts"].get((receipt.domain, receipt.coordinate)) is not receipt
+                        or receipt.identity != session["receipt_identities"].get(
+                            (receipt.domain, receipt.coordinate)
+                        )
+                        or _coordinate_terminal_receipt_identity(receipt)
+                            != receipt.identity
+                        or not authority.current_at()
+                        or authority.lifecycle != "active"):
+                    raise ProvenanceError("authority_replay")
+                record = observed[1]
+                if receipt.domain == LIVE_QUALIFICATION_NAMESPACE:
+                    target = session["cells"]
+                elif receipt.domain == QUALIFICATION_PROBE_NAMESPACE:
+                    target = session["probes"]
+                else:
+                    raise ProvenanceError("final_prerequisite_mismatch")
+                if (receipt.coordinate in target
+                        or receipt.record_identity != record.identity):
+                    raise ProvenanceError("final_prerequisite_mismatch")
+                self._commit_registered_qualification_terminal(
+                    session,
+                    receipt.domain,
+                    receipt.coordinate,
+                    receipt,
+                    record,
+                )
 
     def _prepare_qualification_semantics(
         self, authority: ActiveQualificationAuthority,
@@ -4517,6 +4941,78 @@ class ParentExecutionAuthority:
                 census.cells, census.probes, terminal_receipts,
             ),
         }
+
+    def _qualification_failed_payload(
+        self,
+        authority: ActiveQualificationAuthority,
+        census: QualificationCensus,
+        verdict: QualificationVerdict,
+    ) -> dict[str, Any]:
+        """Return the one exact durable payload for a failed qualification."""
+
+        return {
+            "result": "failed",
+            "phase": "qualification",
+            "authority_digest": authority.identity,
+            "qualification_aggregate_digest": verdict.aggregate_digest,
+            "probe_aggregate_digest": verdict.probe_digest,
+            "evidence_origin": (
+                RUNTIME_VERIFIED_ORIGIN
+                if authority.origin == RUNTIME_VERIFIED_ORIGIN
+                else INJECTED_FAKE_ORIGIN
+            ),
+            "terminal_verified": False,
+            "failure_reason": (
+                "qualification_probe_failed"
+                if any(probe.passed is not True for probe in census.probes)
+                else "qualification_cell_failed"
+            ),
+        }
+
+    def qualification_failed_payload(
+        self,
+        authority: ActiveQualificationAuthority,
+        census: QualificationCensus,
+        verdict: QualificationVerdict,
+    ) -> dict[str, Any]:
+        """Return the parent-staged exact failed-terminal payload."""
+
+        with self.__qualification_semantic_lock:
+            session = self.__qualification_semantic_sessions.get(
+                getattr(authority, "identity", "")
+            )
+            binding_is_staged = False
+            if isinstance(authority, ActiveQualificationAuthority) and session is not None:
+                try:
+                    binding_is_staged = (
+                        self.owns_active_handle(authority)
+                        and authority.activation_digest
+                            == session.get("activation_digest")
+                        and authority.binding.canonical()
+                            == session.get("authority_binding")
+                    )
+                except (AttributeError, TypeError, ValueError, ProvenanceError):
+                    binding_is_staged = False
+            if (
+                not isinstance(authority, ActiveQualificationAuthority)
+                or session is None
+                or session.get("authority") is not authority
+                or session.get("state") != "failed"
+                or session.get("census") is not census
+                or session.get("verdict") is not verdict
+                or type(census) is not QualificationCensus
+                or type(verdict) is not QualificationVerdict
+                or verdict.passed is not False
+                or not binding_is_staged
+            ):
+                raise ProvenanceError("final_prerequisite_mismatch")
+            recomputed = verify_qualification_projection(census)
+            if (
+                recomputed.passed is not False
+                or recomputed.identity != verdict.identity
+            ):
+                raise ProvenanceError("final_prerequisite_mismatch")
+            return self._qualification_failed_payload(authority, census, verdict)
 
     def _ledger_terminal_qualification_batch(
         self,
@@ -4931,23 +5427,58 @@ class ParentExecutionAuthority:
                     if authority.origin == RUNTIME_VERIFIED_ORIGIN
                     else INJECTED_FAKE_ORIGIN
                 )
+                staged_census = session.get("census")
+                staged_verdict = session.get("verdict")
+                binding_is_staged = False
+                try:
+                    binding_is_staged = (
+                        self.owns_active_handle(authority)
+                        and authority.activation_digest
+                            == session.get("activation_digest")
+                        and authority.binding.canonical()
+                            == session.get("authority_binding")
+                    )
+                except (AttributeError, TypeError, ValueError, ProvenanceError):
+                    binding_is_staged = False
+                try:
+                    recomputed_verdict = (
+                        verify_qualification_projection(staged_census)
+                        if isinstance(staged_census, QualificationCensus)
+                        else None
+                    )
+                except (TypeError, ValueError, KeyError, AttributeError, IndexError):
+                    recomputed_verdict = None
+                staged_verdict_is_exact = (
+                    isinstance(staged_census, QualificationCensus)
+                    and isinstance(staged_verdict, QualificationVerdict)
+                    and staged_verdict.passed is False
+                    and isinstance(recomputed_verdict, QualificationVerdict)
+                    and recomputed_verdict.passed is False
+                    and recomputed_verdict.identity == staged_verdict.identity
+                )
+                expected_payload = (
+                    self._qualification_failed_payload(
+                        authority, staged_census, staged_verdict,
+                    )
+                    if staged_verdict_is_exact
+                    else None
+                )
                 if (
                     payload.get("authority_digest") != authority.identity
                     or payload.get("phase") != "qualification"
                     or payload.get("evidence_origin") != expected_origin
                     or payload.get("terminal_verified") is not False
-                    or not isinstance(payload.get("failure_reason"), str)
-                    or not isinstance(session.get("census"), QualificationCensus)
-                    or not isinstance(session.get("verdict"), QualificationVerdict)
+                    or not binding_is_staged
+                    or not staged_verdict_is_exact
                     or payload.get("qualification_aggregate_digest")
-                        != session["census"].aggregate_digest
+                        != staged_census.aggregate_digest
                     or payload.get("probe_aggregate_digest")
-                        != session["verdict"].probe_digest
+                        != staged_verdict.probe_digest
                     or not isinstance(event_digest, str)
-                    or (
-                        stored_event_digest is not None
-                        and stored_event_digest != event_digest
-                    )
+                    or not isinstance(stored_event_digest, str)
+                    or stored_event_digest != event_digest
+                    or expected_payload is None
+                    or payload != expected_payload
                 ):
                     raise ProvenanceError("final_prerequisite_mismatch")
                 session["terminal_event_digest"] = event_digest
@@ -5030,6 +5561,105 @@ class ParentExecutionAuthority:
             )
             if type(receipt_entries) is not list or len(receipt_entries) != len(expected_keys):
                 raise ProvenanceError("final_prerequisite_mismatch")
+
+            expected_origin = (
+                RUNTIME_VERIFIED_ORIGIN
+                if authority.origin == RUNTIME_VERIFIED_ORIGIN
+                else INJECTED_FAKE_ORIGIN
+            )
+
+            def parent_execution_for_snapshot(
+                domain: str,
+                coordinate: str,
+                record: NormalizedCell | NormalizedProbe,
+                values: Mapping[str, Any],
+                terminal_identity: str,
+            ) -> None:
+                """Anchor durable receipt fields to the live parent registries."""
+
+                key = (domain, coordinate)
+
+                def committed_terminal_for_snapshot() -> None:
+                    """Use a parent-committed terminal only after execution cleanup."""
+
+                    terminal_receipts = session.get("receipts")
+                    target = session.get(
+                        "cells" if domain == LIVE_QUALIFICATION_NAMESPACE else "probes"
+                    )
+                    committed = (
+                        None
+                        if not isinstance(terminal_receipts, Mapping)
+                        else terminal_receipts.get(key)
+                    )
+                    committed_record = (
+                        None if not isinstance(target, Mapping) else target.get(coordinate)
+                    )
+                    if (
+                        type(committed) is not QualificationCoordinateTerminalReceipt
+                        or not self.owns_qualification_terminal_receipt(committed)
+                        or committed.identity != terminal_identity
+                        or committed.authority_digest != values["authority_digest"]
+                        or committed.activation_digest != values["activation_digest"]
+                        or committed.reservation_id != values["reservation_id"]
+                        or committed.domain != values["domain"]
+                        or committed.coordinate != values["coordinate"]
+                        or committed.capability_identity != values["capability_identity"]
+                        or committed.record_identity != values["record_identity"]
+                        or committed.execution_receipt_identity
+                            != values["execution_receipt_identity"]
+                        or committed.execution_stage_receipt_identities
+                            != values["execution_stage_receipt_identities"]
+                        or _coordinate_terminal_receipt_identity(committed)
+                            != committed.identity
+                        or type(committed_record) is not (
+                            NormalizedCell
+                            if domain == LIVE_QUALIFICATION_NAMESPACE else NormalizedProbe
+                        )
+                        or committed_record.identity != record.identity
+                        or _normalized_record_snapshot(committed_record)
+                            != _normalized_record_snapshot(record)
+                    ):
+                        raise ProvenanceError("authority_replay")
+
+                matches = tuple(
+                    owned
+                    for owned in self.__qualification_coordinate_execution_receipts.values()
+                    if (
+                        type(owned) is tuple
+                        and len(owned) == 3
+                        and type(owned[0]) is QualificationCoordinateExecutionReceipt
+                        and owned[0].identity == values["execution_receipt_identity"]
+                    )
+                )
+                if not matches:
+                    committed_terminal_for_snapshot()
+                    return
+                if len(matches) != 1:
+                    raise ProvenanceError("authority_replay")
+                execution_receipt, parent_record, _stages = matches[0]
+                try:
+                    intact = self._qualification_execution_receipt_is_intact(
+                        execution_receipt,
+                    )
+                except (AttributeError, TypeError, ValueError, KeyError, IndexError):
+                    intact = False
+                if (
+                    not intact
+                    or parent_record is None
+                    or type(parent_record) is not (
+                        NormalizedCell
+                        if domain == LIVE_QUALIFICATION_NAMESPACE else NormalizedProbe
+                    )
+                    or parent_record.identity != record.identity
+                    or _normalized_record_snapshot(parent_record)
+                        != _normalized_record_snapshot(record)
+                    or values["capability_identity"]
+                        != execution_receipt.coordinate_capability_identity
+                    or values["execution_stage_receipt_identities"]
+                        != execution_receipt.stage_receipt_identities
+                ):
+                    raise ProvenanceError("authority_replay")
+
             restored_receipts: list[QualificationCoordinateTerminalReceipt] = []
             for (domain, coordinate), entry in zip(expected_keys, receipt_entries):
                 if not isinstance(entry, Mapping):
@@ -5038,6 +5668,11 @@ class ParentExecutionAuthority:
                     stage_identities = tuple(entry.get("execution_stages", ()))
                 except (TypeError, ValueError) as exc:
                     raise ProvenanceError("final_prerequisite_mismatch") from exc
+                record = (
+                    cells[QUALIFICATION_SCHEDULE.index(coordinate)]
+                    if domain == LIVE_QUALIFICATION_NAMESPACE
+                    else probes[QUALIFICATION_PROBES.index(coordinate)]
+                )
                 receipt = object.__new__(QualificationCoordinateTerminalReceipt)
                 values = {
                     "authority_digest": entry.get("authority"),
@@ -5066,9 +5701,7 @@ class ParentExecutionAuthority:
                         for item in values["execution_stage_receipt_identities"]
                     )
                     or values["record_identity"]
-                        != (cells[QUALIFICATION_SCHEDULE.index(coordinate)].identity
-                            if domain == LIVE_QUALIFICATION_NAMESPACE
-                            else probes[QUALIFICATION_PROBES.index(coordinate)].identity)
+                        != record.identity
                 ):
                     raise ProvenanceError("final_prerequisite_mismatch")
                 try:
@@ -5089,6 +5722,9 @@ class ParentExecutionAuthority:
                 )
                 if receipt.identity != entry.get("identity"):
                     raise ProvenanceError("final_prerequisite_mismatch")
+                parent_execution_for_snapshot(
+                    domain, coordinate, record, values, receipt.identity,
+                )
                 restored_receipts.append(receipt)
 
             try:
@@ -5118,37 +5754,111 @@ class ParentExecutionAuthority:
             )
             if _deep_thaw(payload) != _deep_thaw(expected_payload):
                 raise ProvenanceError("final_prerequisite_mismatch")
-            interrupted_terminal_ids = {
-                id(receipt) for receipt in session.get("receipts", {}).values()
+            try:
+                complete = QualificationCensus(
+                    cells,
+                    probes,
+                    NormalizedTerminal(
+                        authority=authority.identity,
+                        activation=authority.activation_digest,
+                        profile_digest=authority.profile_digest,
+                        evidence_origin=expected_origin,
+                        ledger_digest=ledger.head_digest,
+                        aggregate_digest=census.aggregate_digest,
+                        probe_digest=census.probe_digest,
+                        result="passed",
+                        state="terminal",
+                        verified=True,
+                    ),
+                )
+                terminal_verdict = verify_qualification(complete)
+            except (TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+                raise ProvenanceError("final_prerequisite_mismatch") from exc
+            if terminal_verdict.passed is not True:
+                raise ProvenanceError("final_prerequisite_mismatch")
+
+            def copy_session_value(value: Any) -> Any:
+                if isinstance(value, dict):
+                    return dict(value)
+                if isinstance(value, set):
+                    return set(value)
+                return value
+
+            before_session = {
+                key: copy_session_value(value) for key, value in session.items()
             }
-            session["cells"] = {
-                value.cell_id: value for value in cells
-            }
-            session["probes"] = {
-                value.probe: value for value in probes
-            }
-            session["receipts"] = {
-                key: receipt for key, receipt in zip(expected_keys, restored_receipts)
-            }
-            session["receipt_identities"] = {
-                key: receipt.identity
-                for key, receipt in zip(expected_keys, restored_receipts)
-            }
-            session["record_identities"] = {
-                (LIVE_QUALIFICATION_NAMESPACE, record.cell_id): record.identity
-                for record in cells
-            } | {
-                (QUALIFICATION_PROBE_NAMESPACE, record.probe): record.identity
-                for record in probes
-            }
-            for receipt_id in interrupted_terminal_ids:
-                self.__qualification_coordinate_observations.pop(receipt_id, None)
-            session["terminal_event_digest"] = event_digest
-            session.update({"census": census, "verdict": verdict, "state": "terminal"})
-            self._discard_qualification_execution_scope(
-                authority, session, clear_registry=False,
+            before_registries = (
+                dict(self.__qualification_coordinate_capabilities),
+                dict(self.__qualification_coordinate_observations),
+                dict(self.__qualification_execution_stage_receipts),
+                dict(self.__qualification_execution_stage_identities),
+                dict(self.__qualification_execution_stage_observations),
+                dict(self.__qualification_execution_boundary_artifacts),
+                dict(self.__qualification_execution_boundary_identities),
+                dict(self.__qualification_coordinate_execution_receipts),
+                dict(self.__qualification_coordinate_execution_identities),
+                dict(self.__qualification_semantic_attestations),
             )
-            return self._mint_qualification_semantic_attestation(authority)
+
+            def restore_recovery_state() -> None:
+                for target, before in zip(
+                    (
+                        self.__qualification_coordinate_capabilities,
+                        self.__qualification_coordinate_observations,
+                        self.__qualification_execution_stage_receipts,
+                        self.__qualification_execution_stage_identities,
+                        self.__qualification_execution_stage_observations,
+                        self.__qualification_execution_boundary_artifacts,
+                        self.__qualification_execution_boundary_identities,
+                        self.__qualification_coordinate_execution_receipts,
+                        self.__qualification_coordinate_execution_identities,
+                        self.__qualification_semantic_attestations,
+                    ),
+                    before_registries,
+                ):
+                    target.clear()
+                    target.update(before)
+                session.clear()
+                session.update({
+                    key: copy_session_value(value)
+                    for key, value in before_session.items()
+                })
+
+            try:
+                interrupted_terminal_ids = {
+                    id(receipt) for receipt in session.get("receipts", {}).values()
+                }
+                session["cells"] = {
+                    value.cell_id: value for value in cells
+                }
+                session["probes"] = {
+                    value.probe: value for value in probes
+                }
+                session["receipts"] = {
+                    key: receipt for key, receipt in zip(expected_keys, restored_receipts)
+                }
+                session["receipt_identities"] = {
+                    key: receipt.identity
+                    for key, receipt in zip(expected_keys, restored_receipts)
+                }
+                session["record_identities"] = {
+                    (LIVE_QUALIFICATION_NAMESPACE, record.cell_id): record.identity
+                    for record in cells
+                } | {
+                    (QUALIFICATION_PROBE_NAMESPACE, record.probe): record.identity
+                    for record in probes
+                }
+                for receipt_id in interrupted_terminal_ids:
+                    self.__qualification_coordinate_observations.pop(receipt_id, None)
+                session["terminal_event_digest"] = event_digest
+                session.update({"census": census, "verdict": verdict, "state": "terminal"})
+                self._discard_qualification_execution_scope(
+                    authority, session, clear_registry=False,
+                )
+                return self._mint_qualification_semantic_attestation(authority)
+            except BaseException:
+                restore_recovery_state()
+                raise
 
     def _qualification_execution_receipt_is_intact(
         self, receipt: Any,
@@ -5156,11 +5866,54 @@ class ParentExecutionAuthority:
         owned = self.__qualification_coordinate_execution_receipts.get(id(receipt))
         if (
             type(receipt) is not QualificationCoordinateExecutionReceipt
+            or type(owned) is not tuple
+            or len(owned) != 3
             or owned is None
             or owned[0] is not receipt
             or self.__qualification_coordinate_execution_identities.get(id(receipt))
                 != receipt.identity
             or receipt._owner is not self
+        ):
+            return False
+        session = self.__qualification_semantic_sessions.get(receipt.authority_digest)
+        authority = None if session is None else session.get("authority")
+        if (
+            not isinstance(authority, ActiveQualificationAuthority)
+            or authority.owner is not self
+            or authority.identity != receipt.authority_digest
+            or receipt.activation_digest != authority.activation_digest
+            or receipt.reservation_id != authority.reservation_id
+            or receipt.profile_digest != authority.profile_digest
+            or receipt.evidence_origin != (
+                RUNTIME_VERIFIED_ORIGIN
+                if authority.origin == RUNTIME_VERIFIED_ORIGIN
+                else INJECTED_FAKE_ORIGIN
+            )
+            or receipt.domain not in {
+                LIVE_QUALIFICATION_NAMESPACE, QUALIFICATION_PROBE_NAMESPACE,
+            }
+        ):
+            return False
+        capabilities = session.get("capabilities")
+        capability = (
+            None
+            if not isinstance(capabilities, Mapping)
+            else capabilities.get((receipt.domain, receipt.coordinate))
+        )
+        if (
+            type(capability) is not _QualificationCoordinateCapability
+            or self.__qualification_coordinate_capabilities.get(id(capability))
+                is not capability
+            or session.get("capability_identities", {}).get(
+                (receipt.domain, receipt.coordinate)
+            ) != capability.identity
+            or _coordinate_capability_identity(capability) != capability.identity
+            or capability.authority_digest != authority.identity
+            or capability.activation_digest != authority.activation_digest
+            or capability.reservation_id != authority.reservation_id
+            or capability.domain != receipt.domain
+            or capability.coordinate != receipt.coordinate
+            or receipt.coordinate_capability_identity != capability.identity
             or _coordinate_execution_receipt_identity(receipt) != receipt.identity
         ):
             return False
@@ -5169,8 +5922,16 @@ class ParentExecutionAuthority:
             if receipt.domain == LIVE_QUALIFICATION_NAMESPACE
             else _QUALIFICATION_PROBE_STAGE_NAMES
         )
+        stages = owned[2]
+        if (
+            type(stages) is not tuple
+            or len(stages) != len(expected_names)
+            or tuple(stage.identity for stage in stages)
+                != receipt.stage_receipt_identities
+        ):
+            return False
         predecessor = ""
-        for stage, expected_name in zip(owned[2], expected_names):
+        for stage, expected_name in zip(stages, expected_names):
             observation = self.__qualification_execution_stage_observations.get(id(stage))
             boundary = self._boundary_artifact_for_stage(stage)
             if (
@@ -5181,8 +5942,33 @@ class ParentExecutionAuthority:
                 or stage._owner is not self
                 or stage.stage != expected_name
                 or stage.predecessor_identity != predecessor
+                or stage.authority_digest != authority.identity
+                or stage.activation_digest != authority.activation_digest
+                or stage.reservation_id != authority.reservation_id
+                or stage.profile_digest != authority.profile_digest
+                or stage.evidence_origin != receipt.evidence_origin
+                or stage.campaign_id != receipt.campaign_id
+                or stage.domain != receipt.domain
+                or stage.coordinate != receipt.coordinate
+                or stage.coordinate_capability_identity != capability.identity
                 or observation is None
                 or boundary is None
+                or type(boundary) is not _QUALIFICATION_BOUNDARY_ARTIFACT_TYPES[expected_name]
+                or boundary._owner is not self
+                or self.__qualification_execution_boundary_artifacts.get(id(boundary))
+                    is not boundary
+                or self.__qualification_execution_boundary_identities.get(id(boundary))
+                    != boundary.identity
+                or _qualification_boundary_artifact_identity(boundary) != boundary.identity
+                or boundary.authority_digest != authority.identity
+                or boundary.activation_digest != authority.activation_digest
+                or boundary.reservation_id != authority.reservation_id
+                or boundary.profile_digest != authority.profile_digest
+                or boundary.evidence_origin != receipt.evidence_origin
+                or boundary.campaign_id != receipt.campaign_id
+                or boundary.domain != receipt.domain
+                or boundary.coordinate != receipt.coordinate
+                or boundary.stage != expected_name
                 or boundary.values != observation
                 or stage.observation_digest != canonical_sha256({
                     "stage": stage.stage, "observation": dict(observation),
@@ -5192,16 +5978,27 @@ class ParentExecutionAuthority:
                 return False
             predecessor = stage.identity
         record = owned[1]
-        session = self.__qualification_semantic_sessions.get(receipt.authority_digest)
         expected_record_identity = None if session is None else session.get(
             "record_identities", {}
         ).get((receipt.domain, receipt.coordinate))
+        expected_record_type = (
+            NormalizedCell
+            if receipt.domain == LIVE_QUALIFICATION_NAMESPACE else NormalizedProbe
+        )
         try:
             record_identity = replace(record).identity
         except (TypeError, ValueError, AttributeError):
             return False
         return (
-            len(owned[2]) == len(expected_names)
+            type(record) is expected_record_type
+            and getattr(record, "cell_id", getattr(record, "probe", None))
+                == receipt.coordinate
+            and record.authority == authority.identity
+            and record.activation == authority.activation_digest
+            and record.profile_digest == authority.profile_digest
+            and record.evidence_origin == receipt.evidence_origin
+            and record.campaign_id == receipt.campaign_id
+            and record.execution_provenance == receipt.domain
             and expected_record_identity == record.identity == record_identity
         )
 
@@ -5375,12 +6172,33 @@ class ParentExecutionAuthority:
         return _ledger_binding_state(ledger)
 
     def authority_is_current(self, authority: Any, *, now: int | None = None) -> bool:
+        active_handle = None
         if isinstance(authority, (ActiveQualificationAuthority, ActiveFinalAuthority)):
+            active_handle = authority
+            if not self.owns_active_handle(authority):
+                return False
             authority = authority.authority
         now = self._resolve_time(now)
         if not self.owns_authority(authority):
             return False
-        lifecycle = self.lifecycle_for(authority.ledger)[0]
+        try:
+            lifecycle = self.lifecycle_for(authority.ledger)[0]
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError, ProvenanceError):
+            return False
+        if active_handle is not None and (
+            isinstance(active_handle, ActiveFinalAuthority)
+            or lifecycle != "terminal"
+        ):
+            lease = self.__authority_leases.get(id(authority))
+            if lease is not getattr(active_handle, "target_lease", None):
+                return False
+            if not isinstance(lease, K12RetainedTargetLease) or not lease.owned_by(self):
+                return False
+            try:
+                with lease.commit_guard():
+                    lease.revalidate()
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError, ProvenanceError):
+                return False
         if lifecycle == "terminal":
             events = getattr(authority.ledger, "events", ())
             terminal = dict(events[-1].payload) if events else {}
@@ -5477,8 +6295,206 @@ class ParentExecutionAuthority:
     def ledger_activate(self, ledger: Any, authority_digest: str) -> str:
         return self._ledger_controller(ledger).activate(authority_digest)
 
+    def _terminalization_guard(self) -> Any:
+        """Return the parent lock shared by consume and quarantine paths."""
+        return self.__qualification_terminalization_lock
+
+    def _semantic_guard(self) -> Any:
+        """Return the qualification semantic lock for ordered readers."""
+        return self.__qualification_semantic_lock
+
+    def _commit_qualification_first_consume(
+            self, authority: QualificationExecutionAuthority,
+            ledger: Any, observation_digest: str,
+            target_lease: K12RetainedTargetLease, *, activate: bool,
+            source: SourceClosure | None = None,
+            checkout: CheckoutObservation | None = None,
+            revision_authorization: ExternalRevisionAuthorization | None = None,
+    ) -> Any:
+        """Serialize qualification consume, freshness, and activation."""
+        lease_guard = target_lease.commit_guard() if isinstance(
+            target_lease, K12RetainedTargetLease
+        ) else nullcontext()
+        with self.__qualification_terminalization_lock, lease_guard:
+            bound_ledger = getattr(authority, "ledger", None)
+            expected_head: str | None = None
+            seal: _SourceSeal | None = None
+            try:
+                if bound_ledger is None or ledger is not bound_ledger:
+                    raise ProvenanceError("authority_replay")
+                expected_head = bound_ledger.head_digest
+                if not authority.current_at(self.current_time()):
+                    raise ProvenanceError("authority_replay")
+                if (
+                    not isinstance(target_lease, K12RetainedTargetLease)
+                    or not target_lease.owned_by(self)
+                    or target_lease.reservation_id != bound_ledger.reservation_id
+                ):
+                    raise ProvenanceError("target_lock_loss")
+                target_lease.revalidate()
+                if source is not None:
+                    seal = _revalidate_parent_source_closure(
+                        source,
+                        checkout=checkout,
+                        revision_authorization=revision_authorization,
+                        owner=self,
+                    )
+                    if (
+                            seal.aggregate_sha256
+                            != authority.body["source_closure"]["aggregate_sha256"]
+                            or seal.aggregate_sha256
+                            != authority.body["execution_capsule"]["source_aggregate"]
+                    ):
+                        raise ProvenanceError("source_content_mismatch")
+            except BaseException as exc:
+                mapped = exc if isinstance(exc, ProvenanceError) else ProvenanceError(
+                    getattr(exc, "reason", "source_content_mismatch")
+                )
+                _quarantine_first_consume_failure(
+                    self, bound_ledger, authority,
+                    mapped.reason,
+                    allowed_states=frozenset({"authority_minted"}),
+                    expected_head_digest=expected_head,
+                )
+                if mapped is not exc:
+                    raise mapped from exc
+                raise
+            try:
+                target_lease.revalidate()
+                if not authority.current_at(self.current_time()):
+                    raise ProvenanceError("authority_replay")
+                self.ledger_first_consume_verified(
+                    ledger, authority.identity, observation_digest,
+                )
+            except Exception as exc:
+                _quarantine_first_consume_failure(
+                    self, bound_ledger, authority,
+                    getattr(exc, "reason", "first_consume_mismatch"),
+                    allowed_states=frozenset({"authority_minted"}),
+                    expected_head_digest=expected_head,
+                )
+                raise
+            if seal is not None:
+                self.__source_seals[authority.identity] = seal
+            if not activate:
+                return ledger.head_digest
+            expected_head = bound_ledger.head_digest
+            try:
+                if not authority.current_at(self.current_time()):
+                    raise ProvenanceError("authority_replay")
+                return self.activate_qualification(authority, ledger=ledger)
+            except Exception as exc:
+                _quarantine_first_consume_failure(
+                    self, bound_ledger, authority,
+                    getattr(exc, "reason", "first_consume_mismatch"),
+                    allowed_states=frozenset({"first_consume_verified"}),
+                    expected_head_digest=expected_head,
+                )
+                raise
+
+    def _commit_final_first_consume(
+            self, authority: FinalExecutionAuthority,
+            ledger: Any, observation_digest: str,
+            target_lease: K12RetainedTargetLease,
+            *, source: SourceClosure | None = None,
+            checkout: CheckoutObservation | None = None,
+            revision_authorization: ExternalRevisionAuthorization | None = None,
+    ) -> ActiveFinalAuthority:
+        """Serialize final consume, freshness, and activation."""
+        lease_guard = target_lease.commit_guard() if isinstance(
+            target_lease, K12RetainedTargetLease
+        ) else nullcontext()
+        with self.__qualification_terminalization_lock, lease_guard:
+            bound_ledger = getattr(authority, "ledger", None)
+            expected_head: str | None = None
+            seal: _SourceSeal | None = None
+            try:
+                if bound_ledger is None or ledger is not bound_ledger:
+                    raise ProvenanceError("authority_replay")
+                expected_head = bound_ledger.head_digest
+                if not authority.current_at(self.current_time()):
+                    raise ProvenanceError("authority_replay")
+                if (
+                    not isinstance(target_lease, K12RetainedTargetLease)
+                    or not target_lease.owned_by(self)
+                    or target_lease.reservation_id != bound_ledger.reservation_id
+                ):
+                    raise ProvenanceError("target_lock_loss")
+                target_lease.revalidate()
+                if source is not None:
+                    seal = _revalidate_parent_source_closure(
+                        source,
+                        checkout=checkout,
+                        revision_authorization=revision_authorization,
+                        owner=self,
+                    )
+                    if (
+                            seal.aggregate_sha256
+                            != authority.body["source_closure"]["aggregate_sha256"]
+                            or seal.aggregate_sha256
+                            != authority.body["execution_capsule"]["source_aggregate"]
+                    ):
+                        raise ProvenanceError("source_content_mismatch")
+            except Exception as exc:
+                mapped = exc if isinstance(exc, ProvenanceError) else ProvenanceError(
+                    getattr(exc, "reason", "source_content_mismatch")
+                )
+                _quarantine_first_consume_failure(
+                    self, bound_ledger, authority,
+                    mapped.reason,
+                    allowed_states=frozenset({"authority_minted"}),
+                    expected_head_digest=expected_head,
+                )
+                if mapped is not exc:
+                    raise mapped from exc
+                raise
+            try:
+                target_lease.revalidate()
+                if not authority.current_at(self.current_time()):
+                    raise ProvenanceError("authority_replay")
+                self.ledger_first_consume_verified(
+                    ledger, authority.identity, observation_digest,
+                )
+            except Exception as exc:
+                _quarantine_first_consume_failure(
+                    self, bound_ledger, authority,
+                    getattr(exc, "reason", "first_consume_mismatch"),
+                    allowed_states=frozenset({"authority_minted"}),
+                    expected_head_digest=expected_head,
+                )
+                raise
+            if seal is not None:
+                self.__source_seals[authority.identity] = seal
+            expected_head = bound_ledger.head_digest
+            try:
+                if not authority.current_at(self.current_time()):
+                    raise ProvenanceError("authority_replay")
+                return self.activate_final(authority, ledger=ledger)
+            except Exception as exc:
+                _quarantine_first_consume_failure(
+                    self, bound_ledger, authority,
+                    getattr(exc, "reason", "first_consume_mismatch"),
+                    allowed_states=frozenset({"first_consume_verified"}),
+                    expected_head_digest=expected_head,
+                )
+                raise
+
     def ledger_terminal(self, ledger: Any, payload: Mapping[str, Any]) -> str:
-        terminal_payload = dict(payload)
+        """Append a parent-owned terminal receipt under the shared guard."""
+        # Qualification publication already holds the semantic lock before it
+        # enters terminalization.  Preserve that order here to avoid a
+        # semantic->terminal / terminal->semantic deadlock between publishers
+        # and recovery callers.
+        with self.__qualification_semantic_lock:
+            with self.__qualification_terminalization_lock:
+                return self._ledger_terminal_locked(ledger, payload)
+
+    def _ledger_terminal_locked(self, ledger: Any, payload: Mapping[str, Any]) -> str:
+        if not isinstance(payload, Mapping):
+            raise TypeError("mapping terminal payload required")
+        # Validate and append one detached recursive snapshot rather than a
+        # caller-owned nested mapping that can change between those steps.
+        terminal_payload = _deep_thaw(_deep_freeze(payload))
         if (getattr(ledger, "namespace", None) == "qualification"
                 and terminal_payload.get("result") == "passed"):
             authority_identity = terminal_payload.get("authority_digest")
@@ -5537,46 +6553,37 @@ class ParentExecutionAuthority:
                 authority = None if session is None else session.get("authority")
                 census = None if session is None else session.get("census")
                 verdict = None if session is None else session.get("verdict")
-                expected_origin = (
+                binding_is_staged = False
+                if isinstance(authority, ActiveQualificationAuthority):
+                    try:
+                        binding_is_staged = (
+                            self.owns_active_handle(authority)
+                            and authority.activation_digest
+                                == session.get("activation_digest")
+                            and authority.binding.canonical()
+                                == session.get("authority_binding")
+                        )
+                    except (AttributeError, TypeError, ValueError, ProvenanceError):
+                        binding_is_staged = False
+                expected_payload = (
                     None
-                    if authority is None
-                    else (
-                        RUNTIME_VERIFIED_ORIGIN
-                        if authority.origin == RUNTIME_VERIFIED_ORIGIN
-                        else INJECTED_FAKE_ORIGIN
+                    if (
+                        not isinstance(authority, ActiveQualificationAuthority)
+                        or type(census) is not QualificationCensus
+                        or type(verdict) is not QualificationVerdict
                     )
+                    else self.qualification_failed_payload(authority, census, verdict)
                 )
-                expected_reason = (
-                    None
-                    if census is None or verdict is None
-                    else (
-                        "qualification_probe_failed"
-                        if any(probe.passed is not True for probe in census.probes)
-                        else "qualification_cell_failed"
-                    )
-                )
-                expected_payload = {
-                    "result": "failed",
-                    "phase": "qualification",
-                    "authority_digest": terminal_payload.get("authority_digest"),
-                    "qualification_aggregate_digest": (
-                        None if verdict is None else verdict.aggregate_digest
-                    ),
-                    "probe_aggregate_digest": (
-                        None if verdict is None else verdict.probe_digest
-                    ),
-                    "evidence_origin": expected_origin,
-                    "terminal_verified": False,
-                    "failure_reason": expected_reason,
-                }
                 if (
                     session is None
-                    or authority is None
+                    or not isinstance(authority, ActiveQualificationAuthority)
                     or authority.authority.ledger is not ledger
                     or session.get("state") != "failed"
                     or type(census) is not QualificationCensus
                     or type(verdict) is not QualificationVerdict
                     or verdict.passed is not False
+                    or not binding_is_staged
+                    or expected_payload is None
                     or terminal_payload != expected_payload
                     or getattr(ledger, "state", None) != "active"
                 ):
@@ -5597,14 +6604,58 @@ class ParentExecutionAuthority:
         payload: Mapping[str, Any],
     ) -> str:
         """Linearize a qualification terminal event with authority freshness."""
-
+        target_lease = self._require_authority_target_lease(authority.authority)
+        if (
+            target_lease is not authority.target_lease
+            or not target_lease.owned_by(self)
+        ):
+            raise ProvenanceError("target_lock_loss")
         with self.__qualification_terminalization_lock:
-            if not authority.current_at() or authority.lifecycle != "active":
-                raise ProvenanceError("authority_replay")
-            return self._ledger_controller(ledger).terminal(dict(payload))
+            with target_lease.commit_guard():
+                # Retain the exact target lease from final freshness validation
+                # until the durable terminal event has been appended.
+                target_lease.revalidate()
+                if not authority.current_at() or authority.lifecycle != "active":
+                    raise ProvenanceError("authority_replay")
+                try:
+                    return self._ledger_controller(ledger).terminal(dict(payload))
+                except BaseException as exc:
+                    # Ledger append/head-anchor failures leave durable state
+                    # uncertain. Keep the Minecraft target quarantined even
+                    # when the ledger can no longer accept a cleanup event.
+                    try:
+                        target_quarantined = _quarantine_retained_target(
+                            target_lease,
+                            reason="qualification_terminal_append_failed",
+                            authority_identity=authority.identity,
+                            run_name=(
+                                f"k12-qualification-{authority.reservation_id[:24]}"
+                            ),
+                        )
+                    except BaseException:
+                        target_quarantined = False
+                    if not target_quarantined:
+                        raise ProvenanceError("quarantine_incomplete") from exc
+                    raise
 
-    def quarantine_ledger(self, ledger: Any, payload: Mapping[str, Any]) -> str:
-        return self._ledger_controller(ledger).quarantine(payload)
+    def quarantine_ledger(
+            self, ledger: Any, payload: Mapping[str, Any], *,
+            expected_state: str | None = None,
+            expected_head_digest: str | None = None,
+    ) -> str:
+        # Keep quarantine in the same parent-owned terminalization critical
+        # section as final launch/completion and terminal receipt publication.
+        # Otherwise a caller could revoke a ledger between a runner's final
+        # currentness check and its state transition.
+        with self.__qualification_terminalization_lock:
+            controller = self._ledger_controller(ledger)
+            if expected_state is None or expected_head_digest is None:
+                return controller.quarantine(payload)
+            return controller.quarantine_if_current(
+                payload,
+                expected_state=expected_state,
+                expected_head_digest=expected_head_digest,
+            )
 
     def attest_execution_capsule(self, **values: Any) -> Any:
         from .k12_execution_capsule import _CAPSULE_MINT_TOKEN, mint_capsule
@@ -5630,10 +6681,20 @@ class ParentExecutionAuthority:
         checkout's commit tree.  Injected-only collection may cover prospective
         files not present in Git; all record values still come from file FDs.
         """
+        from .k12_runtime_profile import K12RuntimeProfileError, K12SourcePolicy
+
+        if not isinstance(policy, K12SourcePolicy):
+            raise ProvenanceError("source_closure_incomplete")
         if root is None:
             root = trusted_root
         if root is None:
             raise TypeError("trusted source root is required")
+        try:
+            expected_source_policy = _trusted_k12_source_policy(root)
+        except (K12RuntimeProfileError, OSError, TypeError, ValueError) as exc:
+            raise ProvenanceError("source_closure_incomplete") from exc
+        if policy != expected_source_policy:
+            raise ProvenanceError("source_closure_incomplete")
         collection_origin = INJECTED_TEST_ORIGIN if injected_only else self.origin
         if injected_only:
             if checkout is not None:
@@ -6108,19 +7169,53 @@ class ParentExecutionAuthority:
         authority = QualificationExecutionAuthority(
             body, self.__ownership_token, ledger, _AUTHORITY_TOKEN, run_auth, self,
         )
+        self.__authority_leases[id(authority)] = preflight.target_lease
         self.ledger_authority_minted(ledger, authority.identity)
         self.__authorities[id(authority)] = authority
         self.__minted = True
         return authority
 
-    def _safe_quarantine(self, ledger: Any, reason: str) -> None:
-        try:
-            if self.owns_ledger(ledger) and ledger.state not in {"terminal", "quarantined"}:
-                self.quarantine_ledger(ledger, {"reason": reason})
-        except Exception:
-            # A failed quarantine is still a fail-closed mint failure.  Do not
-            # turn a caller-visible provenance error into an implementation leak.
-            pass
+    def _safe_quarantine(
+            self, ledger: Any, reason: str,
+            *, target_lease: K12RetainedTargetLease | None = None,
+            authority: Any = None,
+    ) -> bool:
+        """Quarantine a failed mint's ledger and its retained target together."""
+        ledger_quarantined = False
+        target_required = True
+        target_quarantined = False
+        authority_identity = getattr(authority, "identity", "unknown")
+        with self.__qualification_terminalization_lock:
+            ledger_owned = False
+            try:
+                ledger_owned = self.owns_ledger(ledger)
+                if ledger_owned:
+                    if ledger.state in {"terminal", "quarantined"}:
+                        ledger_quarantined = True
+                    else:
+                        self.quarantine_ledger(
+                            ledger,
+                            {"reason": reason, "authority": authority_identity},
+                        )
+                        ledger_quarantined = ledger.state == "quarantined"
+            except Exception:
+                ledger_quarantined = False
+
+            if (
+                ledger_owned
+                and isinstance(target_lease, K12RetainedTargetLease)
+                and target_lease.owned_by(self)
+                and target_lease.reservation_id == getattr(ledger, "reservation_id", None)
+            ):
+                target_required = True
+                target_quarantined = _quarantine_retained_target(
+                    target_lease,
+                    reason=reason,
+                    authority_identity=authority_identity,
+                    run_name=f"k12-{getattr(ledger, 'namespace', 'execution')}-{getattr(ledger, 'reservation_id', 'unknown')[:24]}",
+                )
+
+        return ledger_quarantined and (target_quarantined if target_required else True)
 
     def mint_qualification(self, preflight: QualificationPreflight, *, now: int | None = None,
                             ledger: Any,
@@ -6136,28 +7231,68 @@ class ParentExecutionAuthority:
                     run_authorization=run_authorization,
                 )
             except Exception as exc:
-                self._safe_quarantine(ledger, getattr(exc, "reason", "authority_replay"))
+                reason = getattr(exc, "reason", "authority_replay")
+                cleanup_ledger = self._qualification_cleanup_ledger(preflight, ledger)
+                cleanup_target_lease = self._find_owned_target_lease(
+                    getattr(preflight, "target", None),
+                    getattr(preflight, "reservation_id", ""),
+                )
+                if not self._safe_quarantine(
+                    cleanup_ledger,
+                    reason,
+                    target_lease=cleanup_target_lease,
+                    authority=None,
+                ):
+                    raise ProvenanceError("quarantine_incomplete") from exc
                 raise
 
     issue_qualification_authority = mint_qualification
     mint_qualification_authority = mint_qualification
 
+    def _require_source_seal(self, authority: Any) -> _SourceSeal:
+        seal = self.__source_seals.get(getattr(authority, "identity", ""))
+        if not isinstance(seal, _SourceSeal):
+            raise ProvenanceError("source_content_mismatch")
+        try:
+            seal.__post_init__()
+            seal.revalidate(self)
+        except (TypeError, ValueError, ProvenanceError) as exc:
+            raise ProvenanceError("source_content_mismatch") from exc
+        body = getattr(authority, "body", {})
+        if (
+            seal.aggregate_sha256
+            != body.get("source_closure", {}).get("aggregate_sha256")
+            or seal.aggregate_sha256
+            != body.get("execution_capsule", {}).get("source_aggregate")
+        ):
+            raise ProvenanceError("source_content_mismatch")
+        return seal
+
     def activate_qualification(self, authority: QualificationExecutionAuthority, *,
                                ledger: Any = None) -> ActiveQualificationAuthority:
-        if (not isinstance(authority, QualificationExecutionAuthority)
-                or not self.owns_authority(authority)):
+        if not isinstance(authority, QualificationExecutionAuthority):
             raise TypeError("parent-owned qualification authority required")
-        ledger = authority.ledger if ledger is None else ledger
-        if (not self.owns_ledger(ledger)
-                or not _ledger_is(ledger, namespace="qualification", state="first_consume_verified",
-                                  reservation=authority.body["reservation_id"])):
-            raise ProvenanceError("authority_replay")
-        activation = self.ledger_activate(ledger, authority.identity)
-        active = ActiveQualificationAuthority(
-            authority, activation, self.__ownership_token, _ACTIVE_TOKEN,
-        )
-        self.__active_qualification_authorities[id(active)] = active
-        return active
+        target_lease = self._require_authority_target_lease(authority)
+        with self.__qualification_terminalization_lock, target_lease.commit_guard():
+            if not self.owns_authority(authority):
+                raise TypeError("parent-owned qualification authority required")
+            target_lease.revalidate()
+            seal = self._require_source_seal(authority)
+            ledger = authority.ledger if ledger is None else ledger
+            if (not self.owns_ledger(ledger)
+                    or not _ledger_is(ledger, namespace="qualification", state="first_consume_verified",
+                                       reservation=authority.body["reservation_id"])):
+                raise ProvenanceError("authority_replay")
+            if not authority.current_at(self.current_time()):
+                raise ProvenanceError("authority_replay")
+            activation = self.ledger_activate(ledger, authority.identity)
+            active = ActiveQualificationAuthority(
+                authority, activation, self.__ownership_token, _ACTIVE_TOKEN,
+                sealed_source=seal.snapshot(),
+                target_lease=target_lease,
+            )
+            self.__active_qualification_authorities[id(active)] = active
+            return active
 
     def _mint_final_impl(
         self, prerequisites: FinalExecutionPrerequisites,
@@ -6355,6 +7490,7 @@ class ParentExecutionAuthority:
         authority = FinalExecutionAuthority(
             body, self.__ownership_token, final_ledger, _AUTHORITY_TOKEN, final_run, self,
         )
+        self.__authority_leases[id(authority)] = target_lease
         self.ledger_authority_minted(final_ledger, authority.identity)
         self.__authorities[id(authority)] = authority
         self.__final_minted = True
@@ -6380,7 +7516,19 @@ class ParentExecutionAuthority:
                     target_lease=target_lease,
                 )
             except Exception as exc:
-                self._safe_quarantine(final_ledger, getattr(exc, "reason", "authority_replay"))
+                reason = getattr(exc, "reason", "authority_replay")
+                cleanup_ledger = self._final_cleanup_ledger(target_lease, final_ledger)
+                cleanup_target_lease = self._find_owned_target_lease(
+                    target,
+                    getattr(final_ledger, "reservation_id", ""),
+                )
+                if not self._safe_quarantine(
+                    cleanup_ledger,
+                    reason,
+                    target_lease=cleanup_target_lease,
+                    authority=None,
+                ):
+                    raise ProvenanceError("quarantine_incomplete") from exc
                 raise
 
     issue_final_authority = mint_final
@@ -6388,18 +7536,29 @@ class ParentExecutionAuthority:
 
     def activate_final(self, authority: FinalExecutionAuthority, *,
                        ledger: Any = None) -> ActiveFinalAuthority:
-        if (not isinstance(authority, FinalExecutionAuthority)
-                or not self.owns_authority(authority)):
+        if not isinstance(authority, FinalExecutionAuthority):
             raise TypeError("parent-owned final authority required")
-        ledger = authority.ledger if ledger is None else ledger
-        if (not self.owns_ledger(ledger)
-                or not _ledger_is(ledger, namespace="final", state="first_consume_verified",
-                                  reservation=authority.body["reservation_id"])):
-            raise ProvenanceError("authority_replay")
-        activation = self.ledger_activate(ledger, authority.identity)
-        return ActiveFinalAuthority(
-            authority, activation, self.__ownership_token, _ACTIVE_TOKEN,
-        )
+        target_lease = self._require_authority_target_lease(authority)
+        with self.__qualification_terminalization_lock, target_lease.commit_guard():
+            if not self.owns_authority(authority):
+                raise TypeError("parent-owned final authority required")
+            target_lease.revalidate()
+            seal = self._require_source_seal(authority)
+            ledger = authority.ledger if ledger is None else ledger
+            if (not self.owns_ledger(ledger)
+                    or not _ledger_is(ledger, namespace="final", state="first_consume_verified",
+                                       reservation=authority.body["reservation_id"])):
+                raise ProvenanceError("authority_replay")
+            if not authority.current_at(self.current_time()):
+                raise ProvenanceError("authority_replay")
+            activation = self.ledger_activate(ledger, authority.identity)
+            active = ActiveFinalAuthority(
+                authority, activation, self.__ownership_token, _ACTIVE_TOKEN,
+                sealed_source=seal.snapshot(),
+                target_lease=target_lease,
+            )
+            self.__active_final_authorities[id(active)] = active
+            return active
 
 
 class InjectedTestController(ParentExecutionAuthority):
@@ -6454,10 +7613,168 @@ InjectedTestVerifier = InjectedTestController
 InjectedTestExecutionController = InjectedTestController
 
 
+def _quarantine_retained_target(
+        lease: K12RetainedTargetLease, *, reason: str,
+        authority_identity: str, run_name: str,
+) -> bool:
+    """Quarantine one parent-owned retained target under its lifecycle guard."""
+    try:
+        lock = lease.lock
+        if getattr(lock, "quarantined", False):
+            return _quarantined_retained_lock_is_intact(lock)
+        with lease.commit_guard():
+            # Do not write quarantine metadata through a retained descriptor
+            # after its pathname has been replaced or unlinked.  The FD may
+            # still be valid while the path is already acquirable by another
+            # owner; revalidation makes that loss an incomplete cleanup.
+            snapshot = lock.retained_lease_snapshot()
+            if getattr(snapshot, "quarantined", False) is True:
+                return _quarantined_retained_lock_is_intact(lock)
+            lease.revalidate()
+            if getattr(lock, "quarantined", False):
+                return _quarantined_retained_lock_is_intact(lock)
+            if not getattr(lock, "acquired", False):
+                return False
+            lock.quarantine(
+                run_name=run_name,
+                reasons=(reason,),
+                diagnostics={
+                    "authority": authority_identity,
+                    "reason": reason,
+                },
+            )
+            return _quarantined_retained_lock_is_intact(lock)
+    except Exception:
+        return False
+
+
+def _quarantined_retained_lock_is_intact(lock: Any) -> bool:
+    """Require durable quarantine and unchanged retained FD/path identity."""
+    try:
+        snapshot = lock.retained_lease_snapshot()
+        return bool(
+            snapshot.quarantined
+            and snapshot.metadata.get("status") == "quarantined"
+            and (snapshot.fd_dev, snapshot.fd_ino)
+                == (snapshot.path_dev, snapshot.path_ino)
+        )
+    except Exception:
+        return False
+
+
 def _replace_preflight(value: QualificationPreflight, **changes: Any) -> QualificationPreflight:
     values = {name: getattr(value, name) for name in value.__dataclass_fields__}
     values.update(changes)
     return QualificationPreflight(**values)
+
+
+def _quarantine_first_consume_failure(
+        owner: Any, ledger: Any, authority: Any, reason: str,
+        *, allowed_states: frozenset[str], expected_head_digest: str | None = None,
+) -> None:
+    """Quarantine only a ledger generation that this attempt still owns.
+
+    A losing concurrent first-consume attempt must not quarantine a ledger that
+    another parent call has already advanced or activated.
+    """
+    if not isinstance(owner, ParentExecutionAuthority):
+        return
+    bound_ledger = getattr(authority, "ledger", None)
+    if bound_ledger is None:
+        return
+    # Cleanup always follows the authority-bound ledger, never a mismatched
+    # handle supplied by the caller.  The mismatch is itself a failed consume
+    # and must not let the bound resources escape quarantine.
+    ledger = bound_ledger
+    with owner._terminalization_guard():
+        state = getattr(ledger, "state", None)
+        if state not in allowed_states and state != "quarantined":
+            return
+        if (
+            state in allowed_states
+            and expected_head_digest is not None
+            and getattr(ledger, "head_digest", None) != expected_head_digest
+        ):
+            return
+        target_lease = None
+        try:
+            target_lease = owner._require_authority_target_lease(authority)
+        except Exception:
+            # A missing registry entry is itself incomplete cleanup: the
+            # authority still carries a bound target capability, but the
+            # parent can no longer authenticate a safe quarantine operation.
+            target_lease = None
+        ledger_error: BaseException | None = None
+        if state in allowed_states:
+            try:
+                owner.quarantine_ledger(
+                    ledger, {"reason": reason, "authority": authority.identity},
+                    expected_state=next(iter(allowed_states)),
+                    expected_head_digest=expected_head_digest or ledger.head_digest,
+                )
+            except BaseException as exc:
+                # The state may have advanced between the check and the guarded
+                # append; the ledger controller reloads under its interprocess
+                # lock and rejects a stale quarantine transition. Still try to
+                # contain the target: ledger failure must not skip target
+                # quarantine.
+                ledger_error = exc
+        if target_lease is None:
+            raise ProvenanceError("quarantine_incomplete")
+        try:
+            target_quarantined = _quarantine_retained_target(
+                target_lease,
+                reason=reason,
+                authority_identity=authority.identity,
+                run_name=f"k12-{getattr(ledger, 'namespace', 'execution')}-{ledger.reservation_id[:24]}",
+            )
+        except BaseException:
+            target_quarantined = False
+        if ledger_error is not None:
+            raise ProvenanceError("quarantine_incomplete") from ledger_error
+        if not target_quarantined:
+            raise ProvenanceError("quarantine_incomplete")
+
+
+def _revalidate_parent_source_closure(
+        source: SourceClosure,
+        *,
+        checkout: CheckoutObservation,
+        revision_authorization: ExternalRevisionAuthorization,
+    owner: ParentExecutionAuthority,
+) -> _SourceSeal:
+    """Re-read the parent source root at each first-consume boundary."""
+    if (
+        not isinstance(source, SourceClosure)
+        or not source.owned_by(owner)
+        or source.origin not in {RUNTIME_VERIFIED_ORIGIN, INJECTED_TEST_ORIGIN}
+    ):
+        raise ProvenanceError("source_closure_incomplete")
+    policy = _trusted_k12_source_policy(source._collector_root)
+    expected_tree = (
+        _authenticated_git_tree(source._collector_root, checkout, policy)
+        if source.runtime_admissible else None
+    )
+    blobs: list[bytes] = []
+    refreshed = _collect_source_closure(
+        policy=policy,
+        root=source._collector_root,
+        expected_tree=expected_tree,
+        injected_only=not source.runtime_admissible,
+        marker=source._collector_marker,
+        origin=source.origin,
+        owner=owner,
+        revision_authorization=revision_authorization,
+        head_commit=source.head_commit,
+        head_tree=source.head_tree,
+        _seal_sink=blobs,
+    )
+    if refreshed.canonical() != source.canonical():
+        raise ProvenanceError("source_content_mismatch")
+    return _SourceSeal(
+        refreshed.aggregate_sha256, refreshed.head_commit, refreshed.head_tree,
+        refreshed.records, tuple(blobs), source, checkout, revision_authorization,
+    )
 
 
 def _verify_qualification_first_consume(
@@ -6470,10 +7787,14 @@ def _verify_qualification_first_consume(
     bound = _deep_thaw(authority.body)
     reservation_id = bound["reservation_id"]
     owner = authority.owner
-    if isinstance(owner, ParentExecutionAuthority):
-        now = owner._resolve_time(now)
+    current_head_digest: str | None = None
     try:
-        current_ledger = durable_ledger_snapshot(ledger)
+        if isinstance(owner, ParentExecutionAuthority):
+            now = owner._resolve_time(now)
+        bound_ledger = getattr(authority, "ledger", None)
+        snapshot_ledger = bound_ledger if ledger is not bound_ledger else ledger
+        current_ledger = durable_ledger_snapshot(snapshot_ledger)
+        current_head_digest = current_ledger.get("head_digest")
         bound_ledger = bound["ledger"]
         if (not isinstance(owner, ParentExecutionAuthority)
                 or not owner.owns_authority(authority)
@@ -6540,30 +7861,21 @@ def _verify_qualification_first_consume(
         mapped = exc if isinstance(exc, ProvenanceError) else ProvenanceError(
             getattr(exc, "reason", "first_consume_mismatch")
         )
-        if isinstance(owner, ParentExecutionAuthority):
-            owner.quarantine_ledger(
-                ledger, {"reason": mapped.reason, "authority": authority.identity},
-            )
+        _quarantine_first_consume_failure(
+            owner, ledger, authority, mapped.reason,
+            allowed_states=frozenset({"authority_minted"}),
+            expected_head_digest=current_head_digest,
+        )
         if mapped is not exc:
             raise mapped from exc
         raise
-    try:
-        observed_digest = canonical_sha256(observation.canonical())
-        if activate:
-            owner.ledger_first_consume_verified(
-                ledger, authority.identity, observed_digest,
-            )
-            return owner.activate_qualification(authority, ledger=ledger)
-        return owner.ledger_first_consume_verified(
-            ledger, authority.identity, observed_digest,
-        )
-    except Exception as exc:
-        reason = getattr(exc, "reason", "first_consume_mismatch")
-        if isinstance(owner, ParentExecutionAuthority):
-            owner.quarantine_ledger(
-                ledger, {"reason": reason, "authority": authority.identity},
-            )
-        raise
+    observed_digest = canonical_sha256(observation.canonical())
+    return owner._commit_qualification_first_consume(
+        authority, ledger, observed_digest, activate=activate,
+        target_lease=observation.target_lease,
+        source=observation.source, checkout=observation.checkout,
+        revision_authorization=revision_authorization,
+    )
 
 
 def verify_first_consume(authority: QualificationExecutionAuthority,
@@ -6595,10 +7907,14 @@ def verify_final_first_consume(
         raise TypeError("typed final first-consume observation required")
     bound = _deep_thaw(authority.body)
     owner = authority.owner
-    if isinstance(owner, ParentExecutionAuthority):
-        now = owner._resolve_time(now)
+    current_head_digest: str | None = None
     try:
-        current_ledger = durable_ledger_snapshot(ledger)
+        if isinstance(owner, ParentExecutionAuthority):
+            now = owner._resolve_time(now)
+        bound_ledger = getattr(authority, "ledger", None)
+        snapshot_ledger = bound_ledger if ledger is not bound_ledger else ledger
+        current_ledger = durable_ledger_snapshot(snapshot_ledger)
+        current_head_digest = current_ledger.get("head_digest")
         bound_ledger = bound["ledger"]
         if (not isinstance(owner, ParentExecutionAuthority)
                 or not owner.owns_authority(authority)
@@ -6713,24 +8029,21 @@ def verify_final_first_consume(
         mapped = exc if isinstance(exc, ProvenanceError) else ProvenanceError(
             getattr(exc, "reason", "first_consume_mismatch")
         )
-        if isinstance(owner, ParentExecutionAuthority):
-            owner.quarantine_ledger(
-                ledger, {"reason": mapped.reason, "authority": authority.identity},
-            )
+        _quarantine_first_consume_failure(
+            owner, ledger, authority, mapped.reason,
+            allowed_states=frozenset({"authority_minted"}),
+            expected_head_digest=current_head_digest,
+        )
         if mapped is not exc:
             raise mapped from exc
         raise
-    try:
-        digest = canonical_sha256(observation.canonical())
-        owner.ledger_first_consume_verified(ledger, authority.identity, digest)
-        return owner.activate_final(authority, ledger=ledger)
-    except Exception as exc:
-        reason = getattr(exc, "reason", "first_consume_mismatch")
-        if isinstance(owner, ParentExecutionAuthority):
-            owner.quarantine_ledger(
-                ledger, {"reason": reason, "authority": authority.identity},
-            )
-        raise
+    digest = canonical_sha256(observation.canonical())
+    return owner._commit_final_first_consume(
+        authority, ledger, digest,
+        target_lease=observation.target_lease,
+        source=observation.source, checkout=observation.checkout,
+        revision_authorization=revision_authorization,
+    )
 
 
 final_first_consume = verify_final_first_consume

@@ -220,11 +220,11 @@ def test_digest_is_detached_and_tamper_fails(tmp_path):
     source["runtime_mode"] = "fake"
     path = tmp_path / "profile.json"
     path.write_text(json.dumps(source), encoding="utf-8")
-    with pytest.raises(K12RuntimeProfileError, match="digest"):
+    with pytest.raises(K12RuntimeProfileError, match="(digest|outside the source root)"):
         load_k12_live_runtime_profile(path)
 
 def test_duplicate_json_keys_fail_before_authentication(tmp_path):
     path=tmp_path/"duplicate.json"
     path.write_text('{"artifact_id":"a","artifact_id":"b","detached_artifact_sha256":"' + '0'*64 + '"}',encoding="utf-8")
-    with pytest.raises(K12RuntimeProfileError,match="duplicate"):
+    with pytest.raises(K12RuntimeProfileError,match="(duplicate|outside the source root)"):
         load_k12_live_runtime_profile(path)

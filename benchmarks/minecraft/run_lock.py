@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
 import math
 import os
+import stat
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 
 
 LOCK_METADATA_SCHEMA_VERSION = 2
@@ -83,9 +87,12 @@ class MinecraftTargetLock:
     ) -> None:
         if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
             raise ValueError("timeout_seconds must be finite and non-negative")
+        if not math.isfinite(poll_interval_seconds) or poll_interval_seconds < 0:
+            raise ValueError("poll_interval_seconds must be finite and non-negative")
         self.lock_root = Path(lock_root)
         self.key = minecraft_target_lock_key(host=host, port=port)
         self.path = self.lock_root / f"{self.key}.lock"
+        self._name_path = self.lock_root / f"{self.key}.guard"
         self.host = host
         self.port = int(port)
         self.world_id = world_id
@@ -94,18 +101,82 @@ class MinecraftTargetLock:
         self.poll_interval_seconds = float(poll_interval_seconds)
         self.acquired = False
         self.quarantined = False
+        self._quarantine_uncertain = False
         self.quarantine_record = None
         self.stale_owner_detected = False
         self._stream = None
+        self._name_stream = None
+        self.release_succeeded: bool | None = None
+
+        self._lifecycle_lock = threading.RLock()
+
+    @contextmanager
+    def lifecycle_guard(self):
+        """Serialize lease observation and release in this process."""
+        with self._lifecycle_lock:
+            yield
 
     def acquire(self) -> "MinecraftTargetLock":
+        with self._lifecycle_lock:
+            return self._acquire_locked()
+
+    def _acquire_locked(self) -> "MinecraftTargetLock":
+        deadline = time.monotonic() + self.timeout_seconds
+        self.release_succeeded = None
         try:
             self.lock_root.mkdir(parents=True, exist_ok=True)
-            self._stream = self.path.open("a+", encoding="utf-8")
+            self._name_stream = _open_lock_stream(self._name_path, writable=True)
+            while True:
+                try:
+                    fcntl.flock(
+                        self._name_stream.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                    break
+                except BlockingIOError as exc:
+                    if time.monotonic() >= deadline:
+                        try:
+                            self._stream = _open_lock_stream(self.path, writable=False)
+                            owner = self._read_contention_owner_snapshot()
+                        except OSError:
+                            owner = {}
+                        self._close_failed_acquire(unlock=False)
+                        message = f"Minecraft target {self.host}:{self.port} is busy"
+                        if owner.get("attempt_id"):
+                            message += f" with attempt {owner['attempt_id']}"
+                        raise MinecraftTargetLockBusyError(
+                            message,
+                            reason="busy",
+                            owner=owner,
+                        ) from exc
+                    time.sleep(self.poll_interval_seconds)
+            if not self._name_path_matches_stream():
+                self._close_failed_acquire(unlock=True)
+                raise MinecraftTargetLockMetadataError(
+                    "Minecraft target lock guard path changed before admission"
+                )
+            uncertain = self._read_uncertain_marker()
+            if uncertain is not None:
+                self._close_failed_acquire(unlock=True)
+                raise MinecraftTargetQuarantinedError(
+                    f"Minecraft target {self.host}:{self.port} is quarantined",
+                    quarantine=uncertain,
+                )
+            self._stream = _open_lock_stream(self.path, writable=True)
         except OSError as exc:
             self._close_failed_acquire(unlock=False)
             raise self._unavailable_error() from exc
-        deadline = time.monotonic() + self.timeout_seconds
+        except BaseException:
+            self._close_failed_acquire(unlock=False)
+            raise
+        if (
+            not self._retained_path_matches_stream()
+            or not self._name_path_matches_stream()
+        ):
+            self._close_failed_acquire(unlock=False)
+            raise MinecraftTargetLockMetadataError(
+                "Minecraft target lock path no longer names the opened lease"
+            )
         while True:
             try:
                 fcntl.flock(self._stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -128,6 +199,13 @@ class MinecraftTargetLock:
                 raise self._unavailable_error() from exc
 
         try:
+            if (
+                not self._retained_path_matches_stream()
+                or not self._name_path_matches_stream()
+            ):
+                raise MinecraftTargetLockMetadataError(
+                    "Minecraft target lock path changed before acquisition"
+                )
             previous = self._read_metadata()
             if previous.get("status") == "quarantined":
                 raise MinecraftTargetQuarantinedError(
@@ -158,7 +236,21 @@ class MinecraftTargetLock:
                     "migrated_from_schema_version": 1,
                     "previous_status": previous["status"],
                 })
+            if (
+                not self._retained_path_matches_stream()
+                or not self._name_path_matches_stream()
+            ):
+                raise MinecraftTargetLockMetadataError(
+                    "Minecraft target lock path changed before acquisition write"
+                )
             self._write_metadata(acquired_metadata)
+            if (
+                not self._retained_path_matches_stream()
+                or not self._name_path_matches_stream()
+            ):
+                raise MinecraftTargetLockMetadataError(
+                    "Minecraft target lock path changed during acquisition"
+                )
         except OSError as exc:
             self._close_failed_acquire(unlock=True)
             raise self._unavailable_error() from exc
@@ -169,6 +261,18 @@ class MinecraftTargetLock:
         return self
 
     def quarantine(
+        self,
+        *,
+        run_name: str,
+        reasons: tuple[str, ...] | list[str],
+        diagnostics: dict,
+    ) -> dict:
+        with self._lifecycle_lock:
+            return self._quarantine_locked(
+                run_name=run_name, reasons=reasons, diagnostics=diagnostics,
+            )
+
+    def _quarantine_locked(
         self,
         *,
         run_name: str,
@@ -188,6 +292,13 @@ class MinecraftTargetLock:
             raise ValueError("quarantine reasons must contain at least one non-empty string")
         if not isinstance(diagnostics, dict):
             raise ValueError("quarantine diagnostics must be an object")
+        if (
+            not self._retained_path_matches_stream()
+            or not self._name_path_matches_stream()
+        ):
+            raise MinecraftTargetLockMetadataError(
+                "Minecraft target lock path no longer names the retained lease"
+            )
         acquired = self._read_metadata()
         if acquired.get("status") != "acquired" or acquired.get("attempt_id") != self.attempt_id:
             raise MinecraftTargetLockMetadataError(
@@ -201,28 +312,181 @@ class MinecraftTargetLock:
             "reasons": list(normalized_reasons),
             "diagnostics": diagnostics,
         }
-        self._write_metadata(record)
+        try:
+            self._write_metadata(record)
+            if (
+                not self._retained_path_matches_stream()
+                or not self._name_path_matches_stream()
+            ):
+                self._quarantine_uncertain = True
+                raise MinecraftTargetLockMetadataError(
+                    "Minecraft target lock path changed during quarantine"
+                )
+        except MinecraftTargetLockMetadataError:
+            # JSON serialization is rejected before the retained lock stream
+            # is modified.  Path drift, unlike serialization, has already set
+            # the uncertainty flag and requires the independent guard marker.
+            if self._quarantine_uncertain:
+                try:
+                    self._write_uncertain_marker()
+                except BaseException:
+                    pass
+            raise
+        except BaseException:
+            # A write/fsync failure may have persisted the quarantine even
+            # though the local assignment below was not reached.  Release
+            # re-reads the on-disk status and will never downgrade such a
+            # record to ``released``.  Also commit quarantine to the independently
+            # locked guard inode now; callers may be unable to append a ledger
+            # cleanup receipt or reach their normal release path.
+            self._quarantine_uncertain = True
+            try:
+                self._write_uncertain_marker()
+            except BaseException:
+                pass
+            raise
         self.quarantined = True
         self.quarantine_record = record
         return dict(record)
 
-    def release(self) -> None:
-        if self._stream is None:
-            return
-        if self.acquired:
-            if not self.quarantined:
+    def _retained_path_matches_stream(self) -> bool:
+        return _stream_path_matches(self.path, self._stream)
+
+    def _name_path_matches_stream(self) -> bool:
+        return _stream_path_matches(self._name_path, self._name_stream)
+
+    def _read_uncertain_marker(self) -> dict | None:
+        if self._name_stream is None:
+            return None
+        return _read_uncertain_marker_stream(
+            self._name_stream,
+            expected_key=self.key,
+            expected_host=self.host,
+            expected_port=self.port,
+        )
+
+    def _write_uncertain_marker(self) -> bool:
+        if self._name_stream is None or not self._name_path_matches_stream():
+            return False
+        marker = {
+            "schema_version": LOCK_METADATA_SCHEMA_VERSION,
+            "status": "quarantined",
+            "attempt_id": self.attempt_id,
+            "pid": os.getpid(),
+            "host": self.host,
+            "port": self.port,
+            "world_id": self.world_id,
+            "lock_key": self.key,
+            "acquired_at": time.time(),
+            "stale_owner_detected": False,
+            "run_name": f"lock-release-{self.attempt_id}",
+            "quarantined_at": time.time(),
+            "reasons": ["lock_release_incomplete"],
+            "diagnostics": {"path": str(self.path)},
+        }
+        try:
+            _write_stream_metadata(self._name_stream, marker)
+        except (MinecraftTargetLockMetadataError, OSError, TypeError, ValueError):
+            return False
+        return True
+
+    def release(self) -> bool:
+        with self._lifecycle_lock:
+            if self._stream is None and self._name_stream is None:
+                return self.release_succeeded is not False
+            try:
+                result = self._release_locked()
+            except BaseException:
+                self.release_succeeded = False
+                raise
+            self.release_succeeded = result
+            return result
+
+    def _release_locked(self) -> bool:
+        stream = self._stream
+        name_stream = self._name_stream
+        if stream is None and name_stream is None:
+            return True
+        release_result = True
+        retain_handles = False
+        try:
+            if self.acquired and (
+                not self._retained_path_matches_stream()
+                or not self._name_path_matches_stream()
+            ):
+                # Never publish ``released`` through an unlinked or replaced
+                # descriptor.  The retained inode is no longer the admission
+                # pathname, so its state is uncertain and the caller must
+                # treat cleanup as incomplete.
+                self._quarantine_uncertain = True
+                if not self._write_uncertain_marker():
+                    retain_handles = True
+                release_result = False
+                return False
+            if self.acquired and not self.quarantined:
                 metadata = self._read_metadata()
-                metadata.update({
-                    "status": "released",
-                    "released_at": max(time.time(), metadata["acquired_at"]),
-                })
-                self._write_metadata(metadata)
-            fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
-        self._stream.close()
-        self._stream = None
-        self.acquired = False
+                if metadata.get("status") == "quarantined":
+                    self.quarantined = True
+                    self.quarantine_record = metadata
+                elif self._quarantine_uncertain:
+                    raise MinecraftTargetLockError(
+                        "Minecraft target quarantine status is uncertain"
+                    )
+                else:
+                    metadata.update({
+                        "status": "released",
+                        "released_at": max(time.time(), metadata["acquired_at"]),
+                    })
+                    self._write_metadata(metadata)
+                    if (
+                        not self._retained_path_matches_stream()
+                        or not self._name_path_matches_stream()
+                    ):
+                        self._quarantine_uncertain = True
+                        if not self._write_uncertain_marker():
+                            retain_handles = True
+                        release_result = False
+        except BaseException:
+            self._quarantine_uncertain = True
+            if not self._write_uncertain_marker():
+                retain_handles = True
+            raise
+        finally:
+            if self.acquired and (
+                not self._retained_path_matches_stream()
+                or not self._name_path_matches_stream()
+            ):
+                self._quarantine_uncertain = True
+                if not self._write_uncertain_marker():
+                    retain_handles = True
+                release_result = False
+            if not retain_handles:
+                try:
+                    if self.acquired and stream is not None:
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                finally:
+                    try:
+                        if stream is not None:
+                            stream.close()
+                    finally:
+                        try:
+                            if name_stream is not None:
+                                fcntl.flock(name_stream.fileno(), fcntl.LOCK_UN)
+                        finally:
+                            try:
+                                if name_stream is not None:
+                                    name_stream.close()
+                            finally:
+                                self._stream = None
+                                self._name_stream = None
+                                self.acquired = False
+        return release_result
 
     def retained_lease_snapshot(self) -> MinecraftTargetLeaseSnapshot:
+        with self._lifecycle_lock:
+            return self._retained_lease_snapshot_locked()
+
+    def _retained_lease_snapshot_locked(self) -> MinecraftTargetLeaseSnapshot:
         """Return an observational snapshot of the currently retained lease.
 
         The descriptor identity comes from the retained stream while the path
@@ -235,6 +499,8 @@ class MinecraftTargetLock:
             raise MinecraftTargetLockError(
                 "Minecraft target lock must be acquired before lease snapshot"
             )
+        if not self._name_path_matches_stream():
+            raise self._unavailable_error()
 
         try:
             fd = stream.fileno()
@@ -332,12 +598,7 @@ class MinecraftTargetLock:
     def _write_metadata(self, payload: dict) -> None:
         if self._stream is None:
             raise RuntimeError("lock stream is not open")
-        self._stream.seek(0)
-        self._stream.truncate()
-        json.dump(payload, self._stream, indent=2)
-        self._stream.write("\n")
-        self._stream.flush()
-        os.fsync(self._stream.fileno())
+        _write_stream_metadata(self._stream, payload)
 
     def _read_contention_owner_snapshot(self) -> dict:
         if self._stream is None:
@@ -356,18 +617,33 @@ class MinecraftTargetLock:
         return _public_lock_owner_snapshot(payload) if isinstance(payload, dict) else {}
 
     def _close_failed_acquire(self, *, unlock: bool) -> None:
-        if self._stream is None:
+        stream = self._stream
+        name_stream = self._name_stream
+        if stream is None and name_stream is None:
             return
         if unlock:
             try:
-                fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
+                if stream is not None:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
             except OSError:
                 pass
         try:
-            self._stream.close()
+            if stream is not None:
+                stream.close()
+        except OSError:
+            pass
+        try:
+            if name_stream is not None:
+                fcntl.flock(name_stream.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            if name_stream is not None:
+                name_stream.close()
         except OSError:
             pass
         self._stream = None
+        self._name_stream = None
 
     def _unavailable_error(self) -> MinecraftTargetLockUnavailableError:
         return MinecraftTargetLockUnavailableError(
@@ -379,7 +655,46 @@ class MinecraftTargetLock:
         return self.acquire()
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        self.release()
+        if not self.release():
+            raise MinecraftTargetLockError(
+                "Minecraft target lock release could not be verified"
+            )
+
+
+def _open_lock_stream(path: Path, *, writable: bool):
+    """Open a lock path without following a final symlink."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        raise OSError("O_NOFOLLOW is required for Minecraft target locks")
+    flags = os.O_CLOEXEC | nofollow
+    if writable:
+        flags |= os.O_RDWR | os.O_CREAT | os.O_APPEND
+        mode = "a+"
+    else:
+        flags |= os.O_RDONLY
+        mode = "r"
+    fd = os.open(path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("Minecraft target lock is not a regular file")
+        return os.fdopen(fd, mode, encoding="utf-8")
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def _stream_path_matches(path: Path, stream: Any) -> bool:
+    if stream is None:
+        return False
+    try:
+        fd_stat = os.fstat(stream.fileno())
+        path_stat = os.lstat(path)
+    except (OSError, TypeError, ValueError):
+        return False
+    return (fd_stat.st_dev, fd_stat.st_ino) == (path_stat.st_dev, path_stat.st_ino)
 
 
 def _pid_exists(pid: int) -> bool:
@@ -426,14 +741,90 @@ def read_minecraft_target_lock_metadata(
 ) -> dict:
     key = minecraft_target_lock_key(host=host, port=port)
     path = Path(lock_root) / f"{key}.lock"
+    return _read_lock_metadata_path(
+        path,
+        key=key,
+        host=host,
+        port=int(port),
+    )
+
+
+def read_minecraft_target_lock_state(
+    *,
+    lock_root: str | Path,
+    host: str,
+    port: int,
+) -> dict:
+    """Read target metadata and guard-only quarantine under the target guard."""
+    key = minecraft_target_lock_key(host=host, port=port)
+    root = Path(lock_root)
+    root.mkdir(parents=True, exist_ok=True)
+    guard_path = root / f"{key}.guard"
+    try:
+        guard = _open_lock_stream(guard_path, writable=True)
+    except OSError as exc:
+        raise MinecraftTargetLockMetadataError(
+            "Minecraft target lock guard must be a regular non-symlink file"
+        ) from exc
+    try:
+        if not _stream_path_matches(guard_path, guard):
+            raise MinecraftTargetLockMetadataError(
+                "Minecraft target lock guard path no longer names the opened guard"
+            )
+        try:
+            fcntl.flock(guard.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise MinecraftTargetLockError(
+                f"Minecraft target {host}:{int(port)} is actively locked"
+            ) from exc
+        if not _stream_path_matches(guard_path, guard):
+            raise MinecraftTargetLockMetadataError(
+                "Minecraft target lock guard path changed during status read"
+            )
+        return {
+            "metadata": _read_lock_metadata_path(
+                root / f"{key}.lock",
+                key=key,
+                host=host,
+                port=int(port),
+            ),
+            "guard_quarantine": _read_uncertain_marker_stream(
+                guard,
+                expected_key=key,
+                expected_host=host,
+                expected_port=int(port),
+            ),
+        }
+    finally:
+        try:
+            fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
+        finally:
+            guard.close()
+
+
+def _read_lock_metadata_path(
+    path: Path,
+    *,
+    key: str,
+    host: str,
+    port: int,
+) -> dict:
     if not path.exists():
+        if path.is_symlink():
+            raise MinecraftTargetLockMetadataError(
+                "Minecraft target lock path must not be a symlink"
+            )
         return {}
     try:
-        with path.open("r", encoding="utf-8") as stream:
+        with _open_lock_stream(path, writable=False) as stream:
             content = stream.read()
     except UnicodeError as exc:
         raise MinecraftTargetLockMetadataError(
             "Minecraft target lock metadata encoding is invalid"
+        ) from exc
+    except OSError as exc:
+        raise MinecraftTargetLockMetadataError(
+            "Minecraft target lock path is invalid"
         ) from exc
     if not content.strip():
         return {}
@@ -447,7 +838,7 @@ def read_minecraft_target_lock_metadata(
         payload,
         expected_key=key,
         expected_host=host,
-        expected_port=int(port),
+        expected_port=port,
     )
 
 
@@ -468,14 +859,55 @@ def clear_minecraft_target_quarantine(
     root = Path(lock_root)
     root.mkdir(parents=True, exist_ok=True)
     path = root / f"{key}.lock"
-    stream = path.open("a+", encoding="utf-8")
+    guard_path = root / f"{key}.guard"
     try:
+        guard = _open_lock_stream(guard_path, writable=True)
+    except OSError as exc:
+        raise MinecraftTargetLockMetadataError(
+            "Minecraft target lock guard must be a regular non-symlink file"
+        ) from exc
+    stream = None
+    try:
+        if not _stream_path_matches(guard_path, guard):
+            raise MinecraftTargetLockMetadataError(
+                "Minecraft target lock guard path no longer names the opened guard"
+            )
+        try:
+            fcntl.flock(guard.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise MinecraftTargetLockError(
+                f"Minecraft target {host}:{int(port)} is actively locked"
+            ) from exc
+        if not _stream_path_matches(guard_path, guard):
+            raise MinecraftTargetLockMetadataError(
+                "Minecraft target lock guard path changed before quarantine clearing"
+            )
+        guard_quarantine = _read_uncertain_marker_stream(
+            guard,
+            expected_key=key,
+            expected_host=host,
+            expected_port=int(port),
+        )
+        try:
+            stream = _open_lock_stream(path, writable=True)
+        except OSError as exc:
+            raise MinecraftTargetLockMetadataError(
+                "Minecraft target lock path must be a regular non-symlink file"
+            ) from exc
+        if not _stream_path_matches(path, stream):
+            raise MinecraftTargetLockMetadataError(
+                "Minecraft target lock path no longer names the opened lease"
+            )
         try:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise MinecraftTargetLockError(
                 f"Minecraft target {host}:{int(port)} is actively locked"
             ) from exc
+        if not _stream_path_matches(path, stream):
+            raise MinecraftTargetLockMetadataError(
+                "Minecraft target lock path changed before quarantine clearing"
+            )
         stream.seek(0)
         content = stream.read()
         previous = {}
@@ -492,9 +924,17 @@ def clear_minecraft_target_quarantine(
                     raise MinecraftTargetLockMetadataError(
                         "corrupt Minecraft target metadata requires force_corrupt"
                     ) from exc
-        if previous and previous.get("status") != "quarantined" and not force_corrupt:
+        if (
+            previous
+            and previous.get("status") != "quarantined"
+            and guard_quarantine is None
+            and not force_corrupt
+        ):
             raise MinecraftTargetLockError("Minecraft target is not quarantined")
-        last_quarantine = _public_quarantine_history(previous)
+        last_quarantine = (
+            _public_quarantine_history(previous)
+            or _public_quarantine_history(guard_quarantine or {})
+        )
         cleared = {
             "schema_version": LOCK_METADATA_SCHEMA_VERSION,
             "status": "cleared",
@@ -506,13 +946,41 @@ def clear_minecraft_target_quarantine(
             "clear_reason": reason.strip(),
             "last_quarantine": last_quarantine,
         }
+        if (
+            not _stream_path_matches(path, stream)
+            or not _stream_path_matches(guard_path, guard)
+        ):
+            raise MinecraftTargetLockMetadataError(
+                "Minecraft target lock path changed before quarantine clear write"
+            )
         _write_stream_metadata(stream, cleared)
+        if (
+            not _stream_path_matches(path, stream)
+            or not _stream_path_matches(guard_path, guard)
+        ):
+            raise MinecraftTargetLockMetadataError(
+                "Minecraft target lock path changed during quarantine clear"
+            )
+        if guard_quarantine is not None:
+            _clear_uncertain_marker_stream(guard)
+            if not _stream_path_matches(guard_path, guard):
+                raise MinecraftTargetLockMetadataError(
+                    "Minecraft target lock guard path changed during uncertainty clear"
+                )
         return cleared
     finally:
         try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            if stream is not None:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
         finally:
-            stream.close()
+            try:
+                if stream is not None:
+                    stream.close()
+            finally:
+                try:
+                    fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
+                finally:
+                    guard.close()
 
 
 def _parse_lock_metadata(
@@ -540,6 +1008,67 @@ def _parse_lock_metadata(
     if schema_version == 1:
         return _validate_schema_v1_metadata(payload)
     return _validate_schema_v2_metadata(payload)
+
+
+def _validate_uncertain_marker(
+    payload: object,
+    *,
+    expected_key: str,
+    expected_host: str,
+    expected_port: int,
+) -> None:
+    parsed = _parse_lock_metadata(
+        payload,
+        expected_key=expected_key,
+        expected_host=expected_host,
+        expected_port=expected_port,
+    )
+    if (
+        parsed.get("status") != "quarantined"
+        or "lock_release_incomplete" not in parsed.get("reasons", [])
+    ):
+        raise MinecraftTargetLockMetadataError(
+            "Minecraft target lock uncertainty marker is invalid"
+        )
+
+
+def _read_uncertain_marker_stream(
+    stream: Any,
+    *,
+    expected_key: str,
+    expected_host: str,
+    expected_port: int,
+) -> dict | None:
+    try:
+        stream.seek(0)
+        content = stream.read()
+        stream.seek(0)
+    except (OSError, TypeError, ValueError, UnicodeError) as exc:
+        raise MinecraftTargetLockMetadataError(
+            "Minecraft target lock uncertainty marker is unreadable"
+        ) from exc
+    if not content.strip():
+        return None
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise MinecraftTargetLockMetadataError(
+            "Minecraft target lock uncertainty marker is invalid JSON"
+        ) from exc
+    _validate_uncertain_marker(
+        payload,
+        expected_key=expected_key,
+        expected_host=expected_host,
+        expected_port=expected_port,
+    )
+    return dict(payload)
+
+
+def _clear_uncertain_marker_stream(stream: Any) -> None:
+    stream.seek(0)
+    stream.truncate()
+    stream.flush()
+    os.fsync(stream.fileno())
 
 
 def _validate_metadata_identity(
@@ -674,10 +1203,21 @@ def _is_non_negative_finite_number(value: object) -> bool:
 
 
 def _write_stream_metadata(stream, payload: dict) -> None:
+    try:
+        encoded = json.dumps(payload, indent=2, allow_nan=False) + "\n"
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise MinecraftTargetLockMetadataError(
+            "Minecraft target lock metadata is not JSON serializable"
+        ) from exc
     stream.seek(0)
+    # The lock stream is opened in ``a+`` mode so acquisition can create it;
+    # truncate before writing because O_APPEND would otherwise append even
+    # after seek(0).  Serialization happens first, so invalid diagnostics can
+    # never destroy an otherwise valid metadata record.  Any later write or
+    # fsync failure leaves the lock fail-closed rather than silently accepting
+    # a partial JSON object.
     stream.truncate()
-    json.dump(payload, stream, indent=2)
-    stream.write("\n")
+    stream.write(encoded)
     stream.flush()
     os.fsync(stream.fileno())
 

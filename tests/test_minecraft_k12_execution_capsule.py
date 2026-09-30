@@ -1,6 +1,7 @@
 import dataclasses
 import os
 import secrets
+import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -296,6 +297,57 @@ def test_ledger_is_append_only_fsynced_and_reopenable(tmp_path):
         reopened.close()
 
 
+def test_pre_anchor_ledger_is_rejected_on_parent_reopen(tmp_path):
+    ledger, controller_key = _ledger(tmp_path)
+    reservation = ledger.reservation_id
+    nonce = ledger.nonce
+    root = ledger.root
+    ledger.close()
+
+    anchor = root / f"qualification-{reservation}.ledger.head"
+    format_marker = root / f"qualification-{reservation}.ledger.format"
+    assert anchor.exists()
+    anchor.unlink()
+    format_marker.unlink()
+
+    with pytest.raises(CapsuleError, match="ledger_corrupt"):
+        DurableLedger.open_parent_owned(
+            controller_key=controller_key,
+            root=root,
+            namespace="qualification",
+            reservation_id=reservation,
+            output_root_identity="output/1",
+            nonce=nonce,
+        )
+    assert not anchor.exists()
+
+
+def test_anchored_ledger_rejects_prefix_rewind_after_anchor_removal(tmp_path):
+    ledger, controller_key = _ledger(tmp_path / "anchored-prefix")
+    controller = ledger.acquire_parent_controller(controller_key)
+    controller.authority_minted(A)
+    reservation = ledger.reservation_id
+    nonce = ledger.nonce
+    root = ledger.root
+    ledger_path = root / f"qualification-{reservation}.ledger"
+    anchor = root / f"qualification-{reservation}.ledger.head"
+    ledger.close()
+
+    lines = ledger_path.read_bytes().splitlines(keepends=True)
+    ledger_path.write_bytes(b"".join(lines[:1]))
+    anchor.unlink()
+
+    with pytest.raises(CapsuleError, match="ledger_corrupt"):
+        DurableLedger.open_parent_owned(
+            controller_key=controller_key,
+            root=root,
+            namespace="qualification",
+            reservation_id=reservation,
+            output_root_identity="output/1",
+            nonce=nonce,
+        )
+
+
 def test_second_handle_reloads_before_appending(tmp_path):
     root = tmp_path / "qualification"
     root.mkdir(mode=0o700)
@@ -372,6 +424,45 @@ def test_two_handles_serialize_same_transition_and_preserve_chain(tmp_path):
         first.close()
 
 
+def test_stale_handle_cannot_quarantine_an_advanced_generation(tmp_path):
+    root = tmp_path / "qualification"
+    root.mkdir(mode=0o700)
+    controller_key = secrets.token_bytes(32)
+    first = DurableLedger.create_parent_owned(
+        controller_key=controller_key,
+        root=root,
+        namespace="qualification",
+        reservation_id="e" * 63 + "1",
+        output_root_identity="output/stale-quarantine",
+    )
+    second = DurableLedger.open_parent_owned(
+        controller_key=controller_key,
+        root=root,
+        namespace="qualification",
+        reservation_id=first.reservation_id,
+        output_root_identity=first.output_root_identity,
+        nonce=first.nonce,
+    )
+    try:
+        first_controller = first.acquire_parent_controller(controller_key)
+        second_controller = second.acquire_parent_controller(controller_key)
+        first_controller.authority_minted(A)
+        second.snapshot()
+        expected_head = second.head_digest
+        first_controller.first_consume_verified(A, A)
+        first_controller.activate(A)
+        with pytest.raises(CapsuleError, match="authority_replay"):
+            second_controller.quarantine_if_current(
+                {"reason": "stale"},
+                expected_state="authority_minted",
+                expected_head_digest=expected_head,
+            )
+        assert first.state == "active"
+    finally:
+        second.close()
+        first.close()
+
+
 def test_ledger_integrity_detects_mode_and_truncation(tmp_path):
     ledger, controller_key = _ledger(tmp_path)
     try:
@@ -388,6 +479,70 @@ def test_ledger_integrity_detects_mode_and_truncation(tmp_path):
         assert not truncated.verify_chain()
     finally:
         truncated.close()
+
+
+def test_ledger_rejects_a_valid_prefix_rewind(tmp_path):
+    ledger, controller_key = _ledger(
+        tmp_path / "prefix-rewind", reservation="0" * 64, output="output/prefix",
+    )
+    try:
+        controller = ledger.acquire_parent_controller(controller_key)
+        controller.authority_minted(A)
+        controller.first_consume_verified(A, A)
+        lines = ledger._storage._bytes_locked().splitlines(keepends=True)
+        assert len(lines) == 3
+        os.ftruncate(ledger._fd, sum(map(len, lines[:2])))
+        assert not ledger.verify_chain()
+    finally:
+        ledger.close()
+
+
+def test_ledger_rejects_a_copied_root_after_directory_replacement(tmp_path):
+    ledger, controller_key = _ledger(
+        tmp_path / "root-replacement", reservation="3" * 64, output="output/root",
+    )
+    controller = ledger.acquire_parent_controller(controller_key)
+    controller.authority_minted(A)
+    reservation = ledger.reservation_id
+    nonce = ledger.nonce
+    root = ledger.root
+    replacement = tmp_path / "replacement-root"
+    replacement.mkdir(mode=0o700)
+    for path in root.iterdir():
+        shutil.copy2(path, replacement / path.name)
+    ledger.close()
+    original = tmp_path / "original-root"
+    root.rename(original)
+    replacement.rename(root)
+    with pytest.raises(CapsuleError, match="ledger_corrupt"):
+        DurableLedger.open_parent_owned(
+            controller_key=controller_key,
+            root=root,
+            namespace="qualification",
+            reservation_id=reservation,
+            output_root_identity="output/root",
+            nonce=nonce,
+        )
+
+
+def test_ledger_does_not_accept_an_append_after_fsync_uncertainty(tmp_path, monkeypatch):
+    ledger, controller_key = _ledger(
+        tmp_path / "fsync-uncertain", reservation="2" * 64, output="output/fsync",
+    )
+    try:
+        controller = ledger.acquire_parent_controller(controller_key)
+        original_fsync = os.fsync
+
+        def fsync_then_fail(fd):
+            original_fsync(fd)
+            raise OSError("fsync acknowledgement failure")
+
+        monkeypatch.setattr(os, "fsync", fsync_then_fail)
+        with pytest.raises(OSError, match="fsync acknowledgement failure"):
+            controller.authority_minted(A)
+        assert not ledger.verify_chain()
+    finally:
+        ledger.close()
 
 
 def test_global_reservation_root_and_nonce_replay_is_cross_namespace(tmp_path):

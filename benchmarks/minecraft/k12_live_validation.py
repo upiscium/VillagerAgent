@@ -16,11 +16,13 @@ network, RCON, Minecraft, provider, systemd, or filesystem execution path.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 import re
 from threading import RLock
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
+import weakref
 
 from benchmarks.common.eac.canonical import canonical_sha256
 
@@ -77,6 +79,11 @@ _FINAL_ADMISSION_TOKEN = object()
 _FINAL_CELL_TOKEN = object()
 _FINAL_ADMISSION_LOCK = RLock()
 _FINAL_ADMISSION_KEYS: set[str] = set()
+_FINAL_ADMISSIONS: weakref.WeakValueDictionary[
+    str, "FinalCampaignAdmission"
+] = weakref.WeakValueDictionary()
+_FINAL_ADMISSION_SNAPSHOTS: dict[str, tuple[str, str]] = {}
+_FINAL_ADMISSION_STATE_DIGESTS: dict[str, str] = {}
 _FINAL_EVIDENCE_ORIGINS = frozenset(
     {"test_only", RUNTIME_VERIFIED_ORIGIN, INJECTED_FAKE_ORIGIN}
 )
@@ -279,6 +286,34 @@ def load_k12_live_containment_probe(path: str | Path | None = None) -> dict[str,
     return value
 
 
+def _final_manifest_identity_payload(manifest: Any) -> dict[str, Any]:
+    """Return every field that authenticates a final campaign manifest."""
+    return {
+        "artifact": FINAL_PHASE_MANIFEST_IDENTITY,
+        "phase": manifest.phase,
+        "manifest_identity": manifest.manifest_identity,
+        "manifest_digest": manifest.manifest_digest,
+        "schedule": list(manifest.schedule),
+        "common_closure_digest": manifest.common_closure_digest,
+        "fixture_manifest_digest": manifest.fixture_manifest_digest,
+        "randomization_manifest_digest": manifest.randomization_manifest_digest,
+        "evidence_origin": manifest.evidence_origin,
+    }
+
+
+def _final_manifest_closure_digest(manifest: Any) -> str:
+    return canonical_sha256(
+        {
+            "phase": manifest.phase,
+            "manifest_identity": manifest.manifest_identity,
+            "manifest_digest": manifest.manifest_digest,
+            "schedule_digest": FINAL_SCHEDULE_DIGEST,
+            "fixture_manifest_digest": manifest.fixture_manifest_digest,
+            "randomization_manifest_digest": manifest.randomization_manifest_digest,
+        }
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class FinalCampaignManifest:
     """Authenticated final-phase manifest identity and exact schedule."""
@@ -320,37 +355,54 @@ class FinalCampaignManifest:
         ):
             raise ValueError("live final manifest is not the sealed repository manifest pair")
         closure = self.common_closure_digest
+        expected_closure = _final_manifest_closure_digest(self)
         if not closure:
-            closure = canonical_sha256(
-                {
-                    "phase": self.phase,
-                    "manifest_identity": self.manifest_identity,
-                    "manifest_digest": self.manifest_digest,
-                    "schedule_digest": FINAL_SCHEDULE_DIGEST,
-                    "fixture_manifest_digest": self.fixture_manifest_digest,
-                    "randomization_manifest_digest": self.randomization_manifest_digest,
-                }
-            )
+            closure = expected_closure
             object.__setattr__(self, "common_closure_digest", closure)
-        elif not _digest(closure):
+        elif not _digest(closure) or closure != expected_closure:
             raise ValueError("final manifest closure digest is invalid")
         object.__setattr__(
             self,
             "identity",
-            canonical_sha256(
-                {
-                    "artifact": "minecraft-k12-live-final-phase-manifest/1",
-                    "phase": self.phase,
-                    "manifest_identity": self.manifest_identity,
-                    "manifest_digest": self.manifest_digest,
-                    "schedule": list(self.schedule),
-                    "common_closure_digest": self.common_closure_digest,
-                    "fixture_manifest_digest": self.fixture_manifest_digest,
-                    "randomization_manifest_digest": self.randomization_manifest_digest,
-                    "evidence_origin": self.evidence_origin,
-                }
-            ),
+            canonical_sha256(_final_manifest_identity_payload(self)),
         )
+
+    def validate_integrity(self) -> bool:
+        """Verify that the current object still matches its sealed identity."""
+        try:
+            if type(self.schedule) is not tuple:
+                return False
+            schedule = self.schedule
+            if (
+                self.phase != FINAL_PHASE
+                or not isinstance(self.manifest_identity, str)
+                or not self.manifest_identity
+                or self.manifest_identity in _QUALIFICATION_MANIFEST_IDENTITIES
+                or not _digest(self.manifest_digest)
+                or schedule != FINAL_SCHEDULE
+                or not _digest(self.common_closure_digest)
+                or self.common_closure_digest != _final_manifest_closure_digest(self)
+                or self.evidence_origin not in _FINAL_EVIDENCE_ORIGINS
+                or "qualification" in self.manifest_identity.lower()
+                or (self.fixture_manifest_digest and not _raw_digest(self.fixture_manifest_digest))
+                or (
+                    self.randomization_manifest_digest
+                    and not _raw_digest(self.randomization_manifest_digest)
+                )
+            ):
+                return False
+            if self.evidence_origin == RUNTIME_VERIFIED_ORIGIN and (
+                self.manifest_identity != FINAL_RANDOMIZATION_MANIFEST_IDENTITY
+                or self.manifest_digest != FINAL_RANDOMIZATION_MANIFEST_DIGEST
+                or self.fixture_manifest_digest != FINAL_FIXTURE_MANIFEST_DIGEST
+                or self.randomization_manifest_digest != FINAL_RANDOMIZATION_MANIFEST_DIGEST
+            ):
+                return False
+            return self.identity == canonical_sha256(
+                _final_manifest_identity_payload(self)
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
 
     @property
     def schedule_identity(self) -> str:
@@ -482,6 +534,31 @@ def final_common_closure(
     )
 
 
+def _final_cell_evidence_identity_payload(value: Any) -> dict[str, Any]:
+    return {
+        "artifact": "minecraft-k12-live-final-cell-evidence/1",
+        "cell_id": value.cell_id,
+        "profile_digest": value.profile_digest,
+        "campaign_id": value.campaign_id,
+        "phase": value.phase,
+        "manifest_identity": value.manifest_identity,
+        "manifest_digest": value.manifest_digest,
+        "common_closure_digest": value.common_closure_digest,
+        "evidence_digest": value.evidence_digest,
+        "authority_binding": (
+            value.authority_binding.canonical() if value.authority_binding else None
+        ),
+        "terminal_verified": value.terminal_verified,
+        "result": value.result,
+        "execution_provenance": value.execution_provenance,
+        "evidence_origin": value.evidence_origin,
+        "fresh_root": value.fresh_root,
+        "retry": value.retry,
+        "resumed": value.resumed,
+        "replacement": value.replacement,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class FinalCellEvidence:
     """One injected, terminal final-cell observation."""
@@ -495,11 +572,11 @@ class FinalCellEvidence:
     common_closure_digest: str
     evidence_digest: str
     authority_binding: AuthorityBinding | None = None
-    terminal_verified: bool = True
+    terminal_verified: bool = False
     result: str = "passed"
     execution_provenance: str = "live_final"
     evidence_origin: str = INJECTED_FAKE_EVIDENCE_ORIGIN
-    fresh_root: bool = True
+    fresh_root: bool = False
     retry: bool = False
     resumed: bool = False
     replacement: bool = False
@@ -524,36 +601,46 @@ class FinalCellEvidence:
             or self.result != "passed"
             or self.execution_provenance != "live_final"
             or self.evidence_origin not in _FINAL_EVIDENCE_ORIGINS
+            or self.fresh_root is not True
         ):
             raise ValueError("complete final cell evidence is required")
         object.__setattr__(
             self,
             "identity",
-            canonical_sha256(
-                {
-                    "artifact": "minecraft-k12-live-final-cell-evidence/1",
-                    "cell_id": self.cell_id,
-                    "profile_digest": self.profile_digest,
-                    "campaign_id": self.campaign_id,
-                    "phase": self.phase,
-                    "manifest_identity": self.manifest_identity,
-                    "manifest_digest": self.manifest_digest,
-                    "common_closure_digest": self.common_closure_digest,
-                    "evidence_digest": self.evidence_digest,
-                    "authority_binding": (
-                        self.authority_binding.canonical() if self.authority_binding else None
-                    ),
-                    "terminal_verified": self.terminal_verified,
-                    "result": self.result,
-                    "execution_provenance": self.execution_provenance,
-                    "evidence_origin": self.evidence_origin,
-                    "fresh_root": self.fresh_root,
-                    "retry": self.retry,
-                    "resumed": self.resumed,
-                    "replacement": self.replacement,
-                }
-            ),
+            canonical_sha256(_final_cell_evidence_identity_payload(self)),
         )
+
+    def validate_integrity(self) -> bool:
+        """Verify that mutable object fields still match the evidence identity."""
+        try:
+            if (
+                not isinstance(self.cell_id, str)
+                or not self.cell_id
+                or not isinstance(self.profile_digest, str)
+                or not self.profile_digest
+                or not isinstance(self.campaign_id, str)
+                or not self.campaign_id
+                or self.phase != FINAL_PHASE
+                or not isinstance(self.manifest_identity, str)
+                or not self.manifest_identity
+                or not _digest(self.manifest_digest)
+                or not _digest(self.common_closure_digest)
+                or not isinstance(self.evidence_digest, str)
+                or not self.evidence_digest
+                or (self.authority_binding is not None
+                    and not isinstance(self.authority_binding, AuthorityBinding))
+                or self.terminal_verified is not True
+                or self.result != "passed"
+                or self.execution_provenance != "live_final"
+                or self.evidence_origin not in _FINAL_EVIDENCE_ORIGINS
+                or self.fresh_root is not True
+            ):
+                return False
+            return self.identity == canonical_sha256(
+                _final_cell_evidence_identity_payload(self)
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
 
     @property
     def closure_digest(self) -> str:
@@ -577,7 +664,7 @@ class FinalCellEvidence:
             value.get("result", "passed"),
             value.get("execution_provenance", "live_final"),
             value.get("evidence_origin", INJECTED_FAKE_EVIDENCE_ORIGIN),
-            value.get("fresh_root", True),
+            value.get("fresh_root", False),
             value.get("retry", False),
             value.get("resumed", False),
             value.get("replacement", False),
@@ -594,6 +681,16 @@ def make_final_cell_evidence(**values: Any) -> FinalCellEvidence:
 def _validate_active_final_authority(authority: ActiveFinalAuthority) -> None:
     if not isinstance(authority, ActiveFinalAuthority):
         raise TypeError("active parent final authority required")
+    try:
+        owner = authority.owner
+        owns_active = getattr(owner, "owns_active_authority", None)
+        owned = callable(owns_active) and owns_active(authority) is True
+    except (AttributeError, TypeError, ValueError, ProvenanceError):
+        owned = False
+    if not owned:
+        raise ProvenanceError("authority_replay")
+    if not authority.current_at():
+        raise ProvenanceError("authority_replay")
     expected_origin = _authority_evidence_origin(authority)
     if authority.lifecycle != "active" or authority.binding.lifecycle != "active":
         raise ProvenanceError("authority_replay")
@@ -623,6 +720,54 @@ def _validate_active_final_authority(authority: ActiveFinalAuthority) -> None:
         raise ProvenanceError("authority_replay")
 
 
+def _authority_terminalization_guard(authority: ActiveFinalAuthority):
+    owner = getattr(authority, "owner", None)
+    guard = getattr(owner, "_terminalization_guard", None)
+    return guard() if callable(guard) else nullcontext()
+
+
+def _authority_semantic_guard(authority: ActiveFinalAuthority):
+    owner = getattr(authority, "owner", None)
+    guard = getattr(owner, "_semantic_guard", None)
+    return guard() if callable(guard) else nullcontext()
+
+
+def _final_admission_payload(admission: Any) -> dict[str, Any]:
+    """Return the parent-side immutable identity inputs for an admission."""
+    manifest = admission.manifest
+    return {
+        "artifact": "minecraft-k12-live-final-campaign-admission/1",
+        "authority": admission.authority.identity,
+        "authority_binding": admission.authority_binding.canonical(),
+        "campaign_id": admission.campaign_id,
+        "manifest": {
+            "identity": manifest.identity,
+            "phase": manifest.phase,
+            "manifest_identity": manifest.manifest_identity,
+            "manifest_digest": manifest.manifest_digest,
+            "schedule": list(manifest.schedule),
+            "common_closure_digest": manifest.common_closure_digest,
+            "fixture_manifest_digest": manifest.fixture_manifest_digest,
+            "randomization_manifest_digest": manifest.randomization_manifest_digest,
+            "evidence_origin": manifest.evidence_origin,
+        },
+        "schedule": list(admission.schedule),
+        "common_closure_digest": admission.common_closure_digest,
+        "profile_digest": admission.profile_digest,
+        "qualification_semantic_projection_digest":
+            admission.qualification_semantic_projection_digest,
+        "qualification_probe_projection_digest":
+            admission.qualification_probe_projection_digest,
+        "qualification_terminal_receipt_census_digest":
+            admission.qualification_terminal_receipt_census_digest,
+        "qualification_terminal_event_digest":
+            admission.qualification_terminal_event_digest,
+        "qualification_terminal_ledger_digest":
+            admission.qualification_terminal_ledger_digest,
+        "evidence_origin": admission.evidence_origin,
+    }
+
+
 @dataclass(slots=True)
 class _FinalAdmissionState:
     observations: dict[str, FinalCellEvidence] = field(default_factory=dict)
@@ -634,9 +779,58 @@ class _FinalAdmissionState:
     lock: RLock = field(default_factory=RLock)
 
 
-@dataclass(frozen=True, slots=True, init=False)
+def _final_admission_state_digest(admission: Any) -> str:
+    """Digest mutable transition state separately from static admission data."""
+    state = admission._state
+    with state.lock:
+        observations = []
+        for cell_id, value in state.observations.items():
+            admission._validate_cell_observation(value, cell_id)
+            observations.append([cell_id, value.identity])
+        return canonical_sha256(
+            {
+                "artifact": "minecraft-k12-live-final-admission-state/1",
+                "observations": observations,
+                "issued": sorted(state.issued),
+                "cell_authorities": [
+                    [cell_id, getattr(value, "identity", None)]
+                    for cell_id, value in state.cell_authorities.items()
+                ],
+                "launched": sorted(state.launched),
+                "consumed": sorted(state.consumed),
+                "launch_permits": [
+                    [cell_id, getattr(value, "identity", None)]
+                    for cell_id, value in state.launch_permits.items()
+                ],
+            }
+        )
+
+
+def _record_final_admission_state(admission: Any) -> None:
+    """Record a parent-side transition digest after a legitimate mutation."""
+    digest = _final_admission_state_digest(admission)
+    authority_identity = admission.authority.identity
+    with _FINAL_ADMISSION_LOCK:
+        if _FINAL_ADMISSIONS.get(authority_identity) is admission:
+            _FINAL_ADMISSION_STATE_DIGESTS[authority_identity] = digest
+
+
+@dataclass(frozen=True, init=False)
 class FinalCampaignAdmission:
     """One final campaign admission owned by one active final authority."""
+
+    # ``WeakValueDictionary`` needs ``__weakref__``; declaring the slots
+    # manually keeps the admission weak-referenceable without reintroducing a
+    # writable ``__dict__`` on this frozen capability.
+    __slots__ = (
+        "authority", "authority_binding", "campaign_id", "manifest", "schedule",
+        "common_closure_digest", "profile_digest",
+        "qualification_semantic_projection_digest",
+        "qualification_probe_projection_digest",
+        "qualification_terminal_receipt_census_digest",
+        "qualification_terminal_event_digest", "qualification_terminal_ledger_digest",
+        "evidence_origin", "identity", "_state", "__weakref__",
+    )
 
     authority: ActiveFinalAuthority
     authority_binding: AuthorityBinding
@@ -652,7 +846,7 @@ class FinalCampaignAdmission:
     qualification_terminal_ledger_digest: str
     evidence_origin: str
     identity: str
-    _state: _FinalAdmissionState = field(repr=False, compare=False)
+    _state: ClassVar[_FinalAdmissionState]
 
     @classmethod
     def from_authority(cls, authority: ActiveFinalAuthority, *args: Any, **kwargs: Any) -> "FinalCampaignAdmission":
@@ -680,6 +874,8 @@ class FinalCampaignAdmission:
         expected_origin = _authority_evidence_origin(authority)
         if not isinstance(manifest, FinalCampaignManifest):
             raise TypeError("typed final phase manifest required")
+        if not manifest.validate_integrity():
+            raise ProvenanceError("final_manifest_integrity_mismatch")
         if not isinstance(campaign_id, str) or not campaign_id:
             raise ValueError("final campaign identity is required")
         expected_closure = final_common_closure(authority, manifest)
@@ -711,32 +907,15 @@ class FinalCampaignAdmission:
         object.__setattr__(self, "qualification_terminal_ledger_digest", qualification_terminal_ledger_digest)
         object.__setattr__(self, "evidence_origin", evidence_origin)
         object.__setattr__(self, "_state", state)
-        object.__setattr__(
-            self,
-            "identity",
-            canonical_sha256(
-                {
-                    "artifact": "minecraft-k12-live-final-campaign-admission/1",
-                    "authority": authority.identity,
-                    "authority_binding": authority.binding.canonical(),
-                    "campaign_id": campaign_id,
-                    "manifest": manifest.identity,
-                    "schedule": list(FINAL_SCHEDULE),
-                    "common_closure_digest": common_closure_digest,
-                    "profile_digest": authority.profile_digest,
-                    "qualification_semantic_projection_digest": qualification_semantic_projection_digest,
-                    "qualification_probe_projection_digest": qualification_probe_projection_digest,
-                    "qualification_terminal_receipt_census_digest": qualification_terminal_receipt_census_digest,
-                    "qualification_terminal_event_digest": qualification_terminal_event_digest,
-                    "qualification_terminal_ledger_digest": qualification_terminal_ledger_digest,
-                    "evidence_origin": evidence_origin,
-                }
-            ),
-        )
+        object.__setattr__(self, "identity", canonical_sha256(
+            _final_admission_payload(self)
+        ))
 
     def _validate_cell_observation(self, value: FinalCellEvidence, cell_id: str) -> None:
         if not isinstance(value, FinalCellEvidence):
             raise TypeError("typed final cell evidence required")
+        if not value.validate_integrity():
+            raise ProvenanceError("final_evidence_integrity_mismatch")
         if (
             value.cell_id != cell_id
             or value.cell_id not in FINAL_SCHEDULE
@@ -789,10 +968,59 @@ class FinalCampaignAdmission:
         except (TypeError, ValueError, ProvenanceError):
             return False
         return (
+            self.is_parent_owned()
+            and
             self.evidence_origin == RUNTIME_VERIFIED_ORIGIN
             and self.manifest.evidence_origin == RUNTIME_VERIFIED_ORIGIN
             and self.authority.runtime_admissible
         )
+
+    def is_parent_owned(self) -> bool:
+        try:
+            authority_identity = self.authority.identity
+        except (AttributeError, TypeError, ValueError):
+            return False
+        with _FINAL_ADMISSION_LOCK:
+            snapshot = _FINAL_ADMISSION_SNAPSHOTS.get(authority_identity)
+            state_digest = _FINAL_ADMISSION_STATE_DIGESTS.get(authority_identity)
+            registered = _FINAL_ADMISSIONS.get(authority_identity) is self
+        if not registered:
+            return False
+        try:
+            if type(self.schedule) is not tuple or self.schedule != FINAL_SCHEDULE:
+                return False
+            if not self.manifest.validate_integrity():
+                return False
+            expected = (
+                self.identity,
+                canonical_sha256(_final_admission_payload(self)),
+            )
+            current_state_digest = _final_admission_state_digest(self)
+        except (AttributeError, TypeError, ValueError, ProvenanceError):
+            return False
+        return snapshot == expected and state_digest == current_state_digest
+
+    def owns_cell_authority(self, authority: Any) -> bool:
+        if type(authority) is not FinalCellAuthority:
+            return False
+        with self._state.lock:
+            return (
+                self.is_parent_owned()
+                and authority.admission is self
+                and self._state.cell_authorities.get(authority.cell_id) is authority
+                and authority.cell_id in FINAL_SCHEDULE
+                and authority.ordinal == FINAL_SCHEDULE.index(authority.cell_id)
+                and authority.authority_binding == self.authority_binding
+                and authority.identity == canonical_sha256(
+                    {
+                        "artifact": "minecraft-k12-live-final-cell-authority/1",
+                        "admission": self.identity,
+                        "cell_id": authority.cell_id,
+                        "ordinal": authority.ordinal,
+                        "authority_binding": self.authority_binding.canonical(),
+                    }
+                )
+            )
 
     @property
     def complete(self) -> bool:
@@ -841,32 +1069,55 @@ class FinalCampaignAdmission:
     def validate(self) -> bool:
         return self.runtime_admissible
 
+    @contextmanager
+    def _target_commit_guard(self):
+        """Keep the authority-bound target lease across each state commit."""
+        lease = getattr(self.authority, "target_lease", None)
+        owner = getattr(self.authority, "owner", None)
+        if lease is None or owner is None:
+            raise ProvenanceError("target_lock_loss")
+        owned_by = getattr(lease, "owned_by", None)
+        commit_guard = getattr(lease, "commit_guard", None)
+        revalidate = getattr(lease, "revalidate", None)
+        if not callable(owned_by) or not callable(commit_guard) or not callable(revalidate):
+            raise ProvenanceError("target_lock_loss")
+        with commit_guard():
+            if not owned_by(owner):
+                raise ProvenanceError("target_lock_loss")
+            revalidate()
+            yield
+
     def issue_cell(self, cell_id: str) -> "FinalCellAuthority":
-        _validate_active_final_authority(self.authority)
-        if cell_id not in FINAL_SCHEDULE:
-            raise ValueError("cell is outside the authenticated final schedule")
-        with self._state.lock:
-            if cell_id in self._state.issued:
-                raise ProvenanceError("authority_replay")
-            next_ordinal = len(self._state.issued)
-            if (
-                next_ordinal >= FINAL_CELL_COUNT
-                or FINAL_SCHEDULE[next_ordinal] != cell_id
-            ):
-                raise ProvenanceError("final_schedule_order")
-            preloaded = self._state.observations.get(cell_id)
-            if preloaded is not None:
-                self._validate_cell_observation(preloaded, cell_id)
-            self._state.issued.add(cell_id)
-            ordinal = FINAL_SCHEDULE.index(cell_id)
-            authority = FinalCellAuthority(
-                self,
-                cell_id,
-                ordinal,
-                _FINAL_CELL_TOKEN,
-            )
-            self._state.cell_authorities[cell_id] = authority
-            return authority
+        with _authority_terminalization_guard(self.authority):
+            with self._target_commit_guard():
+                _validate_active_final_authority(self.authority)
+                if not self.is_parent_owned():
+                    raise ProvenanceError("authority_replay")
+                if cell_id not in FINAL_SCHEDULE:
+                    raise ValueError("cell is outside the authenticated final schedule")
+                with self._state.lock:
+                    if cell_id in self._state.issued:
+                        raise ProvenanceError("authority_replay")
+                    next_ordinal = len(self._state.issued)
+                    if (
+                        next_ordinal >= FINAL_CELL_COUNT
+                        or FINAL_SCHEDULE[next_ordinal] != cell_id
+                    ):
+                        raise ProvenanceError("final_schedule_order")
+                    preloaded = self._state.observations.get(cell_id)
+                    if preloaded is not None:
+                        self._validate_cell_observation(preloaded, cell_id)
+                    self._state.issued.add(cell_id)
+                    ordinal = FINAL_SCHEDULE.index(cell_id)
+                    authority = FinalCellAuthority(
+                        self,
+                        cell_id,
+                        ordinal,
+                        _FINAL_CELL_TOKEN,
+                    )
+                    self._state.cell_authorities[cell_id] = authority
+                    _record_final_admission_state(self)
+                    return authority
 
     cell_authority = issue_cell
     authorize_cell = issue_cell
@@ -876,58 +1127,72 @@ class FinalCampaignAdmission:
         return tuple(self.issue_cell(cell_id) for cell_id in FINAL_SCHEDULE)
 
     def _consume_for_launch(self, authority: "FinalCellAuthority") -> "FinalLaunchPermit":
-        _validate_active_final_authority(self.authority)
-        if not isinstance(authority, FinalCellAuthority) or authority.admission is not self:
-            raise ProvenanceError("authority_namespace_mismatch")
-        with self._state.lock:
-            _validate_active_final_authority(self.authority)
-            if authority.cell_id not in self._state.issued:
-                raise ProvenanceError("authority_replay")
-            if self._state.cell_authorities.get(authority.cell_id) is not authority:
-                raise ProvenanceError("authority_namespace_mismatch")
-            if authority.cell_id in self._state.launched or authority.cell_id in self._state.consumed:
-                raise ProvenanceError("authority_replay")
-            next_ordinal = len(self._state.launched)
-            if (
-                next_ordinal >= FINAL_CELL_COUNT
-                or authority.ordinal != next_ordinal
-                or FINAL_SCHEDULE[next_ordinal] != authority.cell_id
-            ):
-                raise ProvenanceError("final_schedule_order")
-            self._state.launched.add(authority.cell_id)
-            permit = FinalLaunchPermit(authority, _FINAL_LAUNCH_TOKEN)
-            self._state.launch_permits[authority.cell_id] = permit
-            return permit
+        with _authority_terminalization_guard(self.authority):
+            with self._target_commit_guard():
+                _validate_active_final_authority(self.authority)
+                if (
+                    not self.is_parent_owned()
+                    or not isinstance(authority, FinalCellAuthority)
+                    or authority.admission is not self
+                ):
+                    raise ProvenanceError("authority_namespace_mismatch")
+                with self._state.lock:
+                    _validate_active_final_authority(self.authority)
+                    if authority.cell_id not in self._state.issued:
+                        raise ProvenanceError("authority_replay")
+                    if not self.owns_cell_authority(authority):
+                        raise ProvenanceError("authority_namespace_mismatch")
+                    if authority.cell_id in self._state.launched or authority.cell_id in self._state.consumed:
+                        raise ProvenanceError("authority_replay")
+                    next_ordinal = len(self._state.launched)
+                    if (
+                        next_ordinal >= FINAL_CELL_COUNT
+                        or authority.ordinal != next_ordinal
+                        or FINAL_SCHEDULE[next_ordinal] != authority.cell_id
+                    ):
+                        raise ProvenanceError("final_schedule_order")
+                    self._state.launched.add(authority.cell_id)
+                    permit = FinalLaunchPermit(authority, _FINAL_LAUNCH_TOKEN)
+                    self._state.launch_permits[authority.cell_id] = permit
+                    _record_final_admission_state(self)
+                    return permit
 
     def _complete_cell(
         self, authority: "FinalCellAuthority", terminal_evidence: FinalCellEvidence
     ) -> FinalCellEvidence:
-        _validate_active_final_authority(self.authority)
-        if not isinstance(authority, FinalCellAuthority) or authority.admission is not self:
-            raise ProvenanceError("authority_namespace_mismatch")
-        with self._state.lock:
-            _validate_active_final_authority(self.authority)
-            if authority.cell_id not in self._state.launched:
-                raise ProvenanceError("final_cell_launch_required")
-            if self._state.cell_authorities.get(authority.cell_id) is not authority:
-                raise ProvenanceError("authority_namespace_mismatch")
-            if authority.cell_id not in self._state.launch_permits:
-                raise ProvenanceError("authority_replay")
-            if authority.cell_id in self._state.consumed:
-                raise ProvenanceError("authority_replay")
-            next_ordinal = len(self._state.consumed)
-            if (
-                next_ordinal >= FINAL_CELL_COUNT
-                or authority.ordinal != next_ordinal
-                or FINAL_SCHEDULE[next_ordinal] != authority.cell_id
-            ):
-                raise ProvenanceError("final_schedule_order")
-            if not isinstance(terminal_evidence, FinalCellEvidence):
-                raise TypeError("typed terminal final-cell evidence is required")
-            self._validate_cell_observation(terminal_evidence, authority.cell_id)
-            self._state.consumed.add(authority.cell_id)
-            self._state.observations[authority.cell_id] = terminal_evidence
-            return terminal_evidence
+        with _authority_terminalization_guard(self.authority):
+            with self._target_commit_guard():
+                _validate_active_final_authority(self.authority)
+                if (
+                    not self.is_parent_owned()
+                    or not isinstance(authority, FinalCellAuthority)
+                    or authority.admission is not self
+                ):
+                    raise ProvenanceError("authority_namespace_mismatch")
+                with self._state.lock:
+                    _validate_active_final_authority(self.authority)
+                    if authority.cell_id not in self._state.launched:
+                        raise ProvenanceError("final_cell_launch_required")
+                    if not self.owns_cell_authority(authority):
+                        raise ProvenanceError("authority_namespace_mismatch")
+                    if authority.cell_id not in self._state.launch_permits:
+                        raise ProvenanceError("authority_replay")
+                    if authority.cell_id in self._state.consumed:
+                        raise ProvenanceError("authority_replay")
+                    next_ordinal = len(self._state.consumed)
+                    if (
+                        next_ordinal >= FINAL_CELL_COUNT
+                        or authority.ordinal != next_ordinal
+                        or FINAL_SCHEDULE[next_ordinal] != authority.cell_id
+                    ):
+                        raise ProvenanceError("final_schedule_order")
+                    if not isinstance(terminal_evidence, FinalCellEvidence):
+                        raise TypeError("typed terminal final-cell evidence is required")
+                    self._validate_cell_observation(terminal_evidence, authority.cell_id)
+                    self._state.consumed.add(authority.cell_id)
+                    self._state.observations[authority.cell_id] = terminal_evidence
+                    _record_final_admission_state(self)
+                    return terminal_evidence
 
     def consume_for_launch(self, authority: "FinalCellAuthority") -> "FinalLaunchPermit":
         return self._consume_for_launch(authority)
@@ -1256,6 +1521,8 @@ def _require_completed_final_cell_containment(
         raise ProvenanceError("authority_namespace_mismatch")
     if authority.binding != admission.binding:
         raise ProvenanceError("authority_namespace_mismatch")
+    if not admission.is_parent_owned():
+        raise ProvenanceError("authority_namespace_mismatch")
     with admission._state.lock:
         if admission._state.cell_authorities.get(authority.cell_id) is not authority:
             raise ProvenanceError("authority_namespace_mismatch")
@@ -1286,6 +1553,8 @@ def _require_completed_final_cell_containment(
         admission._validate_cell_observation(completed_evidence, authority.cell_id)
         if terminal_evidence is not None and terminal_evidence is not completed_evidence:
             raise ProvenanceError("final_cell_evidence_mismatch")
+    if not admission.is_parent_owned():
+        raise ProvenanceError("authority_namespace_mismatch")
     _require_current_final_parent(authority)
     return selected_permit
 
@@ -1402,6 +1671,14 @@ def admit_final_campaign(
             _FINAL_ADMISSION_TOKEN,
         )
         _FINAL_ADMISSION_KEYS.add(authority.identity)
+        _FINAL_ADMISSIONS[authority.identity] = admission
+        _FINAL_ADMISSION_SNAPSHOTS[authority.identity] = (
+            admission.identity,
+            canonical_sha256(_final_admission_payload(admission)),
+        )
+        _FINAL_ADMISSION_STATE_DIGESTS[authority.identity] = (
+            _final_admission_state_digest(admission)
+        )
     return admission
 
 
@@ -1510,7 +1787,7 @@ class FinalGateInput:
     resumed: bool = False
     replacement: bool = False
     authority_binding: AuthorityBinding | None = None
-    execution_authority: FinalExecutionAuthority | ActiveFinalAuthority | None = None
+    execution_authority: ActiveFinalAuthority | None = None
     observed_at: int | None = None
     admission: FinalCampaignAdmission | None = None
     cell_authorities: tuple[FinalCellAuthority, ...] = ()
@@ -1553,7 +1830,7 @@ def _final_execution(value: FinalGateInput) -> FinalExecutionAuthority | None:
     return authority if isinstance(authority, FinalExecutionAuthority) else None
 
 
-def final_launch_gate(value: FinalGateInput) -> bool:
+def _final_launch_gate_unlocked(value: FinalGateInput) -> bool:
     """Accept only a complete live qualification/final authority closure."""
 
     if not isinstance(value, FinalGateInput):
@@ -1593,7 +1870,10 @@ def final_launch_gate(value: FinalGateInput) -> bool:
         return False
     active = value.admission.authority
     if (
-        not value.admission.runtime_admissible
+        not isinstance(value.execution_authority, ActiveFinalAuthority)
+        or value.execution_authority is not active
+        or not value.admission.is_parent_owned()
+        or not value.admission.runtime_admissible
         or not value.admission.matches_qualification(value.qualification_attestation)
         or authority.identity != active.identity
         or binding != active.binding
@@ -1661,11 +1941,25 @@ def final_launch_gate(value: FinalGateInput) -> bool:
         if any(
             not isinstance(item, FinalCellAuthority)
             or item.admission is not value.admission
+            or not value.admission.owns_cell_authority(item)
             or item.authority_binding != binding
             for item in value.cell_authorities
         ):
             return False
     return True
+
+
+def final_launch_gate(value: FinalGateInput) -> bool:
+    if not isinstance(value, FinalGateInput):
+        return False
+    authority = value.execution_authority
+    if isinstance(authority, ActiveFinalAuthority):
+        # Qualification publication acquires semantic -> terminalization;
+        # final admission validation must use the same order.
+        with _authority_semantic_guard(authority):
+            with _authority_terminalization_guard(authority):
+                return _final_launch_gate_unlocked(value)
+    return _final_launch_gate_unlocked(value)
 
 
 final_gate_accepts = final_launch_gate

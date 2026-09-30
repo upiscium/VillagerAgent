@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import threading
 from typing import Any, Sequence
+
+from benchmarks.common.eac.canonical import canonical_bytes
 
 from .k12_containment import ContainmentError, containment_identity
 from .k12_live_containment import LiveContainment, MockContainmentIO, systemd_run_command
@@ -16,7 +19,9 @@ from .k12_execution_provenance import (
     INJECTED_TEST_ORIGIN,
     RUNTIME_VERIFIED_ORIGIN,
     ActiveFinalAuthority,
+    git_blob_oid,
     ProvenanceError,
+    raw_sha256,
 )
 from .k12_guarded_backend import (
     K12AuthenticatedProfile,
@@ -386,39 +391,45 @@ class ParentLaunchAuthority:
         ):
             raise ContainmentError("launch authority lifecycle is stale or revoked")
 
+    def _parent_terminalization_guard(self):
+        owner = getattr(self.authority, "owner", None)
+        factory = getattr(owner, "_terminalization_guard", None)
+        return factory() if callable(factory) else nullcontext()
+
     def _reserve_bound(
         self, state: NormalizedLiveState, launch: str, namespace: str,
         binding: AuthorityBinding,
     ) -> LaunchKey:
-        self._assert_current()
-        validate_state(state)
-        if (
-            state.profile != self.profile.profile_digest
-            or state.campaign != self.campaign
-            or state.authority_binding != binding
-            or not state.reset_attestation_sha256
-            or not state.plan_authority_digest
-            or not self.plan_authority.owns_state(state)
-        ):
-            raise ContainmentError("launch/reset/profile authority mismatch")
-        key=LaunchKey(state.profile,self.campaign,self.cohort,state.cell,state.generation,
-                      state.reset_token,state.reset_attestation_sha256,launch,namespace,binding)
-        with self._lock:
+        with self._parent_terminalization_guard():
             self._assert_current()
-            if self._blocked:
-                raise ContainmentError("launch is blocked after quarantine or unknown outcome")
-            if key in self._reserved:
-                raise ContainmentError("launch reservation already consumed; retry/resume/replacement denied")
-            cell_key=(key.namespace,key.profile_digest,key.campaign,key.cohort,key.cell)
-            launch_key=(key.namespace,key.profile_digest,key.campaign,key.launch)
-            token_key=(key.namespace,key.profile_digest,key.campaign,key.reset_token)
-            if (cell_key in self._cells or launch_key in self._launches or token_key in self._tokens
-                    or key.reset_generation <= self._generation.get(cell_key,0)):
-                raise ContainmentError("cell, launch, token, or generation replay denied")
-            self._reserved.add(key)
-            self._cells.add(cell_key); self._launches.add(launch_key); self._tokens.add(token_key)
-            self._generation[cell_key]=key.reset_generation
-            return key
+            validate_state(state)
+            if (
+                state.profile != self.profile.profile_digest
+                or state.campaign != self.campaign
+                or state.authority_binding != binding
+                or not state.reset_attestation_sha256
+                or not state.plan_authority_digest
+                or not self.plan_authority.owns_state(state)
+            ):
+                raise ContainmentError("launch/reset/profile authority mismatch")
+            key=LaunchKey(state.profile,self.campaign,self.cohort,state.cell,state.generation,
+                          state.reset_token,state.reset_attestation_sha256,launch,namespace,binding)
+            with self._lock:
+                self._assert_current()
+                if self._blocked:
+                    raise ContainmentError("launch is blocked after quarantine or unknown outcome")
+                if key in self._reserved:
+                    raise ContainmentError("launch reservation already consumed; retry/resume/replacement denied")
+                cell_key=(key.namespace,key.profile_digest,key.campaign,key.cohort,key.cell)
+                launch_key=(key.namespace,key.profile_digest,key.campaign,key.launch)
+                token_key=(key.namespace,key.profile_digest,key.campaign,key.reset_token)
+                if (cell_key in self._cells or launch_key in self._launches or token_key in self._tokens
+                        or key.reset_generation <= self._generation.get(cell_key,0)):
+                    raise ContainmentError("cell, launch, token, or generation replay denied")
+                self._reserved.add(key)
+                self._cells.add(cell_key); self._launches.add(launch_key); self._tokens.add(token_key)
+                self._generation[cell_key]=key.reset_generation
+                return key
 
     def reserve(self, state: NormalizedLiveState, launch: str, namespace: str) -> LaunchKey:
         if namespace not in {"qualification","probe","final"}:
@@ -475,11 +486,12 @@ class ParentLaunchAuthority:
             self._blocked = True
 
     def consume(self,key:LaunchKey,callback) -> None:
-        with self._lock:
-            self._assert_current()
-            if self._blocked: raise ContainmentError("campaign launch authority is blocked")
-            if key not in self._reserved or key in self._consumed: raise ContainmentError("launch reservation is absent or consumed")
-            self._consumed.add(key); callback()
+        with self._parent_terminalization_guard():
+            with self._lock:
+                self._assert_current()
+                if self._blocked: raise ContainmentError("campaign launch authority is blocked")
+                if key not in self._reserved or key in self._consumed: raise ContainmentError("launch reservation is absent or consumed")
+                self._consumed.add(key); callback()
 
 
 class LiveRunner:
@@ -524,6 +536,7 @@ class LiveRunner:
         self.fake_transport = fake_transport
         self._campaign_blocked = False
         self._closed = False
+        self._stopping = False
         self._prepared: dict[LaunchKey, LiveLaunch] = {}
         self._prepared_final: dict[LaunchKey, tuple[Any, Any, Any]] = {}
         self._launched_final: dict[LaunchKey, tuple[Any, Any, Any, LiveLaunch]] = {}
@@ -543,7 +556,7 @@ class LiveRunner:
         return self._closed
 
     def _ensure_open(self) -> None:
-        if self._closed or self._campaign_blocked:
+        if self._closed or self._campaign_blocked or self._stopping:
             raise ContainmentError("launch is blocked or runner is terminally closed")
 
     def _record_launch(
@@ -705,6 +718,7 @@ class LiveRunner:
         if not isinstance(cell_authority, FinalCellAuthority):
             raise ContainmentError("typed final-cell authority is required")
         LiveRunner._require_target_lease(cell_authority, lease)
+        LiveRunner._require_sealed_source(cell_authority)
         if expected_origin == INJECTED_FAKE_ORIGIN:
             LiveRunner._require_injected_final_graph(cell_authority)
         if expected_origin not in {RUNTIME_VERIFIED_ORIGIN, INJECTED_FAKE_ORIGIN}:
@@ -725,12 +739,15 @@ class LiveRunner:
             raise ContainmentError("typed retained target lease is required")
         if not isinstance(ledger, DurableLedger):
             raise ContainmentError("typed final durable ledger is required")
+        try:
+            ledger_snapshot = ledger.snapshot()
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise ContainmentError("final ledger is not active") from exc
         if (
-            ledger.namespace != "final"
-            or ledger.reservation_id != cell_authority.authority.reservation_id
-            or ledger.state != "active"
-            or ledger.head_digest != cell_authority.binding.activation
-            or not ledger.verify_chain()
+            ledger_snapshot.get("namespace") != "final"
+            or ledger_snapshot.get("reservation_id") != cell_authority.authority.reservation_id
+            or ledger_snapshot.get("state") != "active"
+            or ledger_snapshot.get("head_digest") != cell_authority.binding.activation
         ):
             raise ContainmentError("final ledger is not active")
         try:
@@ -783,6 +800,257 @@ class LiveRunner:
             raise ContainmentError("target lease ownership or receipt validation failed") from exc
 
     @staticmethod
+    def _require_sealed_source(cell_authority: Any) -> None:
+        """Ensure final dispatch has the immutable source snapshot from its authority."""
+        active = getattr(cell_authority, "authority", None)
+        execution = getattr(active, "authority", None)
+        sealed = getattr(active, "sealed_source", None)
+        body = getattr(execution, "body", None)
+        closure = body.get("source_closure") if isinstance(body, Mapping) else None
+        records = closure.get("records") if isinstance(closure, Mapping) else None
+        if (
+            not isinstance(sealed, Mapping)
+            or not isinstance(closure, Mapping)
+            or not isinstance(records, (list, tuple))
+            or not sealed
+            or any(not isinstance(record, Mapping) for record in records)
+        ):
+            raise ContainmentError("immutable final source snapshot is unavailable")
+        paths = {record.get("path") for record in records}
+        if set(sealed) != paths or any(not isinstance(path, str) for path in paths):
+            raise ContainmentError("immutable final source snapshot paths are invalid")
+        for record in records:
+            blob = sealed.get(record.get("path"))
+            if (
+                type(blob) is not bytes
+                or raw_sha256(blob) != record.get("sha256")
+                or git_blob_oid(blob) != record.get("git_blob_oid")
+            ):
+                raise ContainmentError("immutable final source snapshot does not match authority")
+        canonical_records = [dict(record) for record in records]
+        if raw_sha256(canonical_bytes({
+            "head_commit": closure.get("head_commit"),
+            "head_tree": closure.get("head_tree"),
+            "records": canonical_records,
+        })) != closure.get("aggregate_sha256"):
+            raise ContainmentError("immutable final source snapshot closure is invalid")
+
+    @staticmethod
+    def _target_lease_guard(lease: Any) -> Any:
+        """Hold the retained target lease across an admission/dispatch boundary."""
+        from .k12_execution_provenance import K12RetainedTargetLease
+
+        if not isinstance(lease, K12RetainedTargetLease):
+            raise ContainmentError("typed retained target lease is required")
+        guard = getattr(lease, "commit_guard", None)
+        if not callable(guard):
+            raise ContainmentError("retained target lease guard is unavailable")
+        try:
+            return guard()
+        except (AttributeError, TypeError, ValueError, ProvenanceError) as exc:
+            raise ContainmentError("retained target lease guard is unavailable") from exc
+
+    @staticmethod
+    def _failure_reason(exc: BaseException) -> str:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, str) and reason.strip():
+            return reason.strip()
+        return type(exc).__name__
+
+    @staticmethod
+    def _quarantined_target_is_intact(lock: Any) -> bool:
+        """Require durable quarantine and retained FD/path identity."""
+        try:
+            snapshot = lock.retained_lease_snapshot()
+            return bool(
+                snapshot.quarantined
+                and snapshot.metadata.get("status") == "quarantined"
+                and (snapshot.fd_dev, snapshot.fd_ino)
+                    == (snapshot.path_dev, snapshot.path_ino)
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _bound_final_lease(cell_authority: Any, fallback: Any = None) -> Any:
+        """Resolve the exact lease recorded on the parent final authority."""
+        try:
+            active = getattr(cell_authority, "authority", cell_authority)
+            execution = getattr(active, "authority", active)
+            owner = getattr(active, "owner", None)
+            resolver = getattr(owner, "_require_authority_target_lease", None)
+            if callable(resolver):
+                bound = resolver(execution)
+                if bound is not None:
+                    return bound
+        except Exception:
+            pass
+        return fallback
+
+    @staticmethod
+    def _quarantine_final_failure(
+        cell_authority: Any,
+        lease: Any,
+        reason: str,
+    ) -> bool:
+        """Quarantine every failed final boundary and report completeness.
+
+        Final dispatch is an injected boundary in this package, but its
+        failure semantics are still durable: the parent-owned final ledger is
+        revoked and the retained target is quarantined before another owner
+        can reuse either capability.  Cleanup errors are recorded as an
+        incomplete result so callers cannot mistake local blocking for durable
+        quarantine.
+        """
+        FinalCellAuthority, _ = LiveRunner._final_types()
+        if not isinstance(cell_authority, FinalCellAuthority):
+            return False
+        active = getattr(cell_authority, "authority", None)
+        execution = getattr(active, "authority", None)
+        owner = getattr(active, "owner", None)
+        ledger = getattr(execution, "ledger", None)
+        if owner is None or ledger is None:
+            return False
+
+        authority_identity = getattr(execution, "identity", "unknown")
+        if not isinstance(authority_identity, str):
+            authority_identity = "unknown"
+        normalized_reason = reason.strip() if isinstance(reason, str) else "final_boundary_failure"
+        if not normalized_reason:
+            normalized_reason = "final_boundary_failure"
+        run_name = f"k12-final-{authority_identity[:24]}"
+        diagnostics = {
+            "authority": authority_identity,
+            "campaign": getattr(cell_authority, "campaign_id", ""),
+            "reason": normalized_reason,
+        }
+        ledger_payload = {
+            "reason": normalized_reason,
+            "authority": authority_identity,
+            "phase": "final_dispatch_failure",
+        }
+
+        parent_guard_factory = getattr(owner, "_terminalization_guard", None)
+        try:
+            parent_guard = (
+                parent_guard_factory() if callable(parent_guard_factory) else nullcontext()
+            )
+        except Exception:
+            parent_guard = nullcontext()
+
+        target_lock = None
+        target_guard = nullcontext()
+        target_required = True
+        try:
+            # Cleanup follows the parent authority registry, not the lease
+            # supplied by the failed caller.  A stale/mismatched argument must
+            # never make the actual retained target escape quarantine.
+            lease = LiveRunner._bound_final_lease(cell_authority)
+            if lease is None:
+                raise ContainmentError("final authority target lease is unavailable")
+            target_lock = getattr(lease, "lock", None)
+            target_guard = LiveRunner._target_lease_guard(lease)
+        except Exception:
+            target_lock = None
+            target_guard = nullcontext()
+
+        ledger_quarantined = False
+        target_quarantined = False
+        cleanup_failed = False
+        try:
+            with parent_guard:
+                with target_guard:
+                    if getattr(ledger, "namespace", None) == "final":
+                        try:
+                            if getattr(ledger, "state", None) == "quarantined":
+                                ledger_quarantined = True
+                            else:
+                                owner.quarantine_ledger(ledger, ledger_payload)
+                                ledger_quarantined = (
+                                    getattr(ledger, "state", None) == "quarantined"
+                                )
+                        except Exception:
+                            cleanup_failed = True
+                    if target_lock is not None:
+                        if getattr(target_lock, "quarantined", False):
+                            target_quarantined = LiveRunner._quarantined_target_is_intact(
+                                target_lock
+                            )
+                            if not target_quarantined:
+                                cleanup_failed = True
+                        elif not getattr(target_lock, "acquired", False):
+                            cleanup_failed = True
+                        else:
+                            try:
+                                lease.revalidate()
+                                target_lock.quarantine(
+                                    run_name=run_name,
+                                    reasons=(normalized_reason,),
+                                    diagnostics=diagnostics,
+                                )
+                                target_quarantined = LiveRunner._quarantined_target_is_intact(
+                                    target_lock
+                                )
+                                if not target_quarantined:
+                                    cleanup_failed = True
+                            except Exception:
+                                cleanup_failed = True
+        except Exception:
+            # Quarantine must never mask the original boundary failure, but a
+            # failed guard/lock transition is still an incomplete cleanup.
+            cleanup_failed = True
+        return ledger_quarantined and (
+            target_quarantined if target_required else True
+        ) and not cleanup_failed
+
+    @staticmethod
+    @contextmanager
+    def _final_boundary_guard(cell_authority: Any, lease: Any):
+        """Acquire parent lifecycle before target lease for a fixed lock order."""
+        if not isinstance(cell_authority, LiveRunner._final_types()[0]):
+            raise ContainmentError("typed final-cell authority is required")
+        active = getattr(cell_authority, "authority", cell_authority)
+        owner = getattr(active, "owner", None)
+        guard_lease = LiveRunner._bound_final_lease(cell_authority, lease)
+        parent_guard_factory = getattr(owner, "_terminalization_guard", None)
+        parent_guard = (
+            parent_guard_factory() if callable(parent_guard_factory) else nullcontext()
+        )
+        with parent_guard:
+            try:
+                with LiveRunner._target_lease_guard(guard_lease):
+                    yield
+            except BaseException as exc:
+                cleanup_complete = LiveRunner._quarantine_final_failure(
+                    cell_authority,
+                    lease,
+                    LiveRunner._failure_reason(exc),
+                )
+                if not cleanup_complete:
+                    raise ContainmentError(
+                        "final failure cleanup incomplete"
+                    ) from exc
+                raise
+
+    @contextmanager
+    def _final_operation(self, cell_authority: Any, lease: Any):
+        """Block this in-memory runner after a failed final boundary."""
+        try:
+            with self._final_boundary_guard(cell_authority, lease):
+                yield
+        except BaseException as exc:
+            # The boundary guard has already attempted durable cleanup.  Keep
+            # retained launch records when that cleanup was incomplete so a
+            # parent can diagnose/recover the exact outstanding resources.
+            self.block(
+                clear_boundaries=not (
+                    isinstance(exc, ContainmentError)
+                    and str(exc) == "final failure cleanup incomplete"
+                )
+            )
+            raise
+
+    @staticmethod
     def _consume_final_cell_for_launch(cell_authority: Any) -> Any:
         """Consume the public prelaunch cell capability, never terminal evidence."""
 
@@ -822,7 +1090,7 @@ class LiveRunner:
         :meth:`complete_final_cell`.
         """
 
-        with self._lock:
+        with self._lock, self._final_operation(cell_authority, lease):
             self._ensure_open()
             FinalCellAuthority, _ = self._final_types()
             if not isinstance(state, NormalizedLiveState):
@@ -898,7 +1166,7 @@ class LiveRunner:
         exposed by :meth:`complete_final_cell`.
         """
 
-        with self._lock:
+        with self._lock, self._final_operation(cell_authority, lease):
             self._ensure_open()
             if not isinstance(state, NormalizedLiveState):
                 raise ContainmentError("typed normalized final state is required")
@@ -965,7 +1233,6 @@ class LiveRunner:
             try:
                 self.parent.consume(key, record_dispatch)
             except BaseException:
-                self.block()
                 raise
             self._prepared.pop(key, None)
             self._prepared_final.pop(key, None)
@@ -991,7 +1258,7 @@ class LiveRunner:
     ) -> Any:
         """Submit terminal evidence after the external dispatch returned."""
 
-        with self._lock:
+        with self._lock, self._final_operation(cell_authority, lease):
             self._ensure_open()
             if not isinstance(cell_authority, self._final_types()[0]):
                 raise ContainmentError("typed final-cell authority is required")
@@ -1025,7 +1292,6 @@ class LiveRunner:
                 )
                 result = self._complete_final_cell_authority(cell_authority, evidence)
             except BaseException as exc:
-                self.block()
                 if isinstance(exc, ContainmentError):
                     raise
                 raise ContainmentError("final-cell completion denied") from exc
@@ -1049,31 +1315,97 @@ class LiveRunner:
 
     consume_admitted_cell = consume_final_cell
 
-    def block(self) -> None:
+    def block(self, *, clear_boundaries: bool = True) -> None:
         with self._lock:
             self._campaign_blocked = True
             self._closed = True
+            self._stopping = True
             self._prepared.clear()
             self._prepared_final.clear()
+            if clear_boundaries:
+                self._launched_final.clear()
             self.parent.block()
+
+    def _final_boundaries_for_stop(self, authority: Any = None) -> tuple[tuple[Any, Any], ...]:
+        """Recover every dispatched authority/lease requiring stop cleanup."""
+        with self._lock:
+            launched = tuple(self._launched_final.values())
+            if authority is not None:
+                matching = tuple(
+                    (value[0], value[1]) for value in launched if value[0] is authority
+                )
+                if matching:
+                    return matching
+            return tuple((value[0], value[1]) for value in launched)
+
+    def _cleanup_stop_failure(self, authority: Any, reason: str) -> bool:
+        """Durably contain a stop failure for the stored dispatched boundary."""
+        boundaries = self._final_boundaries_for_stop(authority)
+        with self._lock:
+            has_dispatched_boundary = bool(self._launched_final)
+            multiple_boundaries = len(self._launched_final) > 1
+        if multiple_boundaries:
+            boundaries = self._final_boundaries_for_stop(None)
+        if not boundaries:
+            return not has_dispatched_boundary
+        complete = True
+        for stored_authority, lease in boundaries:
+            if not self._quarantine_final_failure(stored_authority, lease, reason):
+                complete = False
+        return complete
+
+    def _raise_stop_failure(
+            self, authority: Any, error: BaseException, reason: str,
+    ) -> None:
+        cleanup_complete = self._cleanup_stop_failure(authority, reason)
+        if not cleanup_complete:
+            self.block(clear_boundaries=False)
+            raise ContainmentError("final failure cleanup incomplete") from error
+        self.block()
+        raise error
+
+    def _begin_stop(self) -> None:
+        with self._lock:
+            self._ensure_open()
+            self._stopping = True
+
+    def _stop_started(self, controller: LiveContainment, selected_authority: Any) -> object:
+        if not isinstance(controller, LiveContainment) or controller.io is not self.executor:
+            self._raise_stop_failure(
+                selected_authority,
+                ContainmentError("runner/controller authority mismatch"),
+                "runner/controller authority mismatch",
+            )
+        if selected_authority is not None:
+            if not isinstance(selected_authority, self._final_types()[0]):
+                self._raise_stop_failure(
+                    selected_authority,
+                    ContainmentError("typed final-cell authority is required"),
+                    "typed final-cell authority is required",
+                )
+        with self._lock:
+            if len(self._launched_final) > 1:
+                self._raise_stop_failure(
+                    selected_authority,
+                    ContainmentError(
+                        "multiple final-cell dispatches require coordinated stop"
+                    ),
+                    "multiple final-cell dispatches require coordinated stop",
+                )
+        try:
+            result = controller.stop()
+        except BaseException as exc:
+            self._raise_stop_failure(
+                selected_authority, exc, self._failure_reason(exc),
+            )
+        self.block()
+        return result
 
     def stop(self, controller: LiveContainment, cell_authority: Any = None, *,
              authority: Any = None) -> object:
         selected_authority = cell_authority if cell_authority is not None else authority
-        if not isinstance(controller, LiveContainment) or controller.io is not self.executor:
-            self.block()
-            raise ContainmentError("runner/controller authority mismatch")
-        if selected_authority is not None:
-            if not isinstance(selected_authority, self._final_types()[0]):
-                self.block()
-                raise ContainmentError("typed final-cell authority is required")
-        try:
-            result = controller.stop()
-        except BaseException:
-            self.block()
-            raise
-        self.block()
-        return result
+        self._begin_stop()
+        return self._stop_started(controller, selected_authority)
 
 
 class FinalCellAdmissionRunner(LiveRunner):
@@ -1122,12 +1454,15 @@ class FinalCellAdmissionRunner(LiveRunner):
         LiveRunner._require_target_lease(admission, lease)
         if not isinstance(ledger, DurableLedger):
             raise ContainmentError("typed final durable ledger is required")
+        try:
+            ledger_snapshot = ledger.snapshot()
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise ContainmentError("final ledger or retained target lease is not active") from exc
         if (
-            ledger.namespace != "final"
-            or ledger.reservation_id != admission.authority.reservation_id
-            or ledger.state != "active"
-            or ledger.head_digest != admission.authority_binding.activation
-            or not ledger.verify_chain()
+            ledger_snapshot.get("namespace") != "final"
+            or ledger_snapshot.get("reservation_id") != admission.authority.reservation_id
+            or ledger_snapshot.get("state") != "active"
+            or ledger_snapshot.get("head_digest") != admission.authority_binding.activation
             or lease.reservation_id != admission.authority.reservation_id
         ):
             raise ContainmentError("final ledger or retained target lease is not active")
@@ -1215,15 +1550,20 @@ class FinalCellAdmissionRunner(LiveRunner):
 
     def stop(self, controller: LiveContainment, cell_authority: Any = None, *,
              authority: Any = None) -> object:
+        self._begin_stop()
         selected = cell_authority if cell_authority is not None else authority
         if selected is None:
-            self.block()
-            raise ContainmentError("exact final-cell authority is required for stop")
+            self._raise_stop_failure(
+                selected,
+                ContainmentError("exact final-cell authority is required for stop"),
+                "exact final-cell authority is required for stop",
+            )
         try:
             self._check_cell(selected)
-        except BaseException:
-            self.block()
-            raise
+        except BaseException as exc:
+            self._raise_stop_failure(
+                selected, exc, self._failure_reason(exc),
+            )
         with self._lock:
             matches = [
                 launch
@@ -1231,19 +1571,26 @@ class FinalCellAdmissionRunner(LiveRunner):
                 if value[0] is selected
                 for launch in (value[3],)
             ]
-            if not matches:
-                # A prepared launch has a containment identity, but stopping
-                # before dispatch is not a valid final-cell observation.
-                self.block()
-                raise ContainmentError("final-cell dispatch is not active")
+        if not matches:
+            # A prepared launch has a containment identity, but stopping
+            # before dispatch is not a valid final-cell observation.
+            self._raise_stop_failure(
+                selected,
+                ContainmentError("final-cell dispatch is not active"),
+                "final-cell dispatch is not active",
+            )
+        with self._lock:
             launch = matches[0]
             if (
                 getattr(controller, "unit", None) != launch.unit_id
                 or getattr(controller, "cgroup", None) != launch.cgroup_id
             ):
-                self.block()
-                raise ContainmentError("final-cell containment authority mismatch")
-        return super().stop(controller, selected)
+                error = ContainmentError("final-cell containment authority mismatch")
+            else:
+                error = None
+        if error is not None:
+            self._raise_stop_failure(selected, error, self._failure_reason(error))
+        return self._stop_started(controller, selected)
 
 
 FinalCellRunner = FinalCellAdmissionRunner

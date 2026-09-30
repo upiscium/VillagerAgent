@@ -1,5 +1,6 @@
 import itertools
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -174,3 +175,67 @@ def test_atomic_concurrent_launch_consumes_preparation_once():
     for thread in threads: thread.start()
     for thread in threads: thread.join()
     assert sorted(outcomes)==["rejected","won"] and len(runner.fake_transport.dispatches)==1
+
+
+def test_parent_terminalization_precedes_launch_authority_lock():
+    """The consume/revoke pair must not invert the parent/authority lock order."""
+    parent, state = authority_and_state()
+    key = parent.reserve(state, "lock-order", "qualification")
+    terminalization = threading.Lock()
+    authority_lock_acquired = threading.Event()
+    release_assertion = threading.Event()
+    assertion_started = threading.Event()
+    errors = []
+
+    class _Owner:
+        def _terminalization_guard(self):
+            return terminalization
+
+    class _SignalingLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            self._lock.acquire()
+            authority_lock_acquired.set()
+            return self
+
+        def __exit__(self, _type, _value, _traceback):
+            self._lock.release()
+
+    parent.authority = SimpleNamespace(owner=_Owner())
+    parent._lock = _SignalingLock()
+
+    def gated_assert_current():
+        assertion_started.set()
+        if not release_assertion.wait(timeout=2):
+            raise AssertionError("launch authority current check was not released")
+
+    parent._assert_current = gated_assert_current
+
+    def consume():
+        try:
+            parent.consume(key, lambda: None)
+        except BaseException as exc:  # pragma: no cover - diagnostic capture
+            errors.append(exc)
+
+    consume_thread = threading.Thread(target=consume, daemon=True)
+
+    def terminalize():
+        with terminalization:
+            consume_thread.start()
+            # With the old order consume acquired the authority lock first;
+            # the parent thread then deterministically exposes the cycle by
+            # trying to block that same authority.
+            if authority_lock_acquired.wait(timeout=0.5):
+                parent.block()
+        release_assertion.set()
+
+    terminal_thread = threading.Thread(target=terminalize, daemon=True)
+    terminal_thread.start()
+    terminal_thread.join(timeout=3)
+    consume_thread.join(timeout=3)
+
+    assert not terminal_thread.is_alive()
+    assert not consume_thread.is_alive()
+    assert not errors

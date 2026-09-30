@@ -8,7 +8,7 @@ from pathlib import Path
 from benchmarks.minecraft.run_lock import (
     MinecraftTargetLockError,
     clear_minecraft_target_quarantine,
-    read_minecraft_target_lock_metadata,
+    read_minecraft_target_lock_state,
 )
 
 
@@ -20,17 +20,24 @@ def main(argv: list[str] | None = None) -> int:
     lock_root = Path(args.lock_root)
     try:
         if args.command == "status":
-            metadata = read_minecraft_target_lock_metadata(
+            state = read_minecraft_target_lock_state(
                 lock_root=lock_root,
                 host=args.host,
                 port=args.port,
             )
+            metadata = state["metadata"]
+            guard_quarantine = state["guard_quarantine"]
             payload = {
                 "host": args.host,
                 "port": args.port,
-                "quarantined": metadata.get("status") == "quarantined",
+                "quarantined": (
+                    metadata.get("status") == "quarantined"
+                    or guard_quarantine is not None
+                ),
                 "metadata": metadata,
             }
+            if guard_quarantine is not None:
+                payload["guard_quarantine"] = guard_quarantine
         else:
             payload = clear_minecraft_target_quarantine(
                 lock_root=lock_root,

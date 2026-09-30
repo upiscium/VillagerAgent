@@ -13,6 +13,7 @@ import fnmatch
 import hashlib
 import importlib.metadata
 import json
+import os
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +43,40 @@ HISTORICAL_SOURCE_REVISION = "2687ce4ad0f360d815a81954ee4313eedaa61a8c"
 
 class K12RuntimeProfileError(ValueError):
     """A detached K12 profile or policy is not authenticated."""
+
+
+def _resolve_source_root(value: str | Path) -> Path:
+    try:
+        absolute = Path(os.path.abspath(os.fspath(value)))
+        current = Path(absolute.anchor)
+        for component in absolute.parts[1:]:
+            current /= component
+            if current.is_symlink():
+                raise K12RuntimeProfileError("source root symlink rejected")
+        resolved = absolute.resolve(strict=True)
+        if not resolved.is_dir():
+            raise K12RuntimeProfileError("source root is not a directory")
+        return resolved
+    except K12RuntimeProfileError:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise K12RuntimeProfileError("source root is unavailable") from exc
+
+
+def _resolve_artifact_path(
+        path: str | Path | None, *, root: Path, relative: str,
+        label: str, enforce_root: bool,
+) -> Path:
+    candidate = root / relative if path is None else Path(path)
+    if enforce_root and not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+        if enforce_root:
+            resolved.relative_to(root)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise K12RuntimeProfileError(f"{label} path is outside the source root") from exc
+    return resolved
 
 
 def _normalize_historical_source_path(value: str) -> str:
@@ -709,8 +744,36 @@ _V2_IDENTITIES = {
 _V1_IDENTITIES = {**_COMMON_IDENTITIES, "source_identity": "minecraft-eac-k12-live-source/1"}
 
 
-def load_k12_live_source_policy(path: str | Path = SOURCE_POLICY_PATH) -> K12SourcePolicy:
-    value = strict_json_load(Path(path), "K12 live source policy")
+def load_k12_live_source_policy(
+        path: str | Path | None = None, *,
+        source_root: str | Path | None = None,
+) -> K12SourcePolicy:
+    root = _resolve_source_root(ROOT if source_root is None else source_root)
+    default_path = root / "configs/minecraft/k12-live-source-closure-policy-v2.json"
+    if (path is None and source_root is not None
+            and not default_path.exists() and not default_path.is_symlink()):
+        # The policy artifact is intentionally excluded from its own source
+        # closure.  A materialized checkout may therefore contain every
+        # reviewed input without containing the detached policy file itself.
+        expected_artifact = build_source_policy_artifact(root)
+        entries = tuple(
+            K12SourcePolicyEntry(
+                item["path"], item["git_mode"], item["semantic_class"],
+            )
+            for item in expected_artifact["paths"]
+        )
+        return K12SourcePolicy(
+            expected_artifact["schema_version"],
+            expected_artifact["detached_artifact_sha256"],
+            entries,
+            _SOURCE_POLICY_TOKEN,
+        )
+    policy_path = _resolve_artifact_path(
+        default_path if path is None else path, root=root,
+        relative="configs/minecraft/k12-live-source-closure-policy-v2.json",
+        label="K12 live source policy", enforce_root=True,
+    )
+    value = strict_json_load(policy_path, "K12 live source policy")
     entries = value.get("paths")
     if (value.get("artifact_id") != "minecraft-k12-live-source-closure-policy"
             or value.get("artifact_version") != 2
@@ -730,7 +793,7 @@ def load_k12_live_source_policy(path: str | Path = SOURCE_POLICY_PATH) -> K12Sou
             ))
         except (TypeError, K12RuntimeProfileError) as exc:
             raise K12RuntimeProfileError("prospective source policy mismatch") from exc
-    expected = build_source_policy(ROOT)
+    expected = build_source_policy(root)
     observed_json = tuple({
         "path": item.path,
         "git_mode": item.git_mode,
@@ -789,8 +852,9 @@ def _validate_installed_distributions(value: Mapping[str, Any]) -> None:
 
 def _validate_provider_and_bridge(
         value: Mapping[str, Any], *, source_contract: HistoricalSourceContract | None = None,
+        source_root: str | Path = ROOT,
 ) -> None:
-    bridge = HERE.parent.parent / "env" / "minecraft_server_fast.py"
+    bridge = _resolve_source_root(source_root) / "env" / "minecraft_server_fast.py"
     try:
         bridge_bytes = (source_contract.read("env/minecraft_server_fast.py")
                         if source_contract is not None else bridge.read_bytes())
@@ -865,15 +929,21 @@ def _validate_historical_source_bytes(
 def _validate_contracts(
         value: Mapping[str, Any], *, historical: bool,
         source_contract: HistoricalSourceContract | None = None,
+        source_root: str | Path = ROOT,
 ) -> None:
+    source_root = _resolve_source_root(source_root)
+    source_here = source_root / "benchmarks" / "minecraft"
     contract_paths = {
-        "reset": HERE / "k12_live_reset_readback_v1.json",
-        "oracle": HERE / "k12_live_oracle_v1.json",
-        "stop_policy": HERE / "k12_live_stop_policy_v1.json",
-        "qualification": HERE / "k12_live_qualification_v1.json",
-        "qualification_manifest": (HISTORICAL_QUALIFICATION_MANIFEST_PATH
-                                    if historical else QUALIFICATION_MANIFEST_PATH),
-        "containment_probe": ROOT / "configs/minecraft/k12-live-containment-probe-v1.json",
+        "reset": source_here / "k12_live_reset_readback_v1.json",
+        "oracle": source_here / "k12_live_oracle_v1.json",
+        "stop_policy": source_here / "k12_live_stop_policy_v1.json",
+        "qualification": source_here / "k12_live_qualification_v1.json",
+        "qualification_manifest": (
+            source_root / "configs/minecraft/k12-live-qualification-manifest-v1.json"
+            if historical else
+            source_root / "configs/minecraft/k12-live-qualification-manifest-v2.json"
+        ),
+        "containment_probe": source_root / "configs/minecraft/k12-live-containment-probe-v1.json",
     }
     contracts = value.get("contract_digests")
     if not isinstance(contracts, dict) or set(contracts) != set(contract_paths):
@@ -884,7 +954,7 @@ def _validate_contracts(
             contract = strict_json_load(contract_path, label)
         else:
             try:
-                relative = contract_path.resolve(strict=True).relative_to(ROOT).as_posix()
+                relative = contract_path.resolve(strict=True).relative_to(source_root).as_posix()
             except (OSError, ValueError) as exc:
                 raise K12RuntimeProfileError("historical contract path mismatch") from exc
             contract = strict_json_load_bytes(source_contract.read(relative), label)
@@ -925,7 +995,9 @@ def _validate_environment_policy(value: Mapping[str, Any]) -> None:
 def _load_runtime_profile(
         path: str | Path, *, historical: bool,
         source_contract: HistoricalSourceContract | None = None,
+        source_root: str | Path = ROOT,
 ) -> K12RuntimeProfile:
+    source_root = _resolve_source_root(source_root)
     historical_contract: HistoricalSourceContract | None = None
     if historical:
         historical_contract = source_contract or historical_source_contract()
@@ -951,12 +1023,17 @@ def _load_runtime_profile(
             raise K12RuntimeProfileError("prospective profile contains historical execution identity")
     _validate_common(value, historical=historical)
     _validate_installed_distributions(value)
-    _validate_provider_and_bridge(value, source_contract=historical_contract)
+    _validate_provider_and_bridge(
+        value, source_contract=historical_contract, source_root=source_root,
+    )
     if historical:
         _validate_historical_source_bytes(value, source_contract=historical_contract)
     else:
-        source_policy = load_k12_live_source_policy()
-        environment_policy = strict_json_load(ENVIRONMENT_POLICY_PATH, "K12 live environment policy")
+        source_policy = load_k12_live_source_policy(source_root=source_root)
+        environment_policy = strict_json_load(
+            source_root / "configs/minecraft/k12-live-environment-policy-v1.json",
+            "K12 live environment policy",
+        )
         _validate_environment_policy(environment_policy)
         if value.get("source_policy_digest") != source_policy.digest:
             raise K12RuntimeProfileError("prospective source policy mismatch")
@@ -965,17 +1042,31 @@ def _load_runtime_profile(
                 or value.get("environment_policy_digest")
                 != environment_policy["detached_artifact_sha256"]):
             raise K12RuntimeProfileError("prospective environment policy mismatch")
-    _validate_contracts(value, historical=historical, source_contract=historical_contract)
+    _validate_contracts(
+        value, historical=historical, source_contract=historical_contract,
+        source_root=source_root,
+    )
     return K12RuntimeProfile(tuple(value.items()), _PROFILE_TOKEN)
 
 
-def load_k12_live_runtime_profile(path: str | Path = RUNTIME_PROFILE_PATH) -> K12RuntimeProfile:
+def load_k12_live_runtime_profile(
+        path: str | Path | None = None, *,
+        source_root: str | Path | None = None,
+) -> K12RuntimeProfile:
     """Load only the prospective `/2` profile; there is no `/1` fallback."""
-    return _load_runtime_profile(path, historical=False)
+    root = _resolve_source_root(ROOT if source_root is None else source_root)
+    profile_path = _resolve_artifact_path(
+        path, root=root,
+        relative="benchmarks/minecraft/k12_live_runtime_profile_v2.json",
+        label="K12 live runtime profile", enforce_root=True,
+    )
+    return _load_runtime_profile(
+        profile_path, historical=False, source_root=root,
+    )
 
 
 def load_k12_live_runtime_profile_v1(
-        path: str | Path = HISTORICAL_RUNTIME_PROFILE_PATH, *,
+        path: str | Path | None = None, *,
         source_contract: HistoricalSourceContract | None = None,
         source_root: str | Path | None = None,
         source_reader: Callable[[str], bytes] | HistoricalSourceContract | None = None,
@@ -985,13 +1076,31 @@ def load_k12_live_runtime_profile_v1(
         source_root=source_root, source_reader=source_reader,
         source_contract=source_contract, revision=source_revision,
     )
-    return _load_runtime_profile(path, historical=True, source_contract=contract)
+    root = contract.root if contract.root is not None else ROOT
+    profile_path = _resolve_artifact_path(
+        path, root=root,
+        relative="benchmarks/minecraft/k12_live_runtime_profile_v1.json",
+        label="K12 live runtime profile",
+        enforce_root=contract.root is not None,
+    )
+    return _load_runtime_profile(
+        profile_path, historical=True, source_contract=contract,
+        source_root=root,
+    )
 
 
 def load_k12_live_qualification_manifest(
-        path: str | Path = QUALIFICATION_MANIFEST_PATH) -> dict[str, Any]:
-    value = strict_json_load(Path(path), "K12 live qualification manifest")
-    profile = load_k12_live_runtime_profile()
+        path: str | Path | None = None, *,
+        source_root: str | Path | None = None,
+) -> dict[str, Any]:
+    root = _resolve_source_root(ROOT if source_root is None else source_root)
+    manifest_path = _resolve_artifact_path(
+        path, root=root,
+        relative="configs/minecraft/k12-live-qualification-manifest-v2.json",
+        label="K12 live qualification manifest", enforce_root=True,
+    )
+    value = strict_json_load(manifest_path, "K12 live qualification manifest")
+    profile = load_k12_live_runtime_profile(source_root=root)
     if (value.get("artifact_id") != "minecraft-eac-k12-live-runtime-qualification"
             or value.get("artifact_version") != 2
             or value.get("schema_version") != LIVE_QUALIFICATION_IDENTITY
@@ -1006,7 +1115,7 @@ def load_k12_live_qualification_manifest(
 
 
 def load_k12_live_qualification_manifest_v1(
-        path: str | Path = HISTORICAL_QUALIFICATION_MANIFEST_PATH, *,
+        path: str | Path | None = None, *,
         source_contract: HistoricalSourceContract | None = None,
         source_root: str | Path | None = None,
         source_reader: Callable[[str], bytes] | HistoricalSourceContract | None = None,
@@ -1015,12 +1124,23 @@ def load_k12_live_qualification_manifest_v1(
         source_root=source_root, source_reader=source_reader,
         source_contract=source_contract, revision=source_revision,
     )
+    root = contract.root if contract.root is not None else ROOT
+    manifest_path = _resolve_artifact_path(
+        path, root=root,
+        relative="configs/minecraft/k12-live-qualification-manifest-v1.json",
+        label="historical K12 live qualification manifest",
+        enforce_root=contract.root is not None,
+    )
     value = _historical_json_load(
-        path, source_contract=contract,
+        manifest_path, source_contract=contract,
         relative="configs/minecraft/k12-live-qualification-manifest-v1.json",
         label="historical K12 live qualification manifest",
     )
-    profile = load_k12_live_runtime_profile_v1(source_contract=contract)
+    profile = load_k12_live_runtime_profile_v1(
+        source_contract=contract, path=(
+            root / "benchmarks/minecraft/k12_live_runtime_profile_v1.json"
+        ),
+    )
     if (value.get("artifact_id") != "minecraft-eac-k12-live-runtime-qualification"
             or value.get("artifact_version") != 1
             or value.get("schema_version") != HISTORICAL_QUALIFICATION_IDENTITY

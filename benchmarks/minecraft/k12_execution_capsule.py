@@ -30,6 +30,8 @@ _RAW_SHA256 = re.compile(r"[0-9a-f]{64}")
 _CANONICAL_SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
 LEDGER_IDENTITY = "minecraft-k12-live-execution-ledger/1"
 CAPSULE_IDENTITY = "minecraft-k12-live-execution-capsule/1"
+_LEDGER_HEAD_ANCHOR_ARTIFACT = "minecraft-k12-live-execution-ledger-head-anchor/1"
+_LEDGER_FORMAT_ARTIFACT = "minecraft-k12-live-execution-ledger-format/1"
 
 MINIMUM_CAPSULE_CATEGORIES = frozenset({
     "repo", "interpreter", "stdlib", "import_roots", "distributions", "native", "startup",
@@ -477,6 +479,9 @@ class LedgerStorage:
         self._directory_mode = stat.S_IMODE(directory_stat.st_mode)
         self._fd = -1
         self._name = f"{namespace}-{reservation_id}.ledger"
+        self._anchor_name = f"{self._name}.head"
+        self._format_name = f"{self._name}.format"
+        self._unknown_name = f"{self._name}.durability-unknown"
         self._inode: tuple[int, int] | None = None
         self._claim_path: Path | None = None
         try:
@@ -490,6 +495,8 @@ class LedgerStorage:
                     or stat.S_IMODE(ledger_stat.st_mode) != 0o600):
                 raise CapsuleError("authority_replay")
             self._inode = (ledger_stat.st_dev, ledger_stat.st_ino)
+            if create:
+                self._write_format_marker_locked()
         except BaseException:
             self.close()
             raise
@@ -604,17 +611,73 @@ class LedgerStorage:
             raise CapsuleError("authority_replay")
         current = os.fstat(self._fd)
         directory = os.fstat(self._dir_fd)
-        named = os.stat(self._name, dir_fd=self._dir_fd, follow_symlinks=False)
+        try:
+            named = os.stat(self._name, dir_fd=self._dir_fd, follow_symlinks=False)
+            named_root = os.stat(self.root, follow_symlinks=False)
+        except OSError as exc:
+            raise CapsuleError("authority_replay") from exc
         if ((current.st_dev, current.st_ino) != self._inode
                 or (named.st_dev, named.st_ino) != self._inode
                 or (directory.st_dev, directory.st_ino) != self._directory_inode
+                or (named_root.st_dev, named_root.st_ino) != self._directory_inode
                 or stat.S_IMODE(directory.st_mode) != self._directory_mode
+                or stat.S_IMODE(named_root.st_mode) != self._directory_mode
                 or stat.S_IMODE(directory.st_mode) & 0o077
+                or stat.S_IMODE(named_root.st_mode) & 0o077
                 or current.st_nlink != 1 or named.st_nlink != 1
                 or stat.S_IMODE(current.st_mode) != 0o600
                 or stat.S_IMODE(named.st_mode) != 0o600
                 or not stat.S_ISREG(current.st_mode) or not stat.S_ISREG(named.st_mode)):
             raise CapsuleError("authority_replay")
+        try:
+            anchor = os.stat(self._anchor_name, dir_fd=self._dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise CapsuleError("authority_replay") from exc
+        if (not stat.S_ISREG(anchor.st_mode) or anchor.st_nlink != 1
+                or stat.S_IMODE(anchor.st_mode) != 0o600):
+            raise CapsuleError("authority_replay")
+
+    def _durability_unknown_locked(self) -> bool:
+        self._check_integrity()
+        try:
+            marker = os.stat(self._unknown_name, dir_fd=self._dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise CapsuleError("ledger_durability_unknown") from exc
+        if (not stat.S_ISREG(marker.st_mode) or marker.st_nlink != 1
+                or stat.S_IMODE(marker.st_mode) != 0o600):
+            raise CapsuleError("ledger_durability_unknown")
+        return True
+
+    def _mark_durability_unknown_locked(self) -> None:
+        """Persist an ambiguity marker; presence always fails closed."""
+        self._check_integrity()
+        try:
+            fd = os.open(
+                self._unknown_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=self._dir_fd,
+            )
+        except FileExistsError:
+            return
+        try:
+            marker = canonical_bytes({
+                "artifact": "minecraft-k12-live-execution-ledger-durability-unknown/1",
+            })
+            written = 0
+            while written < len(marker):
+                count = os.write(fd, marker[written:])
+                if count <= 0:
+                    raise OSError("ledger durability marker write made no progress")
+                written += count
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.fsync(self._dir_fd)
 
     @contextmanager
     def locked(self, *, exclusive: bool = False) -> Iterator[None]:
@@ -646,17 +709,199 @@ class LedgerStorage:
         self._check_integrity()
         written = 0
         while written < len(encoded):
-            written += os.write(self._fd, encoded[written:])
+            count = os.write(self._fd, encoded[written:])
+            if count <= 0:
+                raise OSError("ledger write made no progress")
+            written += count
         os.fsync(self._fd)
         os.fsync(self._dir_fd)
 
+    def _read_head_anchor_locked(self) -> Mapping[str, Any] | None:
+        """Read the independently durable ledger high-water mark."""
+        self._check_integrity()
+        try:
+            fd = os.open(
+                self._anchor_name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=self._dir_fd,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise CapsuleError("ledger_corrupt") from exc
+        try:
+            observed_stat = os.fstat(fd)
+            if (not stat.S_ISREG(observed_stat.st_mode)
+                    or observed_stat.st_nlink != 1
+                    or stat.S_IMODE(observed_stat.st_mode) != 0o600):
+                raise CapsuleError("ledger_corrupt")
+            observed_bytes = os.pread(fd, observed_stat.st_size, 0)
+        finally:
+            os.close(fd)
+        try:
+            observed = json.loads(observed_bytes.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise CapsuleError("ledger_corrupt") from exc
+        if (not isinstance(observed, dict)
+                or set(observed) != {
+                    "artifact", "namespace", "reservation_id", "output_root_identity",
+                    "nonce", "root_device", "root_inode", "ordinal", "state",
+                    "head_digest",
+                }
+                or canonical_bytes(observed) != observed_bytes):
+            raise CapsuleError("ledger_corrupt")
+        return observed
+
+    def _format_marker_payload(self) -> dict[str, Any]:
+        return {
+            "artifact": _LEDGER_FORMAT_ARTIFACT,
+            "namespace": self.namespace,
+            "reservation_id": self.reservation_id,
+            "output_root_identity": self.output_root_identity,
+            "nonce": self.nonce,
+            "root_device": self._directory_inode[0],
+            "root_inode": self._directory_inode[1],
+        }
+
+    def _read_format_marker_locked(self) -> Mapping[str, Any] | None:
+        self._check_integrity()
+        try:
+            fd = os.open(
+                self._format_name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=self._dir_fd,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise CapsuleError("ledger_corrupt") from exc
+        try:
+            observed_stat = os.fstat(fd)
+            if (not stat.S_ISREG(observed_stat.st_mode)
+                    or observed_stat.st_nlink != 1
+                    or stat.S_IMODE(observed_stat.st_mode) != 0o600):
+                raise CapsuleError("ledger_corrupt")
+            observed_bytes = os.pread(fd, observed_stat.st_size, 0)
+        finally:
+            os.close(fd)
+        try:
+            observed = json.loads(observed_bytes.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise CapsuleError("ledger_corrupt") from exc
+        expected = self._format_marker_payload()
+        if (
+            not isinstance(observed, dict)
+            or set(observed) != set(expected)
+            or observed != expected
+            or canonical_bytes(observed) != observed_bytes
+        ):
+            raise CapsuleError("ledger_corrupt")
+        return observed
+
+    def _write_format_marker_locked(self) -> None:
+        self._check_integrity()
+        encoded = canonical_bytes(self._format_marker_payload())
+        fd = -1
+        try:
+            fd = os.open(
+                self._format_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=self._dir_fd,
+            )
+            written = 0
+            while written < len(encoded):
+                count = os.write(fd, encoded[written:])
+                if count <= 0:
+                    raise OSError("ledger format marker write made no progress")
+                written += count
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            os.fsync(self._dir_fd)
+        except FileExistsError:
+            self._read_format_marker_locked()
+        except OSError as exc:
+            raise CapsuleError("ledger_durability_unknown") from exc
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def _write_head_anchor_locked(
+            self, *, ordinal: int, state: str, head_digest: str,
+            reservation_id: str, namespace: str, output_root_identity: str,
+            nonce: str,
+    ) -> None:
+        """Atomically publish the durable high-water mark for one append."""
+        self._check_integrity()
+        payload = {
+            "artifact": _LEDGER_HEAD_ANCHOR_ARTIFACT,
+            "namespace": namespace,
+            "reservation_id": reservation_id,
+            "output_root_identity": output_root_identity,
+            "nonce": nonce,
+            "root_device": self._directory_inode[0],
+            "root_inode": self._directory_inode[1],
+            "ordinal": ordinal,
+            "state": state,
+            "head_digest": head_digest,
+        }
+        encoded = canonical_bytes(payload)
+        temporary_name = f".{self._anchor_name}.{secrets.token_hex(16)}.tmp"
+        temporary_fd = -1
+        try:
+            temporary_fd = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=self._dir_fd,
+            )
+            written = 0
+            while written < len(encoded):
+                count = os.write(temporary_fd, encoded[written:])
+                if count <= 0:
+                    raise OSError("ledger anchor write made no progress")
+                written += count
+            os.fsync(temporary_fd)
+            os.close(temporary_fd)
+            temporary_fd = -1
+            os.replace(
+                temporary_name, self._anchor_name,
+                src_dir_fd=self._dir_fd, dst_dir_fd=self._dir_fd,
+            )
+            os.fsync(self._dir_fd)
+        except OSError as exc:
+            raise CapsuleError("ledger_durability_unknown") from exc
+        finally:
+            if temporary_fd >= 0:
+                try:
+                    os.close(temporary_fd)
+                except OSError:
+                    pass
+            try:
+                os.unlink(temporary_name, dir_fd=self._dir_fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # A failed cleanup is itself non-authoritative; the append has
+                # already failed closed and the next integrity check rejects
+                # any unsafe residual anchor state.
+                pass
+
     def bytes(self) -> bytes:
         with self.locked():
+            if self._durability_unknown_locked():
+                raise CapsuleError("ledger_durability_unknown")
             return self._bytes_locked()
 
     def verify_file(self) -> bool:
         try:
             with self.locked():
+                if self._durability_unknown_locked():
+                    return False
                 content = self._bytes_locked()
                 return bool(content.endswith(b"\n"))
         except (OSError, CapsuleError):
@@ -720,6 +965,7 @@ class DurableLedger:
             )
         else:
             self._controller_key_digest: str | None = None
+        self._durability_unknown = False
         self._storage = LedgerStorage(
             root=root, namespace=namespace, reservation_id=reservation_id,
             output_root_identity=output_root_identity, nonce=self.nonce,
@@ -743,13 +989,17 @@ class DurableLedger:
                 self.close()
                 raise
         else:
-            self._append("reserved", {
-                "reservation_id": reservation_id,
-                "namespace": namespace,
-                "output_root_identity": output_root_identity,
-                "nonce": self.nonce,
-                "controller_key_digest": self._controller_key_digest,
-            })
+            try:
+                self._append("reserved", {
+                    "reservation_id": reservation_id,
+                    "namespace": namespace,
+                    "output_root_identity": output_root_identity,
+                    "nonce": self.nonce,
+                    "controller_key_digest": self._controller_key_digest,
+                })
+            except BaseException:
+                self.close()
+                raise
 
     @classmethod
     def create_parent_owned(
@@ -789,6 +1039,12 @@ class DurableLedger:
         worktree_roots: Sequence[str | Path] = (),
         controller_key: bytes | None = None,
     ) -> "DurableLedger":
+        """Reopen an anchored ledger; pre-anchor ledgers are unsupported.
+
+        Recovery deliberately has no generic legacy migration path.  A caller
+        that cannot present the durable anchor must fail closed rather than
+        turning a potentially rewound prefix into a new high-water mark.
+        """
         return cls(root=root, namespace=namespace, reservation_id=reservation_id,
                    output_root_identity=output_root_identity, nonce=nonce,
                    worktree_roots=worktree_roots, _controller_key=controller_key,
@@ -796,17 +1052,22 @@ class DurableLedger:
 
     def _load_existing_locked(self, *, allow_empty: bool = False) -> None:
         try:
+            if self._durability_unknown or self._storage._durability_unknown_locked():
+                raise CapsuleError("ledger_durability_unknown")
             content = self._storage._bytes_locked()
             if not content:
                 if allow_empty:
-                    self._events.clear()
+                    if self._storage._read_head_anchor_locked() is not None:
+                        raise CapsuleError("ledger_corrupt")
+                    self._events = []
                     self._state = None
                     return
                 raise CapsuleError("ledger_corrupt")
             if not content.endswith(b"\n"):
                 raise CapsuleError("ledger_corrupt")
-            self._events.clear()
-            self._state = None
+            events: list[LedgerEvent] = []
+            state: str | None = None
+            controller_key_digest = self._controller_key_digest
             previous = ""
             for line in content.splitlines():
                 observed = json.loads(line)
@@ -816,7 +1077,7 @@ class DurableLedger:
                 unsigned = {key: observed[key] for key in
                             ("ordinal", "previous_digest", "state", "payload")}
                 digest = observed["digest"]
-                if (type(unsigned["ordinal"]) is not int or unsigned["ordinal"] != len(self._events) + 1
+                if (type(unsigned["ordinal"]) is not int or unsigned["ordinal"] != len(events) + 1
                         or unsigned["previous_digest"] != previous
                         or not isinstance(unsigned["state"], str)
                         or not isinstance(unsigned["payload"], dict)
@@ -826,16 +1087,16 @@ class DurableLedger:
                 frozen_payload = _freeze(unsigned["payload"])
                 event = LedgerEvent(unsigned["ordinal"], unsigned["previous_digest"],
                                     unsigned["state"], MappingProxyType(dict(frozen_payload)), digest)
-                if unsigned["state"] not in self.TRANSITIONS.get(self._state, set()):
+                if unsigned["state"] not in self.TRANSITIONS.get(state, set()):
                     raise CapsuleError("ledger_corrupt")
                 if unsigned["ordinal"] == 1:
                     observed_key_digest = unsigned["payload"].get("controller_key_digest")
                     if _RAW_SHA256.fullmatch(observed_key_digest or "") is None:
                         raise CapsuleError("ledger_corrupt")
-                    if self._controller_key_digest is None:
-                        self._controller_key_digest = observed_key_digest
+                    if controller_key_digest is None:
+                        controller_key_digest = observed_key_digest
                     elif not hmac.compare_digest(
-                        self._controller_key_digest, observed_key_digest
+                        controller_key_digest, observed_key_digest
                     ):
                         raise CapsuleError("authority_replay")
                     if (event.state != "reserved" or dict(event.payload) != {
@@ -846,18 +1107,41 @@ class DurableLedger:
                             "controller_key_digest": observed_key_digest,
                         }):
                         raise CapsuleError("ledger_corrupt")
-                self._events.append(event)
-                self._state = event.state
+                events.append(event)
+                state = event.state
                 previous = digest
+            format_marker = self._storage._read_format_marker_locked()
+            anchor = self._storage._read_head_anchor_locked()
+            if anchor is None and format_marker is not None:
+                # A marker proves this ledger was created in the anchored
+                # format; deleting the high-water mark is corruption, not a
+                # legacy upgrade case.  Pre-anchor ledgers are intentionally
+                # incompatible with this fail-closed recovery format.
+                raise CapsuleError("ledger_corrupt")
+            if (anchor is None
+                    or anchor.get("artifact") != _LEDGER_HEAD_ANCHOR_ARTIFACT
+                    or anchor.get("namespace") != self.namespace
+                    or anchor.get("reservation_id") != self.reservation_id
+                    or anchor.get("output_root_identity") != self.output_root_identity
+                    or anchor.get("nonce") != self.nonce
+                    or anchor.get("root_device") != self._storage._directory_inode[0]
+                    or anchor.get("root_inode") != self._storage._directory_inode[1]
+                    or anchor.get("ordinal") != len(events)
+                    or anchor.get("state") != state
+                    or anchor.get("head_digest") != previous):
+                raise CapsuleError("ledger_corrupt")
+            self._events = events
+            self._state = state
+            self._controller_key_digest = controller_key_digest
         except (OSError, TypeError, ValueError, json.JSONDecodeError, CapsuleError) as exc:
             if isinstance(exc, CapsuleError) and exc.reason in {
-                "ledger_corrupt", "authority_replay",
+                "ledger_corrupt", "ledger_durability_unknown", "authority_replay",
             }:
                 raise
             raise CapsuleError("ledger_corrupt") from exc
 
     def _load_existing(self) -> None:
-        with self._storage.locked():
+        with self._storage.locked(exclusive=True):
             self._load_existing_locked()
 
     @property
@@ -871,6 +1155,33 @@ class DurableLedger:
     @property
     def events(self) -> tuple[LedgerEvent, ...]:
         return tuple(self._events)
+
+    def snapshot(self) -> Mapping[str, Any]:
+        """Return one atomically refreshed ledger identity snapshot."""
+        with self._thread_lock:
+            with self._storage.locked():
+                self._load_existing_locked()
+                root = self.root.resolve(strict=True)
+                root_device, root_inode = self._storage._directory_inode
+                return MappingProxyType({
+                    "identity": self.identity,
+                    "root": str(root),
+                    "root_device": root_device,
+                    "root_inode": root_inode,
+                    "root_digest": hashlib.sha256(canonical_bytes({
+                        "artifact": "minecraft-k12-live-execution-ledger-root/1",
+                        "root": str(root),
+                        "root_device": root_device,
+                        "root_inode": root_inode,
+                    })).hexdigest(),
+                    "namespace": self.namespace,
+                    "reservation_id": self.reservation_id,
+                    "output_root_identity": self.output_root_identity,
+                    "nonce": self.nonce,
+                    "state": self._state,
+                    "head_digest": self.head_digest,
+                    "reservation_record_digest": self._events[0].digest,
+                })
 
     @property
     def controller(self) -> "LedgerController":
@@ -892,6 +1203,8 @@ class DurableLedger:
         payload: Mapping[str, Any],
         *,
         _controller_key: bytes | None = None,
+        _expected_state: str | None = None,
+        _expected_head_digest: str | None = None,
     ) -> str:
         with self._thread_lock:
             with self._storage.locked(exclusive=True):
@@ -899,7 +1212,13 @@ class DurableLedger:
                 # stale cache.  Reload and verify the complete chain while the
                 # same interprocess lock remains held through validation,
                 # digest construction, and the append.
-                self._load_existing_locked(allow_empty=not self._events)
+                self._load_existing_locked(
+                    allow_empty=not self._events,
+                )
+                if ((_expected_state is not None and self._state != _expected_state)
+                        or (_expected_head_digest is not None
+                            and self.head_digest != _expected_head_digest)):
+                    raise CapsuleError("authority_replay")
                 if self._state is not None or state_name != "reserved":
                     self._require_controller_key(_controller_key)
                 if state_name not in self.TRANSITIONS.get(self._state, set()):
@@ -917,9 +1236,26 @@ class DurableLedger:
                     "payload": _thaw(frozen_payload),
                 }
                 event_digest = canonical_sha256(unsigned)
-                self._storage._append_bytes_locked(
-                    canonical_bytes({**unsigned, "digest": event_digest}) + b"\n"
-                )
+                try:
+                    self._storage._append_bytes_locked(
+                        canonical_bytes({**unsigned, "digest": event_digest}) + b"\n"
+                    )
+                    self._storage._write_head_anchor_locked(
+                        ordinal=unsigned["ordinal"], state=state_name,
+                        head_digest=event_digest, reservation_id=self.reservation_id,
+                        namespace=self.namespace,
+                        output_root_identity=self.output_root_identity, nonce=self.nonce,
+                    )
+                except BaseException:
+                    try:
+                        self._storage._mark_durability_unknown_locked()
+                    except BaseException:
+                        # The in-memory poison flag below still rejects all
+                        # subsequent reads in this handle even if the marker
+                        # itself cannot be made durable.
+                        pass
+                    self._durability_unknown = True
+                    raise
                 event = LedgerEvent(unsigned["ordinal"], unsigned["previous_digest"], state_name,
                                     MappingProxyType(dict(frozen_payload)), event_digest)
                 self._events.append(event)
@@ -978,6 +1314,20 @@ class DurableLedger:
             raise CapsuleError("invalid ledger payload")
         return self._append("quarantined", payload, _controller_key=_controller_key)
 
+    def quarantine_if_current(
+            self, payload: Mapping[str, Any], *, expected_state: str,
+            expected_head_digest: str, _controller_key: bytes | None = None,
+    ) -> str:
+        if not isinstance(payload, Mapping):
+            raise CapsuleError("invalid ledger payload")
+        if not isinstance(expected_state, str) or not isinstance(expected_head_digest, str):
+            raise CapsuleError("authority_replay")
+        return self._append(
+            "quarantined", payload, _controller_key=_controller_key,
+            _expected_state=expected_state,
+            _expected_head_digest=expected_head_digest,
+        )
+
     def verify_chain(self) -> bool:
         try:
             with self._thread_lock:
@@ -1029,6 +1379,17 @@ class LedgerController:
 
     def quarantine(self, payload: Mapping[str, Any]) -> str:
         return self.ledger.quarantine(payload, _controller_key=self._controller_key)
+
+    def quarantine_if_current(
+            self, payload: Mapping[str, Any], *, expected_state: str,
+            expected_head_digest: str,
+    ) -> str:
+        return self.ledger.quarantine_if_current(
+            payload,
+            expected_state=expected_state,
+            expected_head_digest=expected_head_digest,
+            _controller_key=self._controller_key,
+        )
 
 
 CapsuleLedger = DurableLedger

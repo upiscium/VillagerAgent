@@ -132,6 +132,8 @@ def authority_binding_is_current(
             return False
 
     if isinstance(owner, FinalCellAuthority):
+        if not owner.admission.owns_cell_authority(owner):
+            return False
         if owner.binding != binding or owner.consumed or (
             not owner.runtime_admissible
             and not (allow_injected and binding.origin in injected_origins)
@@ -139,6 +141,8 @@ def authority_binding_is_current(
             return False
         owner = owner.authority
     elif isinstance(owner, FinalCampaignAdmission):
+        if not owner.is_parent_owned():
+            return False
         if owner.binding != binding or (
             not owner.runtime_admissible
             and not (allow_injected and binding.origin in injected_origins)

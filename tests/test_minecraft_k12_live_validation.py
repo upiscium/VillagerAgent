@@ -16,7 +16,10 @@ from benchmarks.minecraft.k12_execution_provenance import (
 )
 from benchmarks.minecraft.k12_live_validation import *
 from benchmarks.minecraft.k12_live_containment import Descendant, LiveContainment, MockContainmentIO, parse_observation
-from benchmarks.minecraft.k12_guarded_backend import K12AuthenticatedProfile
+from benchmarks.minecraft.k12_guarded_backend import (
+    K12AuthenticatedProfile,
+    authority_binding_is_current,
+)
 from benchmarks.minecraft.k12_live_qualification import (MockCellQualificationEvidence,
     LiveQualificationCellEvidence, LiveQualificationProbeEvidence, MockProbeEvidence,
     LIVE_QUALIFICATION_PROVENANCE, PROBES, aggregate_live_qualification, qualification_ids,
@@ -77,9 +80,10 @@ def _rejection_states(active, profile, campaign, cell, reset_token):
 
 
 @pytest.fixture
-def launched_graph(tmp_path):
+def launched_graph(tmp_path, request):
     helpers = pytest.importorskip("test_minecraft_k12_authority_e2e")
-    graph = helpers._build_graph(tmp_path, "validation-containment")
+    suffix = "evidence" if "evidence" in request.node.name else "containment"
+    graph = helpers._build_graph(tmp_path, f"validation-{suffix}")
     graph.cell_authority.consume_for_launch()
     graph.cell_authority.complete(graph.cell_evidence)
     try:
@@ -99,6 +103,40 @@ def test_containment_validation_requires_empty_cgroup_and_events_zero(launched_g
         parse_observation(MockContainmentIO((show,),descendants=((),),
             cgroup_sources=(("/cg",(),1),)),"u","/cg",
             cell_authority=launched_graph.cell_authority)
+    admission = launched_graph.admission
+    assert admission.is_parent_owned() is True
+    object.__setattr__(admission, "campaign_id", "forged-campaign")
+    assert admission.is_parent_owned() is False
+    assert admission.runtime_admissible is False
+
+
+def test_final_cell_evidence_requires_explicit_terminal_and_fresh_root_proof(launched_graph):
+    admission = launched_graph.admission
+    values = {
+        "cell_id": FINAL_SCHEDULE[0],
+        "profile_digest": launched_graph.profile.profile_digest,
+        "campaign_id": launched_graph.final_campaign,
+        "phase": FINAL_PHASE,
+        "manifest_identity": launched_graph.manifest.manifest_identity,
+        "manifest_digest": launched_graph.manifest.manifest_digest,
+        "common_closure_digest": admission.common_closure_digest,
+        "evidence_digest": "f" * 64,
+        "authority_binding": admission.binding,
+        "evidence_origin": INJECTED_FAKE_ORIGIN,
+    }
+    with pytest.raises(ValueError, match="complete final cell evidence"):
+        FinalCellEvidence(**values)
+
+    values.update({"terminal_verified": True})
+    with pytest.raises(ValueError, match="complete final cell evidence"):
+        FinalCellEvidence.from_mapping(values)
+
+    original_issued = set(admission._state.issued)
+    admission._state.issued.clear()
+    assert admission.is_parent_owned() is False
+    admission._state.issued.update(original_issued)
+    assert admission.is_parent_owned() is True
+
 
 def test_non_final_artifacts_fail_launch_gate():
     assert not final_launch_gate({"cohort_kind":"qualification", "schedule_count":15})
@@ -142,6 +180,17 @@ def test_final_schedule_and_manifest_are_phase_specific():
         FinalCampaignManifest(
             "qualification", "minecraft-eac-k12-live-runtime-qualification/2",
             "a" * 64, FINAL_SCHEDULE,
+        )
+    with pytest.raises(ValueError, match="closure digest"):
+        FinalCampaignManifest(
+            FINAL_PHASE,
+            FINAL_RANDOMIZATION_MANIFEST_IDENTITY,
+            FINAL_RANDOMIZATION_MANIFEST_DIGEST,
+            FINAL_SCHEDULE,
+            "a" * 64,
+            FINAL_FIXTURE_MANIFEST_DIGEST,
+            FINAL_RANDOMIZATION_MANIFEST_DIGEST,
+            RUNTIME_VERIFIED_ORIGIN,
         )
 
 
@@ -360,6 +409,12 @@ def test_injected_controller_mints_typed_final_scope_but_not_runtime_scope(tmp_p
         )
         assert active_final.origin == INJECTED_FAKE_ORIGIN
         assert not active_final.runtime_admissible
+        copied_final = object.__new__(type(active_final))
+        for name in ("authority", "activation_digest", "binding", "ownership_token"):
+            object.__setattr__(copied_final, name, getattr(active_final, name))
+        assert not copied_final.current_at()
+        assert not injected.validate_current_authority(copied_final)
+        assert not authority_binding_is_current(copied_final, copied_final.binding)
         manifest = FinalCampaignManifest(
             FINAL_PHASE,
             "injected-final-manifest",
@@ -376,10 +431,36 @@ def test_injected_controller_mints_typed_final_scope_but_not_runtime_scope(tmp_p
         )
         assert admission.evidence_origin == INJECTED_FAKE_ORIGIN
         assert not admission.runtime_admissible
+        original_manifest_digest = manifest.manifest_digest
+        object.__setattr__(manifest, "manifest_digest", "f" * 64)
+        assert not admission.is_parent_owned()
+        object.__setattr__(manifest, "manifest_digest", original_manifest_digest)
+        assert admission.is_parent_owned()
+        original_schedule = manifest.schedule
+        object.__setattr__(manifest, "schedule", list(original_schedule))
+        assert not admission.is_parent_owned()
+        object.__setattr__(manifest, "schedule", original_schedule)
+        assert admission.is_parent_owned()
+        with pytest.raises(ProvenanceError, match="authority_replay"):
+            admit_final_campaign(
+                copied_final,
+                aggregate.semantic_attestation,
+                manifest=manifest,
+                campaign_id="copied-final-authority",
+                evidence_origin=INJECTED_FAKE_ORIGIN,
+            )
         with pytest.raises(ProvenanceError, match="final_schedule_order"):
             admission.issue_cell(FINAL_SCHEDULE[1])
         cell_authority = admission.issue_cell(FINAL_SCHEDULE[0])
         second_authority = admission.issue_cell(FINAL_SCHEDULE[1])
+        copied_cell = object.__new__(type(cell_authority))
+        for name in ("admission", "cell_id", "ordinal", "authority_binding", "identity"):
+            object.__setattr__(copied_cell, name, getattr(cell_authority, name))
+        assert not authority_binding_is_current(copied_cell, copied_cell.binding)
+        original_cell_identity = cell_authority.identity
+        object.__setattr__(cell_authority, "identity", "sha256:" + "f" * 64)
+        assert not authority_binding_is_current(cell_authority, cell_authority.binding)
+        object.__setattr__(cell_authority, "identity", original_cell_identity)
         cell = FinalCellEvidence(
             cell_id=FINAL_SCHEDULE[0],
             profile_digest=profile.profile_digest,
@@ -390,8 +471,15 @@ def test_injected_controller_mints_typed_final_scope_but_not_runtime_scope(tmp_p
             common_closure_digest=admission.common_closure_digest,
             evidence_digest="d" * 64,
             authority_binding=admission.binding,
+            terminal_verified=True,
             evidence_origin=INJECTED_FAKE_ORIGIN,
+            fresh_root=True,
         )
+        original_evidence_digest = cell.evidence_digest
+        object.__setattr__(cell, "evidence_digest", "f" * 64)
+        assert cell.validate_integrity() is False
+        object.__setattr__(cell, "evidence_digest", original_evidence_digest)
+        assert cell.validate_integrity() is True
         second_cell = FinalCellEvidence(
             cell_id=FINAL_SCHEDULE[1],
             profile_digest=profile.profile_digest,
@@ -402,7 +490,9 @@ def test_injected_controller_mints_typed_final_scope_but_not_runtime_scope(tmp_p
             common_closure_digest=admission.common_closure_digest,
             evidence_digest="e" * 64,
             authority_binding=admission.binding,
+            terminal_verified=True,
             evidence_origin=INJECTED_FAKE_ORIGIN,
+            fresh_root=True,
         )
         with pytest.raises(ProvenanceError, match="final_cell_launch_required"):
             cell_authority.complete(cell)
