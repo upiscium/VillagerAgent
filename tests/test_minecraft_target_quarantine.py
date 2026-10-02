@@ -7,7 +7,11 @@ from benchmarks.minecraft.target_quarantine import main
 def test_status_reports_absent_and_persistent_quarantine(tmp_path, capsys):
     args = _base_args(tmp_path)
     assert main(["status", *args]) == 0
-    assert json.loads(capsys.readouterr().out)["quarantined"] is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["quarantined"] is False
+    assert payload["uncertain"] is False
+    assert payload["actively_owned"] is False
+    assert payload["blocking"] is False
 
     lock = _lock(tmp_path).acquire()
     lock.quarantine(
@@ -20,7 +24,60 @@ def test_status_reports_absent_and_persistent_quarantine(tmp_path, capsys):
     assert main(["status", *args]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["quarantined"] is True
+    assert payload["uncertain"] is False
+    assert payload["actively_owned"] is False
+    assert payload["blocking"] is True
     assert payload["metadata"]["attempt_id"] == "attempt-a"
+
+
+def test_status_reports_marker_only_as_blocking_uncertainty(tmp_path, capsys):
+    lock = _lock(tmp_path)
+    lock.path.parent.mkdir(parents=True)
+    lock.path.with_suffix(".uncertain").write_text(json.dumps({
+        "schema_version": 1,
+        "status": "uncertain",
+        "attempt_id": "attempt-marker",
+        "error_type": "OSError",
+        "error": "simulated uncertain outcome",
+    }), encoding="utf-8")
+
+    assert main(["status", *_base_args(tmp_path)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["metadata"] == {}
+    assert payload["quarantined"] is True
+    assert payload["uncertain"] is True
+    assert payload["actively_owned"] is False
+    assert payload["uncertainty"]["valid"] is True
+    assert payload["blocking"] is True
+
+
+def test_status_reports_corrupt_marker_as_blocking_uncertainty(tmp_path, capsys):
+    lock = _lock(tmp_path)
+    lock.path.parent.mkdir(parents=True)
+    lock.path.with_suffix(".uncertain").write_text("{", encoding="utf-8")
+
+    assert main(["status", *_base_args(tmp_path)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["metadata"] == {}
+    assert payload["quarantined"] is True
+    assert payload["uncertain"] is True
+    assert payload["uncertainty"]["present"] is True
+    assert payload["uncertainty"]["valid"] is False
+    assert payload["blocking"] is True
+
+
+def test_status_reports_active_owner_as_blocking_not_uncertain(tmp_path, capsys):
+    owner = _lock(tmp_path).acquire()
+    try:
+        assert main(["status", *_base_args(tmp_path)]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["metadata"]["attempt_id"] == "attempt-a"
+        assert payload["quarantined"] is False
+        assert payload["uncertain"] is False
+        assert payload["actively_owned"] is True
+        assert payload["blocking"] is True
+    finally:
+        owner.release()
 
 
 def test_clear_requires_acknowledgement(tmp_path, capsys):
@@ -76,6 +133,13 @@ def test_clear_records_reason_and_allows_new_owner(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "cleared"
     assert payload["clear_reason"] == "Verified cleanup"
+    assert main(["status", *_base_args(tmp_path)]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["metadata"]["status"] == "cleared"
+    assert status["quarantined"] is False
+    assert status["uncertain"] is False
+    assert status["actively_owned"] is False
+    assert status["blocking"] is False
     replacement = MinecraftTargetLock(
         lock_root=tmp_path / "locks",
         host="127.0.0.1",

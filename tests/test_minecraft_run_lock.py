@@ -13,12 +13,15 @@ from benchmarks.minecraft.run_lock import (
     MinecraftTargetLockBusyError,
     MinecraftTargetLockError,
     MinecraftTargetLockMetadataError,
+    MinecraftTargetLockReleaseOutcome,
+    MinecraftTargetLockReleaseStatus,
     MinecraftTargetLockUnavailableError,
     MinecraftTargetLeaseSnapshot,
     MinecraftTargetQuarantinedError,
     clear_minecraft_target_quarantine,
     minecraft_target_lock_key,
     read_minecraft_target_lock_metadata,
+    read_minecraft_target_lock_status,
 )
 
 
@@ -116,7 +119,19 @@ def test_retained_lease_snapshot_surfaces_path_inode_drift(tmp_path):
             os.lstat(lock.path).st_ino,
         )
     finally:
-        lock.release()
+        outcome = lock.release()
+        assert outcome.status is MinecraftTargetLockReleaseStatus.UNCERTAIN
+        assert outcome.uncertainty_persisted is True
+        status = read_minecraft_target_lock_status(
+            lock_root=lock.lock_root,
+            host=lock.host,
+            port=lock.port,
+        )
+        assert status["quarantined"] is True
+        assert status["uncertain"] is True
+        with pytest.raises(MinecraftTargetLockUnavailableError) as raised:
+            _lock(tmp_path, "attempt-after-inode-drift").acquire()
+        assert raised.value.reason == "uncertain"
         if lock.path.exists():
             lock.path.unlink()
 
@@ -128,7 +143,9 @@ def test_retained_lease_snapshot_fails_for_missing_path(tmp_path):
         with pytest.raises(MinecraftTargetLockUnavailableError):
             lock.retained_lease_snapshot()
     finally:
-        lock.release()
+        outcome = lock.release()
+        assert outcome.status is MinecraftTargetLockReleaseStatus.UNCERTAIN
+        assert outcome.uncertainty_persisted is True
 
 
 def test_retained_lease_snapshot_fails_for_closed_retained_stream(tmp_path):
@@ -193,6 +210,50 @@ def test_retained_lease_snapshot_classifies_unrepresentable_owner_pid(tmp_path):
     finally:
         lock.path.write_text(original_content, encoding="utf-8")
         lock.release()
+
+
+def test_acquire_classifies_unrepresentable_stale_owner_pid(tmp_path, monkeypatch):
+    lock = _lock(tmp_path, "attempt-new-owner")
+    lock.path.parent.mkdir(parents=True)
+    lock.path.write_text(json.dumps({
+        "schema_version": 2,
+        "status": "acquired",
+        "lock_key": lock.key,
+        "host": lock.host,
+        "port": lock.port,
+        "world_id": lock.world_id,
+        "pid": 1 << 100,
+        "attempt_id": "attempt-old-owner",
+        "acquired_at": 1.0,
+        "stale_owner_detected": False,
+    }), encoding="utf-8")
+
+    def overflow_pid(_pid, _signal):
+        raise OverflowError("pid is outside the platform range")
+
+    monkeypatch.setattr("benchmarks.minecraft.run_lock.os.kill", overflow_pid)
+    with pytest.raises(MinecraftTargetLockMetadataError, match="owner pid"):
+        lock.acquire()
+
+    assert lock.acquired is False
+    assert lock._stream is None
+
+
+@pytest.mark.parametrize("dangling", [False, True])
+def test_metadata_reader_rejects_lock_path_symlinks(tmp_path, dangling):
+    lock = _lock(tmp_path, f"attempt-symlink-reader-{dangling}")
+    lock.path.parent.mkdir(parents=True)
+    target = tmp_path / "other-lock-metadata"
+    if not dangling:
+        target.write_text("{}", encoding="utf-8")
+    lock.path.symlink_to(target)
+
+    with pytest.raises(MinecraftTargetLockMetadataError, match="regular file"):
+        read_minecraft_target_lock_metadata(
+            lock_root=lock.lock_root,
+            host=lock.host,
+            port=lock.port,
+        )
 
 
 def test_retained_lease_snapshot_observes_quarantined_state_and_freezes_metadata(tmp_path):
@@ -271,7 +332,8 @@ def test_retained_lease_snapshot_lstats_symlink_without_following(tmp_path):
     finally:
         if lock.path.is_symlink():
             lock.path.unlink()
-        lock.release()
+        outcome = lock.release()
+        assert outcome.status is MinecraftTargetLockReleaseStatus.UNCERTAIN
 
 
 def test_retained_lease_snapshot_accepts_legacy_metadata_after_compatibility_migration(tmp_path):
@@ -320,6 +382,445 @@ def test_same_minecraft_target_rejects_second_owner(tmp_path):
         assert contender._stream is None
     finally:
         first.release()
+
+
+def test_repeated_acquire_on_same_instance_preserves_existing_flock(tmp_path):
+    owner = _lock(tmp_path, "attempt-repeated-acquire").acquire()
+    retained_stream = owner._stream
+    contender = _lock(tmp_path, "attempt-repeated-contender")
+    try:
+        with pytest.raises(MinecraftTargetLockError, match="already retains a lease"):
+            owner.acquire()
+        assert owner.acquired is True
+        assert owner._stream is retained_stream
+        owner.retained_lease_snapshot()
+        with pytest.raises(MinecraftTargetLockBusyError):
+            contender.acquire()
+    finally:
+        assert owner.release().status is MinecraftTargetLockReleaseStatus.VERIFIED_RELEASED
+
+    with contender:
+        assert contender.acquired is True
+
+
+def test_lifecycle_guard_is_reentrant_and_serializes_same_target_release(tmp_path):
+    owner = _lock(tmp_path, "attempt-owner").acquire()
+    same_target = _lock(tmp_path, "attempt-other")
+    guard_entered = threading.Event()
+    allow_guard_exit = threading.Event()
+    release_started = threading.Event()
+    release_finished = threading.Event()
+    release_result = []
+
+    def hold_guard():
+        with same_target.lifecycle_guard():
+            with owner.lifecycle_guard():
+                guard_entered.set()
+                assert allow_guard_exit.wait(2)
+
+    def release_owner():
+        release_started.set()
+        release_result.append(owner.release())
+        release_finished.set()
+
+    guard_thread = threading.Thread(target=hold_guard)
+    guard_thread.start()
+    assert guard_entered.wait(1)
+    release_thread = threading.Thread(target=release_owner)
+    release_thread.start()
+    try:
+        assert release_started.wait(1)
+        assert not release_finished.wait(0.05)
+    finally:
+        allow_guard_exit.set()
+        guard_thread.join(timeout=1)
+        release_thread.join(timeout=1)
+
+    assert release_finished.is_set()
+    assert release_result[0].status is MinecraftTargetLockReleaseStatus.VERIFIED_RELEASED
+
+
+@pytest.mark.parametrize("operation_name", ["acquire", "snapshot", "quarantine", "release"])
+def test_all_public_lifecycle_operations_honor_same_guard(tmp_path, operation_name):
+    owner = _lock(tmp_path, f"attempt-{operation_name}-owner").acquire()
+    contender = _lock(tmp_path, f"attempt-{operation_name}-contender")
+    started = threading.Event()
+    finished = threading.Event()
+    errors = []
+
+    def operation():
+        started.set()
+        try:
+            if operation_name == "acquire":
+                try:
+                    contender.acquire()
+                except MinecraftTargetLockBusyError:
+                    pass
+            elif operation_name == "snapshot":
+                owner.retained_lease_snapshot()
+            elif operation_name == "quarantine":
+                owner.quarantine(
+                    run_name="guard-run",
+                    reasons=["guard-test"],
+                    diagnostics={},
+                )
+            else:
+                owner.release()
+        except Exception as exc:  # Surface worker-thread failures in the test thread.
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=operation)
+    try:
+        with owner.lifecycle_guard():
+            thread.start()
+            assert started.wait(1)
+            assert not finished.wait(0.05)
+        thread.join(timeout=1)
+        assert finished.is_set()
+        assert not errors
+    finally:
+        if thread.is_alive():
+            thread.join(timeout=1)
+        if owner.acquired:
+            owner.release()
+        if contender.acquired:
+            contender.release()
+
+
+def test_acknowledged_clear_waits_for_same_target_lifecycle_guard(tmp_path):
+    quarantined = _lock(tmp_path, "attempt-clear-guard").acquire()
+    quarantined.quarantine(
+        run_name="clear-guard-run",
+        reasons=["operator-check"],
+        diagnostics={},
+    )
+    quarantined.release()
+    guard_owner = _lock(tmp_path, "attempt-clear-guard-guard")
+    started = threading.Event()
+    finished = threading.Event()
+    result = []
+
+    def clear():
+        started.set()
+        result.append(clear_minecraft_target_quarantine(
+            lock_root=guard_owner.lock_root,
+            host=guard_owner.host,
+            port=guard_owner.port,
+            reason="Target safely inspected",
+            acknowledge_target_safe=True,
+        ))
+        finished.set()
+
+    thread = threading.Thread(target=clear)
+    with guard_owner.lifecycle_guard():
+        thread.start()
+        assert started.wait(1)
+        assert not finished.wait(0.05)
+    thread.join(timeout=1)
+
+    assert finished.is_set()
+    assert result[0]["status"] == "cleared"
+    replacement = _lock(tmp_path, "attempt-after-clear-guard").acquire()
+    replacement.release()
+
+
+def test_uncertainty_clear_requires_target_safe_acknowledgement(tmp_path):
+    lock = _lock(tmp_path, "attempt-uncertainty-clear-ack")
+    lock.lock_root.mkdir(parents=True)
+    marker = lock.path.with_suffix(".uncertain")
+    marker.write_text("corrupt marker", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="acknowledge_target_safe"):
+        clear_minecraft_target_quarantine(
+            lock_root=lock.lock_root,
+            host=lock.host,
+            port=lock.port,
+            reason="Target inspected",
+            acknowledge_target_safe=False,
+        )
+
+    assert marker.exists()
+    assert read_minecraft_target_lock_status(
+        lock_root=lock.lock_root,
+        host=lock.host,
+        port=lock.port,
+    )["blocking"] is True
+
+
+def test_poll_interval_constructor_semantics_remain_unvalidated(tmp_path):
+    lock = MinecraftTargetLock(
+        lock_root=tmp_path / "locks",
+        host="127.0.0.1",
+        port=25565,
+        world_id="world-a",
+        attempt_id="attempt-negative-poll",
+        poll_interval_seconds=-0.25,
+    )
+
+    assert lock.poll_interval_seconds == -0.25
+    assert lock.release().status is MinecraftTargetLockReleaseStatus.NOT_ACQUIRED
+
+
+def test_invalid_poll_sleep_closes_contender_stream_without_constructor_policy_change(
+    tmp_path,
+):
+    owner = _lock(tmp_path, "attempt-poll-owner").acquire()
+    contender = MinecraftTargetLock(
+        lock_root=tmp_path / "locks",
+        host="127.0.0.1",
+        port=25565,
+        world_id="world-a",
+        attempt_id="attempt-poll-contender",
+        timeout_seconds=1,
+        poll_interval_seconds=-0.25,
+    )
+    try:
+        with pytest.raises(ValueError):
+            contender.acquire()
+        assert contender.acquired is False
+        assert contender._stream is None
+        assert owner.acquired is True
+    finally:
+        owner.release()
+
+
+def test_release_returns_and_remembers_explicit_outcomes(tmp_path):
+    unacquired = _lock(tmp_path, "attempt-not-acquired")
+    not_acquired = unacquired.release()
+    assert isinstance(not_acquired, MinecraftTargetLockReleaseOutcome)
+    assert not_acquired.status is MinecraftTargetLockReleaseStatus.NOT_ACQUIRED
+    assert unacquired.last_release_outcome is not_acquired
+
+    acquired = _lock(tmp_path, "attempt-released").acquire()
+    released = acquired.release()
+    assert released.status is MinecraftTargetLockReleaseStatus.VERIFIED_RELEASED
+    assert released.verified_released is True
+    assert acquired.last_release_outcome is released
+    assert not acquired.path.with_suffix(".uncertain").exists()
+
+
+def test_release_metadata_failure_persists_uncertainty_and_blocks_admission(
+    tmp_path,
+    monkeypatch,
+):
+    lock = _lock(tmp_path, "attempt-metadata-failure").acquire()
+
+    def fail_metadata_write(_payload):
+        raise OSError("simulated metadata fsync failure")
+
+    monkeypatch.setattr(lock, "_write_metadata", fail_metadata_write)
+    outcome = lock.release()
+
+    marker = lock.path.with_suffix(".uncertain")
+    assert outcome.status is MinecraftTargetLockReleaseStatus.UNCERTAIN
+    assert outcome.uncertainty_persisted is True
+    assert lock.last_release_outcome is outcome
+    assert json.loads(marker.read_text(encoding="utf-8"))["status"] == "uncertain"
+    with pytest.raises(MinecraftTargetLockUnavailableError) as raised:
+        _lock(tmp_path, "attempt-after-uncertainty").acquire()
+    assert raised.value.reason == "uncertain"
+
+
+def test_release_retains_flock_when_uncertainty_cannot_be_persisted(
+    tmp_path,
+    monkeypatch,
+):
+    lock = _lock(tmp_path, "attempt-unpersistable-uncertainty").acquire()
+
+    def fail_metadata_write(_payload):
+        raise OSError("simulated metadata failure")
+
+    monkeypatch.setattr(lock, "_write_metadata", fail_metadata_write)
+    monkeypatch.setattr(
+        "benchmarks.minecraft.run_lock._persist_uncertainty_marker",
+        lambda *_args, **_kwargs: False,
+    )
+    outcome = lock.release()
+    assert outcome.status is MinecraftTargetLockReleaseStatus.FAILED
+    assert outcome.uncertainty_persisted is False
+    assert lock.acquired is True
+    assert lock._stream is not None
+    with pytest.raises(MinecraftTargetLockBusyError):
+        _lock(tmp_path, "attempt-contender").acquire()
+
+    monkeypatch.undo()
+    assert lock.release().status is MinecraftTargetLockReleaseStatus.VERIFIED_RELEASED
+
+
+def test_directory_fsync_failure_is_not_reported_as_durable_uncertainty(
+    tmp_path,
+    monkeypatch,
+):
+    lock = _lock(tmp_path, "attempt-marker-fsync-failure").acquire()
+
+    def fail_metadata_write(_payload):
+        raise OSError("simulated release metadata failure")
+
+    def fail_directory_fsync(_path):
+        raise OSError("simulated parent directory fsync failure")
+
+    monkeypatch.setattr(lock, "_write_metadata", fail_metadata_write)
+    monkeypatch.setattr(
+        "benchmarks.minecraft.run_lock._fsync_parent_directory",
+        fail_directory_fsync,
+    )
+    outcome = lock.release()
+
+    assert outcome.status is MinecraftTargetLockReleaseStatus.FAILED
+    assert outcome.uncertainty_persisted is False
+    assert outcome.verified_released is False
+    assert lock.acquired is True
+    assert lock.path.with_suffix(".uncertain").exists()
+    status = read_minecraft_target_lock_status(
+        lock_root=lock.lock_root,
+        host=lock.host,
+        port=lock.port,
+    )
+    assert status["quarantined"] is True
+    assert status["uncertain"] is True
+
+    monkeypatch.undo()
+    retried = lock.release()
+    assert retried.status is MinecraftTargetLockReleaseStatus.UNCERTAIN
+    assert retried.uncertainty_persisted is True
+
+
+def test_context_manager_cleanup_failure_does_not_mask_runtime_exception(
+    tmp_path,
+    monkeypatch,
+):
+    lock = _lock(tmp_path, "attempt-context-release-failure")
+
+    def fail_metadata_write(_payload):
+        raise OSError("simulated release write failure")
+
+    with pytest.raises(RuntimeError, match="runtime failure"):
+        with lock:
+            monkeypatch.setattr(lock, "_write_metadata", fail_metadata_write)
+            monkeypatch.setattr(
+                "benchmarks.minecraft.run_lock._persist_uncertainty_marker",
+                lambda *_args, **_kwargs: False,
+            )
+            raise RuntimeError("runtime failure")
+
+    assert lock.last_release_outcome.status is MinecraftTargetLockReleaseStatus.FAILED
+    assert lock.acquired is True
+    monkeypatch.undo()
+    assert lock.release().status is MinecraftTargetLockReleaseStatus.VERIFIED_RELEASED
+
+
+def test_context_manager_exposes_unverified_release_result_after_normal_exit(
+    tmp_path,
+    monkeypatch,
+):
+    lock = _lock(tmp_path, "attempt-context-normal-release-failure")
+
+    def fail_metadata_write(_payload):
+        raise OSError("simulated release metadata failure")
+
+    with lock:
+        monkeypatch.setattr(lock, "_write_metadata", fail_metadata_write)
+        monkeypatch.setattr(
+            "benchmarks.minecraft.run_lock._persist_uncertainty_marker",
+            lambda *_args, **_kwargs: False,
+        )
+
+    assert lock.last_release_outcome.status is MinecraftTargetLockReleaseStatus.FAILED
+    assert lock.last_release_outcome.uncertainty_persisted is False
+    assert lock.acquired is True
+    monkeypatch.undo()
+    assert lock.release().status is MinecraftTargetLockReleaseStatus.VERIFIED_RELEASED
+
+
+@pytest.mark.parametrize("marker_content", ["{", "[]", '{"status":"released"}'])
+def test_any_present_uncertainty_marker_blocks_acquire_and_status_reports_it(
+    tmp_path,
+    marker_content,
+):
+    lock = _lock(tmp_path, "attempt-marker")
+    lock.path.parent.mkdir(parents=True, exist_ok=True)
+    marker = lock.path.with_suffix(".uncertain")
+    marker.write_text(marker_content, encoding="utf-8")
+
+    status = read_minecraft_target_lock_status(
+        lock_root=lock.lock_root,
+        host=lock.host,
+        port=lock.port,
+    )
+    assert status["metadata"] == {}
+    assert status["quarantined"] is True
+    assert status["uncertain"] is True
+    assert status["actively_owned"] is False
+    assert status["uncertainty"]["present"] is True
+    assert status["uncertainty"]["valid"] is False
+    assert status["blocking"] is True
+    with pytest.raises(MinecraftTargetLockUnavailableError) as raised:
+        lock.acquire()
+    assert raised.value.reason == "uncertain"
+
+
+def test_symlink_uncertainty_marker_blocks_acquire(tmp_path):
+    lock = _lock(tmp_path, "attempt-symlink-marker")
+    lock.path.parent.mkdir(parents=True, exist_ok=True)
+    marker = lock.path.with_suffix(".uncertain")
+    marker.symlink_to(tmp_path / "missing-marker-target")
+
+    status = read_minecraft_target_lock_status(
+        lock_root=lock.lock_root,
+        host=lock.host,
+        port=lock.port,
+    )
+    assert status["uncertain"] is True
+    assert status["uncertainty"]["kind"] == "symlink"
+    with pytest.raises(MinecraftTargetLockUnavailableError) as raised:
+        lock.acquire()
+    assert raised.value.reason == "uncertain"
+
+
+def test_status_reports_an_actively_owned_target(tmp_path):
+    owner = _lock(tmp_path, "attempt-active").acquire()
+    try:
+        status = read_minecraft_target_lock_status(
+            lock_root=owner.lock_root,
+            host=owner.host,
+            port=owner.port,
+        )
+        assert status["metadata"]["attempt_id"] == "attempt-active"
+        assert status["actively_owned"] is True
+        assert status["uncertain"] is False
+    finally:
+        owner.release()
+
+
+def test_acknowledged_clear_removes_quarantine_and_uncertainty_marker(tmp_path):
+    owner = _lock(tmp_path, "attempt-quarantine-clear").acquire()
+    owner.quarantine(
+        run_name="run-a",
+        reasons=["cleanup_incomplete"],
+        diagnostics={"safe": False},
+    )
+    owner.release()
+    marker = owner.path.with_suffix(".uncertain")
+    marker.write_text("corrupt marker", encoding="utf-8")
+
+    cleared = clear_minecraft_target_quarantine(
+        lock_root=owner.lock_root,
+        host=owner.host,
+        port=owner.port,
+        reason="Target safety verified",
+        acknowledge_target_safe=True,
+    )
+
+    assert cleared["status"] == "cleared"
+    assert cleared["last_quarantine"]["attempt_id"] == "attempt-quarantine-clear"
+    assert not os.path.lexists(marker)
+    assert read_minecraft_target_lock_status(
+        lock_root=owner.lock_root,
+        host=owner.host,
+        port=owner.port,
+    )["uncertain"] is False
 
 
 @pytest.mark.parametrize("content", ["", "{", "[]", '{"status": "acquired"}'])
@@ -392,12 +893,16 @@ def test_different_minecraft_targets_can_be_locked(tmp_path):
 
 
 def test_lock_is_released_after_context_failure(tmp_path):
+    lock = _lock(tmp_path, "attempt-a")
     with pytest.raises(RuntimeError, match="child failed"):
-        with _lock(tmp_path, "attempt-a"):
+        with lock:
             raise RuntimeError("child failed")
+    assert lock.last_release_outcome.status is MinecraftTargetLockReleaseStatus.VERIFIED_RELEASED
 
-    with _lock(tmp_path, "attempt-b") as replacement:
+    replacement = _lock(tmp_path, "attempt-b")
+    with replacement:
         assert replacement.acquired is True
+    assert replacement.last_release_outcome.status is MinecraftTargetLockReleaseStatus.VERIFIED_RELEASED
 
 
 def test_unlocked_dead_owner_metadata_is_detected_as_stale(tmp_path):
