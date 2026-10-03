@@ -125,6 +125,8 @@ class MinecraftTargetLock:
         self.acquired = False
         self.quarantined = False
         self.quarantine_record = None
+        self._quarantine_persistence_failed = False
+        self._quarantine_persistence_error: BaseException | None = None
         self.stale_owner_detected = False
         self._stream = None
         self._lease_identity: tuple[int, int] | None = None
@@ -140,6 +142,8 @@ class MinecraftTargetLock:
             self.last_release_outcome = None
             self.quarantined = False
             self.quarantine_record = None
+            self._quarantine_persistence_failed = False
+            self._quarantine_persistence_error = None
             self.stale_owner_detected = False
             try:
                 self.lock_root.mkdir(parents=True, exist_ok=True)
@@ -289,13 +293,22 @@ class MinecraftTargetLock:
             }
             try:
                 self._write_metadata(record)
-            except Exception as exc:
-                _persist_uncertainty_marker(
-                    self.lock_root / f"{self.key}.uncertain",
-                    attempt_id=self.attempt_id,
-                    error_type=type(exc).__name__,
-                    error=str(exc),
-                )
+            except BaseException as exc:
+                # Cleanup must never turn an unrecorded quarantine request into
+                # a verified ordinary release, even if storage later recovers.
+                self._quarantine_persistence_failed = True
+                self._quarantine_persistence_error = exc
+                try:
+                    _persist_uncertainty_marker(
+                        self.lock_root / f"{self.key}.uncertain",
+                        attempt_id=self.attempt_id,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                except BaseException:
+                    # The failed quarantine write remains the primary error.
+                    # release() retries the marker before letting go of flock.
+                    pass
                 raise
             self.quarantined = True
             self.quarantine_record = record
@@ -309,6 +322,17 @@ class MinecraftTargetLock:
                 )
                 self.last_release_outcome = outcome
                 return outcome
+
+            if self._quarantine_persistence_failed:
+                failure = self._quarantine_persistence_error
+                if failure is None:
+                    failure = MinecraftTargetLockError(
+                        "Minecraft target quarantine persistence was not verified"
+                    )
+                # Retain the lease even if persistence is interrupted before
+                # _failed_release can record a typed outcome.
+                _UNVERIFIED_RELEASE_LOCKS[id(self)] = self
+                return self._failed_release(failure)
 
             try:
                 _verify_retained_identity(self._stream, self.path, self._lease_identity)
@@ -396,7 +420,7 @@ class MinecraftTargetLock:
             self.last_release_outcome = outcome
             return outcome
 
-    def _failed_release(self, exc: Exception) -> MinecraftTargetLockReleaseOutcome:
+    def _failed_release(self, exc: BaseException) -> MinecraftTargetLockReleaseOutcome:
         if self._stream is not None:
             try:
                 # Re-establish an exclusive hold if failure occurred after an
@@ -407,12 +431,15 @@ class MinecraftTargetLock:
             except Exception:
                 pass
         marker = self.lock_root / f"{self.key}.uncertain"
-        uncertainty_persisted = _persist_uncertainty_marker(
-            marker,
-            attempt_id=self.attempt_id,
-            error_type=type(exc).__name__,
-            error=str(exc),
-        )
+        try:
+            uncertainty_persisted = _persist_uncertainty_marker(
+                marker,
+                attempt_id=self.attempt_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+        except BaseException:
+            uncertainty_persisted = False
         if not uncertainty_persisted:
             _UNVERIFIED_RELEASE_LOCKS[id(self)] = self
             outcome = MinecraftTargetLockReleaseOutcome(

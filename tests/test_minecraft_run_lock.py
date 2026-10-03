@@ -8,6 +8,7 @@ from dataclasses import FrozenInstanceError, fields
 
 import pytest
 
+import benchmarks.minecraft.run_lock as run_lock_module
 from benchmarks.minecraft.run_lock import (
     MinecraftTargetLock,
     MinecraftTargetLockBusyError,
@@ -621,6 +622,188 @@ def test_release_metadata_failure_persists_uncertainty_and_blocks_admission(
     with pytest.raises(MinecraftTargetLockUnavailableError) as raised:
         _lock(tmp_path, "attempt-after-uncertainty").acquire()
     assert raised.value.reason == "uncertain"
+
+
+@pytest.mark.parametrize("write_failure", [OSError, KeyboardInterrupt])
+@pytest.mark.parametrize("first_marker_result", ["non_durable", "durable", "raises"])
+def test_failed_quarantine_cannot_become_verified_release_on_context_exit(
+    tmp_path, monkeypatch, write_failure, first_marker_result,
+):
+    lock = _lock(tmp_path, "attempt-failed-quarantine")
+    real_write = lock._write_metadata
+    real_persist = run_lock_module._persist_uncertainty_marker
+    writes = []
+    marker_attempts = []
+
+    def write_with_one_shot_failure(payload):
+        writes.append(payload["status"])
+        if payload["status"] == "quarantined":
+            raise write_failure("quarantine metadata write failed")
+        return real_write(payload)
+
+    def persist_with_one_shot_failure(*args, **kwargs):
+        marker_attempts.append(kwargs["error_type"])
+        if len(marker_attempts) == 1:
+            if first_marker_result == "non_durable":
+                return False
+            if first_marker_result == "raises":
+                raise OSError("uncertainty marker could not be persisted")
+        return real_persist(*args, **kwargs)
+
+    with pytest.raises(write_failure, match="quarantine metadata write failed"):
+        with lock:
+            monkeypatch.setattr(lock, "_write_metadata", write_with_one_shot_failure)
+            monkeypatch.setattr(
+                run_lock_module, "_persist_uncertainty_marker",
+                persist_with_one_shot_failure,
+            )
+            lock.quarantine(
+                run_name="unsafe-run",
+                reasons=["cleanup_unverified"],
+                diagnostics={},
+            )
+
+    assert writes == ["quarantined"]
+    assert len(marker_attempts) == 2
+    assert lock.last_release_outcome.status is MinecraftTargetLockReleaseStatus.UNCERTAIN
+    assert lock.last_release_outcome.uncertainty_persisted is True
+    assert lock.last_release_outcome.error_type == write_failure.__name__
+    assert lock.last_release_outcome.error == "quarantine metadata write failed"
+    marker = lock.path.with_suffix(".uncertain")
+    marker_metadata = json.loads(marker.read_text(encoding="utf-8"))
+    assert marker_metadata["status"] == "uncertain"
+    assert marker_metadata["error_type"] == write_failure.__name__
+    assert read_minecraft_target_lock_status(
+        lock_root=lock.lock_root, host=lock.host, port=lock.port,
+    )["blocking"] is True
+    contender = _lock(tmp_path, "attempt-after-failed-quarantine")
+    with pytest.raises(MinecraftTargetLockUnavailableError) as raised:
+        contender.acquire()
+    assert raised.value.reason == "uncertain"
+
+    with pytest.raises(ValueError, match="acknowledge_target_safe"):
+        clear_minecraft_target_quarantine(
+            lock_root=lock.lock_root, host=lock.host, port=lock.port,
+            reason="Target examined", acknowledge_target_safe=False,
+        )
+    clear_minecraft_target_quarantine(
+        lock_root=lock.lock_root, host=lock.host, port=lock.port,
+        reason="Target examined and safe", acknowledge_target_safe=True,
+    )
+    assert not marker.exists()
+    with contender:
+        assert contender.acquired is True
+
+
+def test_direct_release_retains_failed_quarantine_when_marker_is_not_durable(
+    tmp_path, monkeypatch,
+):
+    lock = _lock(tmp_path, "attempt-failed-direct-quarantine").acquire()
+    real_write = lock._write_metadata
+    real_persist = run_lock_module._persist_uncertainty_marker
+    marker_attempts = []
+
+    def write_with_one_shot_failure(payload):
+        if payload["status"] == "quarantined":
+            raise OSError("quarantine metadata write failed")
+        return real_write(payload)
+
+    def persist_with_temporary_failure(*args, **kwargs):
+        marker_attempts.append(kwargs["error_type"])
+        if len(marker_attempts) <= 2:
+            return False
+        return real_persist(*args, **kwargs)
+
+    monkeypatch.setattr(lock, "_write_metadata", write_with_one_shot_failure)
+    monkeypatch.setattr(
+        run_lock_module, "_persist_uncertainty_marker", persist_with_temporary_failure,
+    )
+    with pytest.raises(OSError, match="quarantine metadata write failed"):
+        lock.quarantine(
+            run_name="unsafe-run", reasons=["cleanup_unverified"], diagnostics={},
+        )
+
+    outcome = lock.release()
+    assert outcome.status is MinecraftTargetLockReleaseStatus.FAILED
+    assert outcome.uncertainty_persisted is False
+    assert outcome.error_type == "OSError"
+    assert outcome.error == "quarantine metadata write failed"
+    assert len(marker_attempts) == 2
+    assert lock.acquired is True
+    assert lock._stream is not None
+    contender = _lock(tmp_path, "attempt-while-failed-quarantine-is-held")
+    with pytest.raises(MinecraftTargetLockBusyError):
+        contender.acquire()
+
+    outcome = lock.release()
+    assert outcome.status is MinecraftTargetLockReleaseStatus.UNCERTAIN
+    assert outcome.uncertainty_persisted is True
+    assert len(marker_attempts) == 3
+    marker_metadata = json.loads(lock.path.with_suffix(".uncertain").read_text(encoding="utf-8"))
+    assert marker_metadata["error_type"] == "OSError"
+    assert marker_metadata["error"] == "quarantine metadata write failed"
+    with pytest.raises(MinecraftTargetLockUnavailableError) as raised:
+        contender.acquire()
+    assert raised.value.reason == "uncertain"
+    clear_minecraft_target_quarantine(
+        lock_root=lock.lock_root, host=lock.host, port=lock.port,
+        reason="Target examined and safe", acknowledge_target_safe=True,
+    )
+    with contender:
+        assert contender.acquired is True
+
+
+@pytest.mark.parametrize("retry_failure", [OSError, KeyboardInterrupt])
+def test_quarantine_marker_retry_exception_keeps_original_and_retains_flock(
+    tmp_path, monkeypatch, retry_failure,
+):
+    lock = _lock(tmp_path, "attempt-marker-retry-interrupted")
+    real_write = lock._write_metadata
+    marker_attempts = []
+
+    def fail_quarantine_write(payload):
+        if payload["status"] == "quarantined":
+            raise OSError("original quarantine write failure")
+        return real_write(payload)
+
+    def fail_both_marker_attempts(*args, **kwargs):
+        marker_attempts.append(kwargs["error_type"])
+        if len(marker_attempts) == 1:
+            return False
+        raise retry_failure("marker retry interrupted")
+
+    with pytest.raises(OSError, match="original quarantine write failure"):
+        with lock:
+            monkeypatch.setattr(lock, "_write_metadata", fail_quarantine_write)
+            monkeypatch.setattr(
+                run_lock_module, "_persist_uncertainty_marker", fail_both_marker_attempts,
+            )
+            lock.quarantine(
+                run_name="unsafe-run", reasons=["cleanup_unverified"], diagnostics={},
+            )
+
+    assert marker_attempts == ["OSError", "OSError"]
+    assert lock.last_release_outcome.status is MinecraftTargetLockReleaseStatus.FAILED
+    assert lock.last_release_outcome.error_type == "OSError"
+    assert lock.last_release_outcome.error == "original quarantine write failure"
+    assert lock.last_release_outcome.uncertainty_persisted is False
+    assert lock.acquired is True
+    assert run_lock_module._UNVERIFIED_RELEASE_LOCKS[id(lock)] is lock
+    contender = _lock(tmp_path, "attempt-while-retry-interrupted")
+    with pytest.raises(MinecraftTargetLockBusyError):
+        contender.acquire()
+
+    monkeypatch.undo()
+    assert lock.release().status is MinecraftTargetLockReleaseStatus.UNCERTAIN
+    with pytest.raises(MinecraftTargetLockUnavailableError) as raised:
+        contender.acquire()
+    assert raised.value.reason == "uncertain"
+    clear_minecraft_target_quarantine(
+        lock_root=lock.lock_root, host=lock.host, port=lock.port,
+        reason="Target examined and safe", acknowledge_target_safe=True,
+    )
+    with contender:
+        assert contender.acquired is True
 
 
 def test_release_retains_flock_when_uncertainty_cannot_be_persisted(
