@@ -10,15 +10,22 @@ from langchain_core.callbacks.manager import CallbackManager
 from langchain_core.outputs import LLMResult
 
 import json
+import hashlib
+import hmac
 import requests
 import subprocess
 import logging
 import datetime
 import threading
+from collections.abc import Mapping
 from copy import deepcopy
 from functools import wraps
+from math import floor, isfinite
+from pathlib import Path
+from types import MappingProxyType
 import os
 import random
+import secrets
 import re
 import platform
 from urllib.parse import urlsplit
@@ -162,6 +169,398 @@ DEFAULT_BRIDGE_KILL_GRACE_SECONDS = 1.0
 BRIDGE_CLEANUP_PROCESS_DIAGNOSTIC_LIMIT = 64
 DEFAULT_MOVEMENT_CANCEL_CONNECT_TIMEOUT_SECONDS = 0.5
 DEFAULT_MOVEMENT_CANCEL_READ_TIMEOUT_SECONDS = 2.0
+
+K11_REQUEST_SCHEMA = "minecraft-k11-visible-block-snapshot/1"
+K11_SENSOR_ID = "minecraft-k11-fixed-passive-sensor/1"
+K11_GEOMETRY_ID = "minecraft-k11-360-supercover-5x3x5/1"
+K11_GEOMETRY = {
+    "id": K11_GEOMETRY_ID,
+    "offsets": {"x": [-2, 2], "y": [-1, 1], "z": [-2, 2]},
+    "max_steps": 16,
+    "eye": "entity.position+eyeHeight",
+    "los": "3d-supercover/1",
+}
+K11_REQUEST_KEYS = frozenset({
+    "schema", "run_id", "window_id", "actor_id", "tick_index", "nonce",
+    "sensor_id", "sensor_digest", "profile_digest", "ingestion_digest",
+    "geometry_id", "geometry_digest", "request_hmac",
+})
+K11_RESPONSE_BINDING_FIELDS = (
+    "run_id", "window_id", "actor_id", "tick_index", "nonce", "sensor_id",
+    "sensor_digest", "profile_digest", "ingestion_digest", "geometry_id", "geometry_digest",
+)
+K11_RESPONSE_KEYS = frozenset({
+    *K11_RESPONSE_BINDING_FIELDS, "bridge_id", "capture_seq",
+    "capture_started_monotonic_ns", "capture_ended_monotonic_ns", "pose", "eye",
+    "cells", "cell_payload_digest", "complete", "truncated", "error",
+    "request_digest", "hmac_sha256",
+})
+K11_EXPECTED_OFFSETS = tuple(
+    {"x": x, "y": y, "z": z}
+    for x in range(-2, 3) for y in range(-1, 2) for z in range(-2, 3)
+)
+K11_UNKNOWN_REASONS = frozenset({
+    "unloaded_target", "unloaded_path", "occluded", "outside_region", "invalid_pose",
+    "step_limit", "incoherent_capture", "unmapped_registry",
+})
+K11_IMPLEMENTATION_PATHS = frozenset({
+    "env/k11_visible_block_capture.js",
+    "env/minecraft_server_fast.py",
+    "env/minecraft_client.py",
+    "benchmarks/minecraft/k11_hold_evidence.py",
+    "benchmarks/minecraft/eac_runtime.py",
+    "benchmarks/minecraft/k11_hold_protocol.py",
+    "benchmarks/minecraft/k11_hold_trace.py",
+})
+K11_SENSOR_KEY_MAX_BYTES = 256
+
+
+def canonical_bytes(value):
+    """Import K11 canonicalization lazily so default v1 clients stay independent."""
+    from benchmarks.minecraft.k11_hold_protocol import snapshot_canonical_bytes
+    return snapshot_canonical_bytes(value)
+
+
+def _k11_sha256(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _k11_valid_identifier(value) -> bool:
+    return isinstance(value, str) and 1 <= len(value) <= 128 and bool(
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]*", value)
+    )
+
+
+def _k11_source_seal(root: Path | None = None):
+    """Verify detached v2 artifacts and their exact seven-file manifest."""
+    root = Path(root) if root is not None else Path(__file__).resolve().parents[1]
+    docs = root / "docs" / "eac"
+    try:
+        profile = json.loads((docs / "minecraft_source_profile_v2.json").read_text(encoding="utf-8"))
+        contract = json.loads((docs / "minecraft_ingestion_contract_v2.json").read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError) as exc:
+        raise RuntimeError("K11 sensor artifacts are unavailable") from exc
+    if (not isinstance(profile, dict) or profile.get("profile_version") != 2
+            or not isinstance(contract, dict) or contract.get("artifact_version") != 2
+            or isinstance(contract.get("implementation_manifest_version"), bool)
+            or contract.get("implementation_manifest_version") != 1):
+        raise RuntimeError("K11 sensor artifacts are invalid")
+    detached_profile = dict(profile)
+    profile_digest = detached_profile.pop("detached_profile_sha256", None)
+    detached_contract = dict(contract)
+    ingestion_digest = detached_contract.pop("detached_artifact_sha256", None)
+    if (not isinstance(profile_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", profile_digest)
+            or profile_digest != _k11_sha256(canonical_bytes(detached_profile))
+            or not isinstance(ingestion_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", ingestion_digest)
+            or ingestion_digest != _k11_sha256(canonical_bytes(detached_contract))):
+        raise RuntimeError("K11 sensor artifact authentication failed")
+    integrity = profile.get("integrity_contract")
+    if (not isinstance(integrity, dict)
+            or integrity.get("canonical_content_sha256") != ingestion_digest
+            or integrity.get("rule_evaluation_contract_sha256")
+            != _k11_sha256(canonical_bytes(contract.get("rule_evaluation")))):
+        raise RuntimeError("K11 sensor profile binding is invalid")
+    manifest = contract.get("implementation_manifest")
+    if (not isinstance(manifest, dict) or set(manifest) != K11_IMPLEMENTATION_PATHS
+            or any(not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                   for digest in manifest.values())):
+        raise RuntimeError("K11 implementation manifest is invalid")
+    for relative_path, declared_digest in manifest.items():
+        try:
+            observed_digest = _k11_sha256((root / relative_path).read_bytes())
+        except OSError as exc:
+            raise RuntimeError("K11 implementation source is unavailable") from exc
+        if observed_digest != declared_digest:
+            raise RuntimeError("K11 implementation source digest mismatch")
+    adapter = contract.get("trusted_observation_adapter")
+    if (not isinstance(adapter, dict)
+            or adapter.get("implementation_path") != "benchmarks/minecraft/k11_hold_evidence.py"
+            or adapter.get("implementation_sha256")
+            != manifest["benchmarks/minecraft/k11_hold_evidence.py"]
+            or adapter.get("sensor_implementation_path") != "env/k11_visible_block_capture.js"
+            or adapter.get("sensor_implementation_sha256")
+            != manifest["env/k11_visible_block_capture.js"]):
+        raise RuntimeError("K11 adapter source binding is invalid")
+    return manifest["env/k11_visible_block_capture.js"], profile_digest, ingestion_digest
+
+
+def _k11_artifact_digests():
+    _sensor_digest, profile_digest, ingestion_digest = _k11_source_seal()
+    return profile_digest, ingestion_digest
+
+
+def _k11_spawn_with_sensor_key(command, child, secret, run_id):
+    """Pass a per-bridge key through a short-lived inherited pipe, never text args/env."""
+    read_fd = write_fd = None
+    try:
+        child_env = child.get("env")
+        if not isinstance(child_env, dict):
+            raise RuntimeError("K11 child environment is unavailable")
+        for name in ("K11_SENSOR_KEY_HEX", "K11_SENSOR_KEY_FD", "K11_SENSOR_RUN_ID"):
+            child_env.pop(name, None)
+        if secret is not None:
+            if (not isinstance(secret, bytes) or not 32 <= len(secret) <= K11_SENSOR_KEY_MAX_BYTES
+                    or not _k11_valid_identifier(run_id)):
+                raise ValueError("invalid K11 sensor credential")
+            read_fd, write_fd = os.pipe()
+            remaining = memoryview(secret)
+            while remaining:
+                written = os.write(write_fd, remaining)
+                if written <= 0:
+                    raise OSError("K11 sensor credential pipe write failed")
+                remaining = remaining[written:]
+            os.close(write_fd)
+            write_fd = None
+            child_env["K11_SENSOR_KEY_FD"] = str(read_fd)
+            child_env["K11_SENSOR_RUN_ID"] = run_id
+            existing_fds = child.get("pass_fds", ())
+            if existing_fds is None:
+                existing_fds = ()
+            child["pass_fds"] = tuple(dict.fromkeys((*existing_fds, read_fd)))
+        return subprocess.Popen(command, shell=False, **child)
+    finally:
+        for descriptor in (write_fd, read_fd):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
+def _k11_finite_number_string(value):
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if isfinite(number) else None
+
+
+def _k11_integer_position(value):
+    return (
+        isinstance(value, dict) and set(value) == {"x", "y", "z"}
+        and all(isinstance(value[axis], int) and not isinstance(value[axis], bool)
+                for axis in ("x", "y", "z"))
+    )
+
+
+def _k11_expected_supercover(origin, target):
+    """Mirror the fixed 3-D supercover to bind response proofs to ray geometry."""
+    current = {axis: floor(origin[axis]) for axis in ("x", "y", "z")}
+    start = dict(current)
+    goal = {axis: target[axis] for axis in ("x", "y", "z")}
+    delta = {axis: target[axis] + 0.5 - origin[axis] for axis in ("x", "y", "z")}
+    step = {axis: (1 if delta[axis] > 0 else -1 if delta[axis] < 0 else 0)
+            for axis in ("x", "y", "z")}
+    t_delta = {}
+    t_max = {}
+    for axis in ("x", "y", "z"):
+        if step[axis] == 0:
+            t_delta[axis] = float("inf")
+            t_max[axis] = float("inf")
+        else:
+            t_delta[axis] = abs(1 / delta[axis])
+            boundary = current[axis] + 1 if step[axis] > 0 else current[axis]
+            t_max[axis] = (boundary - origin[axis]) / delta[axis]
+
+    path = []
+    seen = set()
+
+    def add_touched(position):
+        if position == start:
+            return True
+        key = tuple(position[axis] for axis in ("x", "y", "z"))
+        if key in seen:
+            return True
+        path.append(position)
+        seen.add(key)
+        return 1 + len(path) <= 16
+
+    boundary_axes = [axis for axis in ("x", "y", "z") if origin[axis].is_integer()]
+    for mask in range(1, 1 << len(boundary_axes)):
+        touched = dict(current)
+        for bit, axis in enumerate(boundary_axes):
+            if mask & (1 << bit):
+                touched[axis] -= 1
+        if not add_touched(touched):
+            return None
+    while current != goal:
+        next_t = min(t_max.values())
+        axes = [axis for axis in ("x", "y", "z")
+                if abs(t_max[axis] - next_t) <= 1e-12]
+        if not axes or not isfinite(next_t):
+            return None
+        for mask in range(1, 1 << len(axes)):
+            touched = dict(current)
+            for bit, axis in enumerate(axes):
+                if mask & (1 << bit):
+                    touched[axis] += step[axis]
+            if not add_touched(touched):
+                return None
+        for axis in axes:
+            current[axis] += step[axis]
+            t_max[axis] += t_delta[axis]
+    return path
+
+
+def _k11_valid_registry_proof(value):
+    return (
+        isinstance(value, dict) and set(value) == {"position", "registry_id", "block_name"}
+        and _k11_integer_position(value.get("position"))
+        and isinstance(value.get("registry_id"), int)
+        and not isinstance(value.get("registry_id"), bool)
+        and value["registry_id"] >= 0
+        and isinstance(value.get("block_name"), str)
+        and bool(re.fullmatch(r"[a-z0-9_]+", value["block_name"]))
+    )
+
+
+def _k11_verify_capture_response(response_payload, request_payload, secret):
+    def invalid():
+        raise ValueError("invalid K11 response")
+
+    if not isinstance(response_payload, dict) or set(response_payload) != K11_RESPONSE_KEYS:
+        invalid()
+    for field in K11_RESPONSE_BINDING_FIELDS:
+        if response_payload.get(field) != request_payload.get(field):
+            raise ValueError("K11 response identity mismatch")
+    if (not isinstance(response_payload.get("bridge_id"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", response_payload["bridge_id"])):
+        invalid()
+    seq = response_payload.get("capture_seq")
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+        invalid()
+    started = response_payload.get("capture_started_monotonic_ns")
+    ended = response_payload.get("capture_ended_monotonic_ns")
+    if (not isinstance(started, str) or len(started) > 32 or not re.fullmatch(r"[0-9]+", started)
+            or not isinstance(ended, str) or len(ended) > 32
+            or not re.fullmatch(r"[0-9]+", ended) or int(ended) < int(started)):
+        invalid()
+
+    complete = response_payload.get("complete")
+    truncated = response_payload.get("truncated")
+    error = response_payload.get("error")
+    if (not isinstance(complete, bool) or not isinstance(truncated, bool)
+            or (error is not None and (not isinstance(error, str)
+                or error not in {"invalid_pose", "unloaded_path", "incoherent_capture"}))
+            or (complete and (truncated or error is not None))
+            or (not complete and not truncated and error is None)):
+        invalid()
+    pose = response_payload.get("pose")
+    eye = response_payload.get("eye")
+    if pose is None or eye is None:
+        if pose is not None or eye is not None:
+            invalid()
+        pose_values = eye_values = None
+        foot = eye_voxel = None
+    else:
+        if (not isinstance(pose, dict) or set(pose) != {"x", "y", "z"}
+                or not isinstance(eye, dict) or set(eye) != {"x", "y", "z", "eye_height"}):
+            invalid()
+        pose_values = {axis: _k11_finite_number_string(pose[axis]) for axis in ("x", "y", "z")}
+        eye_values = {axis: _k11_finite_number_string(eye[axis]) for axis in ("x", "y", "z")}
+        eye_height = _k11_finite_number_string(eye["eye_height"])
+        if (any(value is None for value in pose_values.values())
+                or any(value is None for value in eye_values.values())
+                or eye_height is None or eye_height <= 0
+                or not isfinite(pose_values["y"] + eye_height)
+                or abs(eye_values["x"] - pose_values["x"]) > 1e-12
+                or abs(eye_values["y"] - (pose_values["y"] + eye_height)) > 1e-12
+                or abs(eye_values["z"] - pose_values["z"]) > 1e-12):
+            invalid()
+        foot = {axis: floor(pose_values[axis]) for axis in ("x", "y", "z")}
+        eye_voxel = {axis: floor(eye_values[axis]) for axis in ("x", "y", "z")}
+    if complete and (pose_values is None or eye_values is None):
+        invalid()
+
+    cells = response_payload.get("cells")
+    if not isinstance(cells, list) or len(cells) != len(K11_EXPECTED_OFFSETS):
+        invalid()
+    air_names = {"air", "cave_air", "void_air"}
+    for cell, expected_offset in zip(cells, K11_EXPECTED_OFFSETS):
+        if (not isinstance(cell, dict) or not _k11_integer_position(cell.get("offset"))
+                or cell["offset"] != expected_offset):
+            invalid()
+        expected_position = (
+            {axis: foot[axis] + expected_offset[axis] for axis in ("x", "y", "z")}
+            if foot is not None else None
+        )
+        position = cell.get("position")
+        if expected_position is None:
+            if position is not None:
+                invalid()
+        elif not _k11_integer_position(position) or position != expected_position:
+            invalid()
+        state = cell.get("state")
+        if state == "unknown":
+            if (set(cell) != {"offset", "position", "state", "unknown_reason"}
+                    or not isinstance(cell.get("unknown_reason"), str)
+                    or cell.get("unknown_reason") not in K11_UNKNOWN_REASONS):
+                invalid()
+            continue
+        if not isinstance(state, str) or state not in {"known_air", "known_non_air"}:
+            invalid()
+        if (pose_values is None or set(cell) != {
+                "offset", "position", "state", "registry_id", "block_name", "coverage",
+        } or isinstance(cell.get("registry_id"), bool)
+                or not isinstance(cell.get("registry_id"), int) or cell["registry_id"] < 0
+                or not isinstance(cell.get("block_name"), str)
+                or not re.fullmatch(r"[a-z0-9_]+", cell["block_name"])):
+            invalid()
+        is_air = cell["block_name"] in air_names
+        if (state == "known_air") != is_air or position == eye_voxel:
+            invalid()
+        coverage = cell.get("coverage")
+        if (not isinstance(coverage, dict) or set(coverage) != {"eye_loaded", "target_loaded", "path"}
+                or not isinstance(coverage.get("path"), list)
+                or len(coverage["path"]) > 15):
+            invalid()
+        eye_proof = coverage.get("eye_loaded")
+        target_proof = coverage.get("target_loaded")
+        if (not _k11_valid_registry_proof(eye_proof)
+                or eye_proof["position"] != eye_voxel
+                or eye_proof["block_name"] not in air_names
+                or not _k11_valid_registry_proof(target_proof)
+                or target_proof["position"] != position
+                or target_proof["registry_id"] != cell["registry_id"]
+                or target_proof["block_name"] != cell["block_name"]):
+            invalid()
+        expected_path = _k11_expected_supercover(eye_values, position)
+        if expected_path is None:
+            invalid()
+        expected_proofs = [
+            point for point in expected_path if point not in (eye_voxel, position)
+        ]
+        proof_positions = set()
+        for step in coverage["path"]:
+            if (not _k11_valid_registry_proof(step) or step["block_name"] not in air_names
+                    or step["position"] in (eye_voxel, position)):
+                invalid()
+            key = tuple(step["position"][axis] for axis in ("x", "y", "z"))
+            if key in proof_positions:
+                invalid()
+            proof_positions.add(key)
+        if [step["position"] for step in coverage["path"]] != expected_proofs:
+            invalid()
+
+    try:
+        if response_payload.get("request_digest") != _k11_sha256(canonical_bytes(request_payload)):
+            raise ValueError("K11 response request digest mismatch")
+        if response_payload.get("cell_payload_digest") != _k11_sha256(canonical_bytes(cells)):
+            raise ValueError("K11 response cell digest mismatch")
+        signature = response_payload.get("hmac_sha256")
+        unsigned = {key: value for key, value in response_payload.items() if key != "hmac_sha256"}
+        expected = hmac.new(secret, canonical_bytes(unsigned), hashlib.sha256).hexdigest()
+    except (TypeError, OverflowError) as exc:
+        raise ValueError("invalid K11 response") from exc
+    if not isinstance(signature, str) or not hmac.compare_digest(signature, expected):
+        raise ValueError("K11 response authentication failed")
+    if (complete is not True or truncated is not False or error is not None
+            or pose is None or eye is None):
+        raise ValueError("K11 capture is incomplete")
+    return response_payload
 
 
 def _request_monotonic_ns() -> int:
@@ -596,6 +995,8 @@ class Agent():
     _bridge_diagnostic_recorders: dict[str, BoundedDiagnosticRecorder] = {}
     _bridge_diagnostic_lock = threading.Lock()
     last_bridge_diagnostics: dict | None = None
+    k11_sensor_keys_by_actor: dict[str, bytes] = {}
+    k11_sensor_run_id: str | None = None
 
     @classmethod
     def _caller_diagnostic_recorder(cls, actor_name: str | None):
@@ -962,6 +1363,60 @@ class Agent():
         url = Agent.get_agent_url(self.name) + "/post_environment"
         response = _minecraft_request("POST", url, headers=Agent.headers)
         return str(response.json())
+
+    def capture_k11_visible_block_region(self, *, window_id: str, tick_index: int,
+                                         nonce: str | None = None):
+        """Request one supervised passive snapshot; this is not an agent tool."""
+        actor_id = self.name
+        if not _k11_valid_identifier(actor_id) or not _k11_valid_identifier(window_id):
+            raise ValueError("invalid K11 capture identity")
+        if isinstance(tick_index, bool) or not isinstance(tick_index, int) or tick_index < 0:
+            raise ValueError("invalid K11 tick index")
+        if nonce is None:
+            nonce = secrets.token_hex(16)
+        if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce):
+            raise ValueError("invalid K11 nonce")
+        if Agent.bridge_entrypoint_by_name.get(actor_id) != "bridge_fast":
+            raise RuntimeError("K11 passive sensing requires a fast bridge")
+        secret = Agent.k11_sensor_keys_by_actor.get(actor_id)
+        run_id = Agent.k11_sensor_run_id
+        if (not isinstance(secret, bytes) or not 32 <= len(secret) <= K11_SENSOR_KEY_MAX_BYTES
+                or not _k11_valid_identifier(run_id)):
+            raise RuntimeError("K11 sensor authentication is not configured")
+
+        sensor_digest, profile_digest, ingestion_digest = _k11_source_seal()
+        geometry_digest = _k11_sha256(canonical_bytes(K11_GEOMETRY))
+        payload = {
+            "schema": K11_REQUEST_SCHEMA,
+            "run_id": run_id,
+            "window_id": window_id,
+            "actor_id": actor_id,
+            "tick_index": tick_index,
+            "nonce": nonce,
+            "sensor_id": K11_SENSOR_ID,
+            "sensor_digest": sensor_digest,
+            "profile_digest": profile_digest,
+            "ingestion_digest": ingestion_digest,
+            "geometry_id": K11_GEOMETRY_ID,
+            "geometry_digest": geometry_digest,
+        }
+        payload["request_hmac"] = hmac.new(
+            secret, canonical_bytes(payload), hashlib.sha256,
+        ).hexdigest()
+        response = _minecraft_request(
+            "POST", Agent.get_agent_url(actor_id) + "/post_k11_visible_block_region_v1",
+            data=canonical_bytes(payload), headers=Agent.headers,
+            timeout=(0.1, 0.35),
+        )
+        content = getattr(response, "content", b"")
+        if (not isinstance(content, (bytes, bytearray)) or len(content) > 64 * 1024
+                or not 200 <= getattr(response, "status_code", 0) < 300):
+            raise ValueError("K11 sensor request was rejected")
+        try:
+            result = response.json()
+        except Exception as exc:
+            raise ValueError("K11 sensor response is invalid") from exc
+        return _k11_verify_capture_response(result, payload, secret)
     
     def get_environment_info_dict(player_name: str):
         """Get the Environment Information, return string contains time of day, weather"""
@@ -1016,7 +1471,30 @@ class Agent():
             return {'message': 'Exception', 'status': False}
 
     @staticmethod
-    def launch(host="10.21.31.18", port=25565, world="world", verbose=False, ignore_name=[], debug=False, fast=False, runtime_paths: RuntimePaths | None = None, runtime_execution=None):
+    def launch(host="10.21.31.18", port=25565, world="world", verbose=False, ignore_name=[], debug=False, fast=False, runtime_paths: RuntimePaths | None = None, runtime_execution=None, k11_sensor_keys: Mapping[str, bytes] | None = None, k11_sensor_run_id: str | None = None):
+        configured_k11 = k11_sensor_keys is not None or k11_sensor_run_id is not None
+        if configured_k11 and not fast:
+            raise ValueError("K11 sensor credentials are supported only by the fast bridge")
+        if configured_k11:
+            if (not isinstance(k11_sensor_keys, Mapping) or not k11_sensor_keys
+                    or not _k11_valid_identifier(k11_sensor_run_id)):
+                raise ValueError("K11 sensor credentials require actor keys and a run ID")
+            launch_sensor_keys = MappingProxyType(dict(k11_sensor_keys))
+            if any(
+                not _k11_valid_identifier(actor) or actor not in Agent.name2port
+                or not isinstance(secret, bytes)
+                or not 32 <= len(secret) <= K11_SENSOR_KEY_MAX_BYTES
+                for actor, secret in launch_sensor_keys.items()
+            ) or len(set(launch_sensor_keys.values())) != len(launch_sensor_keys):
+                raise ValueError("invalid K11 actor credential mapping")
+            launch_sensor_run_id = k11_sensor_run_id
+            Agent.k11_sensor_keys_by_actor = dict(launch_sensor_keys)
+            Agent.k11_sensor_run_id = k11_sensor_run_id
+        else:
+            launch_sensor_keys = MappingProxyType({})
+            launch_sensor_run_id = None
+            Agent.k11_sensor_keys_by_actor = {}
+            Agent.k11_sensor_run_id = None
         Agent.port = port
         Agent.last_bridge_cleanup = None
         Agent.last_bridge_diagnostics = None
@@ -1035,8 +1513,13 @@ class Agent():
                     "-W", world, "-D", str(debug))
             command = runtime_execution.python_command(entrypoint, *args)
             child = runtime_execution.child_kwargs(runtime_paths, base=env)
+            # Keep launch credentials local to this immutable launch snapshot.
+            secret = launch_sensor_keys.get(key) if fast else None
             try:
-                process = subprocess.Popen(command, shell=False, **child)
+                process = _k11_spawn_with_sensor_key(
+                    command, child, secret,
+                    launch_sensor_run_id if secret is not None else None,
+                )
             except BaseException as error:
                 Agent.record_bridge_diagnostic(
                     key, "bridge_process_spawn_failed", actor=key,
@@ -1144,6 +1627,9 @@ class Agent():
         terminate_grace_seconds: float = DEFAULT_BRIDGE_TERMINATE_GRACE_SECONDS,
         kill_grace_seconds: float = DEFAULT_BRIDGE_KILL_GRACE_SECONDS,
     ) -> dict:
+        # Revoke controller-side credential references even if child cleanup fails.
+        cls.k11_sensor_keys_by_actor = {}
+        cls.k11_sensor_run_id = None
         if (
             not cls.agent_process
             and not cls.runtime_paths_by_name

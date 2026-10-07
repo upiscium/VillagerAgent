@@ -1,0 +1,25 @@
+{
+  "profile_id": "minecraft-eac-k11-fixed-passive",
+  "profile_version": 2,
+  "detached_profile_sha256": "d486a57a481765e204e64603d78049f0338bf1a55a6f908d373cfd65d935eb3c",
+  "mapping_rules": [
+    {"rule_id":"minecraft-direct-observation","priority":0,"record_namespace":"minecraft","record_type":"direct_observation","root_type":"direct_observation","visibility_field":"visible_to","source_lineage_field":"source_lineage_id","upstream_origin_field":"upstream_origin_id","trusted_tool_identity":null,"trusted_tool_version":null},
+    {"rule_id":"minecraft-trusted-tool-result","priority":0,"record_namespace":"minecraft","record_type":"trusted_tool_result","root_type":"trusted_tool_result","visibility_field":"visible_to","source_lineage_field":"source_lineage_id","upstream_origin_field":"upstream_origin_id","trusted_tool_identity":"minecraft-observation-adapter","trusted_tool_version":"1"},
+    {"rule_id":"minecraft-visible-action-outcome","priority":0,"record_namespace":"minecraft","record_type":"visible_action_outcome","root_type":"visible_action_outcome","visibility_field":"visible_to","source_lineage_field":"source_lineage_id","upstream_origin_field":"upstream_origin_id","trusted_tool_identity":null,"trusted_tool_version":null},
+    {"rule_id":"minecraft-peer-report","priority":0,"record_namespace":"minecraft","record_type":"peer_report","root_type":"unverified_peer_report","visibility_field":"visible_to","source_lineage_field":"source_lineage_id","upstream_origin_field":"upstream_origin_id","trusted_tool_identity":null,"trusted_tool_version":null},
+    {"rule_id":"minecraft-k11-passive-direct","priority":0,"record_namespace":"minecraft","record_type":"k11_passive_observation","root_type":"direct_observation","visibility_field":"visible_to","source_lineage_field":"source_lineage_id","upstream_origin_field":"upstream_origin_id","trusted_tool_identity":null,"trusted_tool_version":null}
+  ],
+  "trusted_tools": [
+    {"tool_identity":"minecraft-observation-adapter","tool_version":"1","allowed_proposition_namespaces":["minecraft"],"integrity_contract_sha256":"ef85aebc3340f2345d002e994d7cb20b7ae36cfdc3068986f61a7334d2a77cd3"},
+    {"tool_identity":"minecraft-k11-hold-evidence-adapter","tool_version":"1","allowed_proposition_namespaces":["minecraft"],"integrity_contract_sha256":"51523a7a4716b73afab99be5a0d8e198c66f638e8f96b424f9673bc1e0ccb660"}
+  ],
+  "supersession_streams": [
+    {"source_stream_id":"minecraft-visible-state","authorized_issuer":"minecraft-eac-adapter","revision_field":"source_stream_revision","tracked_proposition_rule_id":"minecraft-direct-observation"},
+    {"source_stream_id":"minecraft-visible-action-state","authorized_issuer":"minecraft-eac-adapter","revision_field":"source_stream_revision","tracked_proposition_rule_id":"minecraft-visible-action-outcome"},
+    {"source_stream_id":"minecraft-k11-passive-state","authorized_issuer":"minecraft-k11-passive-sensor","revision_field":"source_stream_revision","tracked_proposition_rule_id":"minecraft-k11-passive-direct"}
+  ],
+  "derivation_rules": [],
+  "aging_rules": [],
+  "integrity_contract": {"contract_id":"minecraft-eac-ingestion-contract","contract_version":2,"canonical_content_sha256":"9239c252954d5a7e5c2207bcd22293dee547005a729267ea89c0c37a552916a3","issuer_authentication_rule_id":"minecraft-k11-passive-hmac-authentication","rule_evaluation_contract_sha256":"a4c1d4b059d640d49265ae2df745ec6f472355e226c3ef32153aeec1bbad1ffa"},
+  "fail_closed": true
+}

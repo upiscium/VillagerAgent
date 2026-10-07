@@ -1,0 +1,59 @@
+{
+  "artifact_id": "minecraft-eac-ingestion-contract",
+  "artifact_version": 2,
+  "detached_artifact_sha256": "9239c252954d5a7e5c2207bcd22293dee547005a729267ea89c0c37a552916a3",
+  "implementation_manifest_version": 1,
+  "implementation_manifest": {
+    "env/k11_visible_block_capture.js": "b87a6eb74a05d51446661ccc6d411bcea73ea843f14480e6f4546c92d9f57e95",
+    "env/minecraft_server_fast.py": "2b16d3a7c42a37444040475a9c7c6b223373e2a80b6be151741d2d0c285894e3",
+    "env/minecraft_client.py": "71ad1312212d991eec11e8331c943bb3c8ed52cc50e7995a53953803a3610e83",
+    "benchmarks/minecraft/k11_hold_evidence.py": "e93665447a987f01923d7503588e41641de27bc5aa6aeab0c8cb33913edb2011",
+    "benchmarks/minecraft/eac_runtime.py": "959b26ba2eb12f201ece544d470fb376104a129b6bee4c48a3bae84bf839842f",
+    "benchmarks/minecraft/k11_hold_protocol.py": "28fbb7db448f25261cf0b1327d3cf49a7c9379dd5838195040c2f4e875f8ea23",
+    "benchmarks/minecraft/k11_hold_trace.py": "6c4456c4495f9772ce843d17bab04acc4b197683245342b270631cc7bdbd4803"
+  },
+  "implementation_manifest_purpose": {
+    "env/k11_visible_block_capture.js": "Synchronous actor-local coverage and conservative geometric LOS semantics",
+    "env/minecraft_server_fast.py": "Fast-only observation route, inherited-descriptor secret consumption, replay and response authentication",
+    "env/minecraft_client.py": "Supervised inherited-descriptor launch and non-tool passive sensing request/response binding",
+    "benchmarks/minecraft/k11_hold_evidence.py": "Complete capture validation, semantic coalescing, capacity preflight and truthful fatal/commit ledgers",
+    "benchmarks/minecraft/eac_runtime.py": "Explicit v2 admission, actual-byte authentication and actor-private current-fluent mutation boundary",
+    "benchmarks/minecraft/k11_hold_protocol.py": "Fixed target/Delta-independent sensing schedule, cutoff and callback/receipt disposition",
+    "benchmarks/minecraft/k11_hold_trace.py": "Bounded non-secret observation, commit, rejection and fatal-state trace validation"
+  },
+  "issuer_authentication": {
+    "rule_id": "minecraft-k11-passive-hmac-authentication",
+    "issuer": "minecraft-k11-passive-sensor",
+    "profile_id": "minecraft-eac-k11-fixed-passive",
+    "record_namespace": "minecraft",
+    "required_binding": "supervisor-signed run/window/actor/tick/nonce request; actor-bound bot.username; short-lived per-run/actor HMAC key delivered only through an inherited descriptor; one-shot nonce, ordered capture_seq, fixed geometry and actual implementation bytes verified before sensor use"
+  },
+  "trusted_observation_adapter": {
+    "tool_identity": "minecraft-k11-hold-evidence-adapter",
+    "tool_version": "1",
+    "accepted_native_source": "bridge_fast POST /post_k11_visible_block_region_v1 with minecraft-k11-visible-block-snapshot/1; not a LangChain tool or normal guarded action",
+    "sanitization": "validate the entire signed complete untruncated <=65536-byte 75-cell capture before any root/provenance; exact loaded clear-LOS known_air -> false, known_non_air -> true, unknown -> no semantic evidence; actor-private current target_block_present only",
+    "implementation_path": "benchmarks/minecraft/k11_hold_evidence.py",
+    "implementation_sha256": "e93665447a987f01923d7503588e41641de27bc5aa6aeab0c8cb33913edb2011",
+    "forbidden_origins": ["evaluator", "oracle", "meta_judger", "score", "simulator_truth", "post_hoc_action_log", "standard_bridge", "post_find"],
+    "sensor_identity": "minecraft-k11-fixed-passive-sensor/1",
+    "sensor_implementation_path": "env/k11_visible_block_capture.js",
+    "sensor_implementation_sha256": "b87a6eb74a05d51446661ccc6d411bcea73ea843f14480e6f4546c92d9f57e95",
+    "geometry_identity": "minecraft-k11-360-supercover-5x3x5/1",
+    "geometry_digest": "ab681169dea484b936095e903cedb2dde0af3854e77f89b693c1276e6b5afa01",
+    "bridge_envelope_identity": "minecraft-k11-visible-block-snapshot/1",
+    "accepted_route": "POST /post_k11_visible_block_region_v1",
+    "visibility": "actor-private direct current observation; 360-degree conservative geometric LOS; loaded air-like eye and all intermediate voxels; exact loaded target",
+    "coverage_proof": "signed complete fixed 75-cell foot-relative region, consistent registry identities and exact ordered conservative 3D supercover with max 16 touched voxels; unknown never includes hidden target identity",
+    "supersession_behavior": "first known polarity or polarity transition allocates a strictly increasing runtime-local ingest revision and explicitly supersedes the prior same-actor/key sensor root; same-polarity observations including different non-air identity are semantic_noop with no root/provenance/dependency mutation; unknown never expires prior roots",
+    "capacity_behavior": "preflight every planned tick transition against frozen shared root/provenance occupancy before the first mutation; capacity_exhausted commits zero tick cells and censors the run; no TTL, pruning or shared-bound changes",
+    "failure_behavior": "immediate truthful per-cell commit ledger; unexpected insertion/bookkeeping failure inventories actual roots and orphan provenance, stops the run and records sensor_ingest_fatal or partial_commit_fatal; never rollback or disguise partial mutation as rejection",
+    "authentication": "HMAC is supervised source/replay binding only, not Minecraft server/world-truth attestation or protection against a fully hostile same-UID process; no secret values in argv, environment, trace or artifacts"
+  },
+  "rule_evaluation": {
+    "contract_id": "minecraft-k11-source-rule-evaluation",
+    "fail_closed": true,
+    "mapping_authority": "benchmarks.common.eac.policy.match_mapping",
+    "source_authenticator": "MinecraftEACRuntime._authenticate_record"
+  }
+}
