@@ -41,7 +41,9 @@ from benchmarks.minecraft.run_lock import (
     MinecraftTargetLock,
     MinecraftTargetLockReleaseOutcome,
     MinecraftTargetLockReleaseStatus,
+    MinecraftTargetPredecessorHistoryStatus,
     clear_minecraft_target_quarantine,
+    read_minecraft_target_predecessor_status,
 )
 from benchmarks.minecraft.events import (
     ATTEMPT_TERMINAL_EVENT_TYPES,
@@ -1623,6 +1625,102 @@ def test_stale_lock_owner_remains_diagnostic_for_generic_experiment(
     assert summary["server_lock_release_outcome"]["verified_released"] is True
     assert summary["runtime_target_safe_to_reuse"] is True
     assert summary["error"] is None
+
+
+def test_generic_experiment_cycles_preserve_abandoned_predecessor_history(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = _write_minecraft_config(tmp_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config.update({"task_type": "construction", "required_artifacts": []})
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    lock_root = tmp_path / "target-locks"
+    abandoned_attempt_id = "abandoned-predecessor-A"
+    abandoned_lock = MinecraftTargetLock(
+        lock_root=lock_root,
+        host=config["host"],
+        port=config["port"],
+        world_id="",
+        attempt_id=abandoned_attempt_id,
+    ).acquire()
+    abandoned_lock._stream.close()
+    abandoned_lock._history_io.close()
+
+    runtime_calls = []
+
+    def mocked_runtime(launch_config, **kwargs):
+        runtime_calls.append((launch_config, kwargs))
+        runtime_result = _runtime_result_snapshot(status="success")
+        runtime_result["score"] = {}
+        runtime_result["runtime_process"] = _safe_runtime_process_metadata(
+            exit_code=1 if len(runtime_calls) == 2 else 0
+        )
+        if len(runtime_calls) == 2:
+            runtime_result_path = Path(kwargs["runtime_result_path"])
+            runtime_result_path.parent.mkdir(parents=True, exist_ok=True)
+            runtime_result_path.write_text(json.dumps(runtime_result), encoding="utf-8")
+            raise MinecraftRuntimeChildError(
+                "mock runtime context failed after cleanup",
+                error_type="RuntimeError",
+                process_metadata=_safe_runtime_process_metadata(exit_code=1),
+                child_protocol={"status": "failed"},
+            )
+        return runtime_result
+
+    monkeypatch.setattr(
+        "benchmarks.minecraft.experiment._execute_real_runtime_bounded",
+        mocked_runtime,
+    )
+
+    completed = run_minecraft_experiment(
+        config_path=config_path,
+        output_root=tmp_path / "result",
+        run_name="generic_after_abandoned_predecessor",
+        execute=True,
+        execute_timeout_seconds=30,
+    )
+    first_history = read_minecraft_target_predecessor_status(
+        lock_root=lock_root,
+        host=config["host"],
+        port=config["port"],
+    )
+
+    failed = run_minecraft_experiment(
+        config_path=config_path,
+        output_root=tmp_path / "result",
+        run_name="generic_failure_after_abandoned_predecessor",
+        execute=True,
+        execute_timeout_seconds=30,
+    )
+    final_history = read_minecraft_target_predecessor_status(
+        lock_root=lock_root,
+        host=config["host"],
+        port=config["port"],
+    )
+
+    assert len(runtime_calls) == 2
+    assert all(call[0]["host"] == config["host"] for call in runtime_calls)
+    assert all(call[0]["port"] == config["port"] for call in runtime_calls)
+    assert completed["runtime_target_lock_admission"] == "granted"
+    assert completed["error"] is None
+    assert completed["server_lock_released"] is True
+    assert completed["server_lock_release_outcome"]["status"] == "verified_released"
+    assert completed["runtime_target_safe_to_reuse"] is True
+    assert failed["runtime_target_lock_admission"] == "granted"
+    assert failed["error_type"] == "RuntimeError"
+    assert failed["server_lock_released"] is True
+    assert failed["server_lock_release_outcome"]["status"] == "verified_released"
+    assert failed["runtime_target_safe_to_reuse"] is True
+
+    assert first_history.status is MinecraftTargetPredecessorHistoryStatus.UNRESOLVED
+    assert first_history.active_owner is False
+    assert first_history.first["attempt_id"] == abandoned_attempt_id
+    assert final_history.status is MinecraftTargetPredecessorHistoryStatus.UNRESOLVED
+    assert final_history.active_owner is False
+    assert final_history.first == first_history.first
+    assert final_history.first["attempt_id"] == abandoned_attempt_id
 
 
 def _install_target_lock_release_outcome(monkeypatch, *, status, error):
