@@ -39,6 +39,7 @@ from benchmarks.minecraft.run_lock import (
     MinecraftTargetLock,
     MinecraftTargetLockBusyError,
     MinecraftTargetLockMetadataError,
+    MinecraftTargetLockReleaseStatus,
     MinecraftTargetLockUnavailableError,
     MinecraftTargetQuarantinedError,
     minecraft_target_lock_key,
@@ -348,6 +349,7 @@ def _run_minecraft_experiment_attempt(
     child_protocol = {}
     server_lock_acquired = False
     server_lock_released = False
+    server_lock_release_outcome = None
     server_lock_stale_owner_detected = False
     server_lock_quarantine_detected = False
     runtime_started = False
@@ -484,7 +486,19 @@ def _run_minecraft_experiment_attempt(
                 runtime_target_lock_unavailable_reason = "unknown_error"
                 runtime_target_lock_metadata_valid = None
         finally:
-            server_lock_released = not target_lock.acquired
+            release_outcome = target_lock.last_release_outcome
+            server_lock_released = bool(
+                release_outcome is not None
+                and release_outcome.status
+                is MinecraftTargetLockReleaseStatus.VERIFIED_RELEASED
+            )
+            server_lock_release_outcome = _public_target_lock_release_outcome(
+                release_outcome
+            )
+            if runtime_target_lock_admission == "granted" and not server_lock_released:
+                if error is None:
+                    error = "Minecraft target lock release could not be verified"
+                    error_type = "MinecraftTargetLockReleaseError"
         action_log_available = isinstance(runtime_result.get("action_log"), dict)
         action_log = runtime_result.get("action_log") if action_log_available else {}
         score = runtime_result.get("score") if isinstance(runtime_result.get("score"), dict) else {}
@@ -527,6 +541,7 @@ def _run_minecraft_experiment_attempt(
     effective_settings["runtime"].update({
         "server_lock_acquired": server_lock_acquired,
         "server_lock_released": server_lock_released,
+        "server_lock_release_outcome": server_lock_release_outcome,
         "server_lock_stale_owner_detected": server_lock_stale_owner_detected,
         "server_lock_quarantine_detected": server_lock_quarantine_detected,
     })
@@ -607,6 +622,7 @@ def _run_minecraft_experiment_attempt(
         "server_lock_key": lock_key,
         "server_lock_acquired": server_lock_acquired,
         "server_lock_released": server_lock_released,
+        "server_lock_release_outcome": server_lock_release_outcome,
         "server_lock_stale_owner_detected": server_lock_stale_owner_detected,
         "server_lock_quarantine_detected": server_lock_quarantine_detected,
         "task_type": launch_config.get("task_type", ""),
@@ -972,6 +988,11 @@ def _run_minecraft_experiment_attempt(
     _write_json(output_dir / "dual_dag_artifact.json", artifact)
     _write_json(output_dir / "decision_support.json", decision_support)
     _write_json(output_dir / "metrics.json", metrics)
+    if execute and server_lock_release_outcome is not None:
+        _write_json(
+            output_dir / "server_lock_release.json",
+            server_lock_release_outcome,
+        )
     if minecraft_eac_audit.get("configured") is not False:
         _write_json(output_dir / "minecraft_eac_audit.json", minecraft_eac_audit)
     _write_json(output_dir / "summary.json", persisted_summary)
@@ -2056,6 +2077,34 @@ def _public_target_lock_owner(value: object) -> dict:
         field: value[field]
         for field in ("status", "attempt_id", "run_name")
         if isinstance(value.get(field), str) and value[field]
+    }
+
+
+def _public_target_lock_release_outcome(outcome: object) -> dict | None:
+    if outcome is None:
+        return None
+    status = getattr(outcome, "status", None)
+    verified_released = (
+        status is MinecraftTargetLockReleaseStatus.VERIFIED_RELEASED
+    )
+    status_value = getattr(status, "value", status)
+    if not isinstance(status_value, str):
+        status_value = "unknown"
+    error_type = getattr(outcome, "error_type", None)
+    if not isinstance(error_type, str) or not error_type.isidentifier():
+        error_type = None
+    return {
+        "status": status_value,
+        "error_type": error_type,
+        "error": (
+            None
+            if verified_released
+            else "Minecraft target lock release could not be verified"
+        ),
+        "uncertainty_persisted": bool(
+            getattr(outcome, "uncertainty_persisted", False)
+        ),
+        "verified_released": verified_released,
     }
 
 

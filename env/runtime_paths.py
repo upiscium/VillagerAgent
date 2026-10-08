@@ -122,6 +122,31 @@ class RuntimePaths:
         return self.data_dir / "tokens.json"
 
     @property
+    def openai_log(self) -> Path:
+        return self.data_dir / "openai.logs"
+
+    @property
+    def openai_diagnostics(self) -> Path:
+        return self.data_dir / "openai_diagnostics.jsonl"
+
+    @property
+    def minecraft_bridge_diagnostics_dir(self) -> Path:
+        return self.data_dir / "minecraft_bridge_diagnostics"
+
+    @property
+    def minecraft_bridge_caller_diagnostics(self) -> Path:
+        return self.minecraft_bridge_diagnostics_dir / "caller.json"
+
+    def minecraft_bridge_actor_diagnostics(self, actor: str) -> Path:
+        safe_actor = "".join(character if character.isalnum() or character in "_-" else "_"
+                             for character in str(actor))[:64] or "unknown"
+        return self.minecraft_bridge_diagnostics_dir / f"bridge-{safe_actor}.json"
+
+    @property
+    def openai_cache(self) -> Path:
+        return self.cache_dir / "openai.cache"
+
+    @property
     def llm_inference(self) -> Path:
         return self.data_dir / "llm_inference.json"
 
@@ -143,6 +168,7 @@ class RuntimePaths:
             self.result_dir,
             self.logs_dir,
             self.history_dir,
+            self.minecraft_bridge_diagnostics_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 

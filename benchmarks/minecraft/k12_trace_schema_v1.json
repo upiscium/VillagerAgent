@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "artifact_id": "minecraft-k12-recovery-trace-schema",
+  "artifact_version": 1,
+  "schema_version": "minecraft-k12-recovery-trace/1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "source", "sequence", "received_monotonic_ns", "message_digest", "previous_digest", "trace_digest", "event", "worker_id", "cell_id", "triplet_id", "arm", "payload"],
+  "properties": {
+    "schema": {"const": "minecraft-k12-recovery-trace/1"}, "source": {"type": "string", "minLength": 1}, "sequence": {"type": "integer", "minimum": 0}, "received_monotonic_ns": {"type": "integer", "minimum": 0}, "message_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}, "previous_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}, "trace_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}, "event": {"enum": ["reset_attested", "cell_started", "prepared_request_frozen", "invalidation_ingested", "current_inadmissible_confirmed", "advisory_would_block", "authority_rejected", "rejection_observation_emitted", "recovery_started", "recovery_step", "recovery_step_terminal", "model_call_admitted", "model_call_terminal", "observation_started", "observation_terminal", "evidence_ingested", "recovery_proposed", "proposal_validated", "new_request_prepared", "permit_issued", "effect_decision", "effect_entered", "effect_terminal", "objective_oracle_evaluated", "budget_reached", "worker_terminal_candidate", "process_finalized", "cell_terminal"]}, "worker_id": {"type": "string", "minLength": 1}, "cell_id": {"type": "string", "minLength": 1}, "triplet_id": {"type": "string", "minLength": 1}, "arm": {"enum": ["A", "R", "S"]}, "payload": {}
+  },
+  "event_order": ["reset_attested", "cell_started", "prepared_request_frozen", "invalidation_ingested", "current_inadmissible_confirmed", "advisory_would_block", "authority_rejected", "rejection_observation_emitted", "recovery_started", "recovery_step", "recovery_step_terminal", "model_call_admitted", "model_call_terminal", "observation_started", "observation_terminal", "evidence_ingested", "recovery_proposed", "proposal_validated", "new_request_prepared", "permit_issued", "effect_decision", "effect_entered", "effect_terminal", "budget_reached", "worker_terminal_candidate", "objective_oracle_evaluated", "process_finalized", "cell_terminal"],
+  "genesis_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "detached_artifact_sha256": "d289c483829fef71702b3fd940ece30440632641383c68ed016f4893224db2d3"
+}

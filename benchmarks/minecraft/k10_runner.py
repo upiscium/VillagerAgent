@@ -101,7 +101,11 @@ def _preflight_with_protocol(repo_root, *, expected_execution_revision, output_d
     root=Path(repo_root).resolve() if repo_root is not None else REPOSITORY_ROOT
     if root != REPOSITORY_ROOT.resolve(): raise K10RunnerError("K10 repo-root must be the checkout containing the census runner")
     root=_repository_top(root)
-    contract,digest=load_k10_contract(); protocol=protocol_module.load_k10_protocol(); cells=tuple(protocol_module.build_k10_cells())
+    contract,digest=load_k10_contract(); protocol=protocol_module.load_k10_protocol()
+    live_validator=getattr(protocol_module,"validate_live_k10_checkout",None)
+    if not callable(live_validator): raise K10RunnerError("K10 live checkout validator is unavailable")
+    live_validator(protocol,root=root)
+    cells=tuple(protocol_module.build_k10_cells())
     if len(cells)!=120 or sum(c.matrix=="primary" for c in cells)!=80 or sum(c.matrix=="control" for c in cells)!=40: raise K10RunnerError("K10 census counts mismatch")
     if output_dir is not None: _validate_output_dir(output_dir,_worktrees(root))
     bindings={"protocol_digest":protocol["validated_protocol_digest"],"candidate_pool_digest":protocol["validated_candidate_pool_digest"],"inventory_digest":protocol["validated_inventory_digest"],"result_schema_digest":protocol["validated_result_schema_digest"],"selection_manifest_digest":getattr(protocol_module,"SELECTION_MANIFEST_DIGEST",k10_protocol.SELECTION_MANIFEST_DIGEST),"historical_audit_digest":protocol["validated_historical_audit_digest"]}
@@ -174,12 +178,13 @@ def _authoritative_final_valid(final,run_id,checks):
             and aggregate.get("aggregate",{}).get("observed_control_cells")==40)
 
 def run(repo_root=None, *, run_id, expected_execution_revision, output_dir):
+    checks=_preflight_with_protocol(repo_root,expected_execution_revision=expected_execution_revision,output_dir=output_dir,protocol_module=k10_protocol)
     from benchmarks.minecraft import k10_fixture
-    return _run_with_dependencies(repo_root,run_id=run_id,expected_execution_revision=expected_execution_revision,output_dir=output_dir,fixture_module=k10_fixture,protocol_module=k10_protocol)
+    return _run_with_dependencies(repo_root,run_id=run_id,expected_execution_revision=expected_execution_revision,output_dir=output_dir,fixture_module=k10_fixture,protocol_module=k10_protocol,preflight_checks=checks)
 
-def _run_with_dependencies(repo_root, *, run_id, expected_execution_revision, output_dir, fixture_module, protocol_module, fault_hook=None):
+def _run_with_dependencies(repo_root, *, run_id, expected_execution_revision, output_dir, fixture_module, protocol_module, fault_hook=None, preflight_checks=None):
     if not RUN_ID_RE.fullmatch(run_id) or run_id in {".", ".."}: raise K10RunnerError("K10 run_id is invalid")
-    checks=_preflight_with_protocol(repo_root,expected_execution_revision=expected_execution_revision,output_dir=output_dir,protocol_module=protocol_module); output=_validate_output_dir(output_dir,_worktrees(Path(repo_root or REPOSITORY_ROOT).resolve())); run_dir=output/run_id
+    checks=preflight_checks if preflight_checks is not None else _preflight_with_protocol(repo_root,expected_execution_revision=expected_execution_revision,output_dir=output_dir,protocol_module=protocol_module); output=_validate_output_dir(output_dir,_worktrees(Path(repo_root or REPOSITORY_ROOT).resolve())); run_dir=output/run_id
     exposure_marker=output/EXPOSURE_MARKER
     if exposure_marker.exists() or exposure_marker.is_symlink(): raise K10RunnerError("K10 holdout effect boundary was already started in this authorized output root")
     if run_dir.exists() or run_dir.is_symlink(): raise K10RunnerError("K10 run directory must not already exist")

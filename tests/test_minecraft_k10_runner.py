@@ -33,6 +33,7 @@ class _ProtocolFacade:
         self._cells = k10_protocol.build_k10_cells()
         self._protocol = copy.deepcopy(k10_protocol.load_k10_protocol())
         self._aggregate_complete = aggregate_complete
+        self.live_validation_calls = 0
         if binding_override is not None:
             self._protocol["validated_protocol_digest"] = binding_override
 
@@ -41,6 +42,11 @@ class _ProtocolFacade:
 
     def build_k10_cells(self):
         return self._cells
+
+    def validate_live_k10_checkout(self, protocol, *, root):
+        assert protocol is self._protocol
+        assert Path(root).resolve() == ROOT.resolve()
+        self.live_validation_calls += 1
 
     def validate_k10_trace(self, trace, *, cell):
         expected = {name: getattr(cell, name) for name in (
@@ -150,6 +156,31 @@ def test_runner_contract_is_materialized_and_protocol_bound():
         "selection_manifest_digest": k10_protocol.SELECTION_MANIFEST_DIGEST,
         "historical_audit_digest": protocol["validated_historical_audit_digest"],
     }
+
+
+def test_runner_preflight_invokes_explicit_live_checkout_admission(monkeypatch, tmp_path):
+    facade = _ProtocolFacade()
+
+    _run(monkeypatch, tmp_path, protocol=facade)
+
+    assert facade.live_validation_calls == 1
+
+
+def test_public_runner_preflights_before_fixture_import(monkeypatch, tmp_path):
+    observed = []
+
+    def reject(*_args, **_kwargs):
+        observed.append("preflight")
+        raise k10_runner.K10RunnerError("synthetic admission rejection")
+
+    monkeypatch.setattr(k10_runner, "_preflight_with_protocol", reject)
+
+    with pytest.raises(k10_runner.K10RunnerError, match="admission rejection"):
+        k10_runner.run(
+            ROOT, run_id="blocked", expected_execution_revision=REVISION,
+            output_dir=tmp_path,
+        )
+    assert observed == ["preflight"]
 
 
 def test_initial_manifest_has_120_canonical_cells_and_real_submission_count_stays_zero(monkeypatch, tmp_path):

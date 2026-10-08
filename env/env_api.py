@@ -15,6 +15,7 @@ try:
         evaluate_movement_completion,
         movement_status,
     )
+    from env.movement_runtime import CooperativeMovementError
 except ImportError:
     from movement_diagnostics import (
         EUCLIDEAN_DISTANCE,
@@ -22,6 +23,7 @@ except ImportError:
         evaluate_movement_completion,
         movement_status,
     )
+    from movement_runtime import CooperativeMovementError
 
 if not os.environ.get("PYTEST_CURRENT_TEST") and hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf8')
@@ -30,6 +32,7 @@ env_infos = None
 update_time = 0
 update_interval = .5
 last_jump_time = 0
+
 
 def getBlock(bot, Vec3, x, y, z):
     while True:
@@ -1250,7 +1253,8 @@ async def place_block_op(bot, mcData, pathfinder, Vec3, item_name, pos, axis=Non
     
     return True, f"place {item_name} at {pos[0]} {pos[1]} {pos[2]}"
 
-async def place_axis(bot, mcData, pathfinder, Vec3, item_name, pos, axis=None):
+async def place_axis(bot, mcData, pathfinder, Vec3, item_name, pos, axis=None,
+                     movement_runner=None):
     # [DEBUG] print('#place block axis {}'.format(axis))
     '''
     This function is used to place a block on the ground at the given position.
@@ -1298,7 +1302,10 @@ async def place_axis(bot, mcData, pathfinder, Vec3, item_name, pos, axis=None):
     T_RANGE = 2
     origin_block_name = bot.blockAt(Vec3(pos[0], pos[1], pos[2]))['name']
     if origin_block_name != 'air' and origin_block_name != 'scaffolding':
-        tag, flag, data = asyncio.run(interact_nearest(pathfinder, bot, Vec3, get_envs_info(bot), mcData, 2.0, origin_block_name))
+        tag, flag, data = await interact_nearest(
+            pathfinder, bot, Vec3, get_envs_info(bot), mcData, 2.0,
+            origin_block_name, movement_runner=movement_runner,
+        )
         if flag:
             return True, done_msg
         else:
@@ -1400,8 +1407,11 @@ async def place_axis(bot, mcData, pathfinder, Vec3, item_name, pos, axis=None):
                         
                         msg, done = equip(bot, item_name, 'hand')
 
-                        move_success = move_to(pathfinder, bot, Vec3, GoalRange,
-                                               Vec3(pos[0] + x, pos[1] + y, pos[2] + z))
+                        target = Vec3(pos[0] + x, pos[1] + y, pos[2] + z)
+                        move_success = (
+                            (await movement_runner(target, max(GoalRange, 1.0))).success
+                            if movement_runner else move_to(pathfinder, bot, Vec3, GoalRange, target)[0]
+                        )
                         
                         if not move_success:
                             # # bot.chat('can not reach the position')
@@ -1437,6 +1447,8 @@ async def place_axis(bot, mcData, pathfinder, Vec3, item_name, pos, axis=None):
                         if not flag:
                             # # bot.chat('can not place block')
                             continue
+                    except CooperativeMovementError:
+                        raise
                     except Exception as e:
                         # bot.chat(f'can not place block: {e}')
                         continue
@@ -1462,8 +1474,11 @@ async def place_axis(bot, mcData, pathfinder, Vec3, item_name, pos, axis=None):
                                 bot.blockAt(Vec3(pos[0] + x, pos[1] + y, pos[2] + z))['name'] != 'air':
                             # # bot.chat('#can not move to the position is not air') 机器人身高是2
                             continue
-                        move_success = move_to(pathfinder, bot, Vec3, GoalRange,
-                                               Vec3(pos[0] + x, pos[1] + y, pos[2] + z))
+                        target = Vec3(pos[0] + x, pos[1] + y, pos[2] + z)
+                        move_success = (
+                            (await movement_runner(target, max(GoalRange, 1.0))).success
+                            if movement_runner else move_to(pathfinder, bot, Vec3, GoalRange, target)[0]
+                        )
                         msg, done = equip(bot, item_name, 'hand')
                         if not move_success:
                             # # bot.chat('can not reach the position')
@@ -1480,6 +1495,8 @@ async def place_axis(bot, mcData, pathfinder, Vec3, item_name, pos, axis=None):
                         if not flag:
                             # # bot.chat('can not place block')
                             continue
+                    except CooperativeMovementError:
+                        raise
                     except Exception as e:
                         # # bot.chat(f'can not place block: {e}')
                         continue
@@ -1505,8 +1522,11 @@ async def place_axis(bot, mcData, pathfinder, Vec3, item_name, pos, axis=None):
                                 bot.blockAt(Vec3(pos[0] + x, pos[1] + y, pos[2] + z))['name'] != 'air':
                             # # bot.chat('#can not move to the position is not air')
                             continue
-                        move_success = move_to(pathfinder, bot, Vec3, GoalRange,
-                                               Vec3(pos[0] + x, pos[1] + y, pos[2] + z))
+                        target = Vec3(pos[0] + x, pos[1] + y, pos[2] + z)
+                        move_success = (
+                            (await movement_runner(target, max(GoalRange, 1.0))).success
+                            if movement_runner else move_to(pathfinder, bot, Vec3, GoalRange, target)[0]
+                        )
                         msg, done = equip(bot, item_name, 'hand')
                         if not move_success:
                             # # bot.chat('can not reach the position')
@@ -1522,6 +1542,8 @@ async def place_axis(bot, mcData, pathfinder, Vec3, item_name, pos, axis=None):
                         if not flag:
                             # # bot.chat('can not place block')
                             continue
+                    except CooperativeMovementError:
+                        raise
                     except Exception as e:
                         # # bot.chat(f'can not place block: {e}')
                         continue
@@ -1546,8 +1568,11 @@ async def place_axis(bot, mcData, pathfinder, Vec3, item_name, pos, axis=None):
                                 bot.blockAt(Vec3(pos[0] + x, pos[1] + y, pos[2] + z))['name'] != 'air':
                             # # bot.chat('#can not move to the position is not air')
                             continue
-                        move_success = move_to(pathfinder, bot, Vec3, GoalRange,
-                                               Vec3(pos[0] + x, pos[1] + y, pos[2] + z))
+                        target = Vec3(pos[0] + x, pos[1] + y, pos[2] + z)
+                        move_success = (
+                            (await movement_runner(target, max(GoalRange, 1.0))).success
+                            if movement_runner else move_to(pathfinder, bot, Vec3, GoalRange, target)[0]
+                        )
                         msg, done = equip(bot, item_name, 'hand')
                         if not move_success:
                             # # bot.chat('can not reach the position')
@@ -1563,6 +1588,8 @@ async def place_axis(bot, mcData, pathfinder, Vec3, item_name, pos, axis=None):
                         if not flag:
                             # # bot.chat('can not place block')
                             continue
+                    except CooperativeMovementError:
+                        raise
                     except Exception as e:
                         # # bot.chat(f'can not place block: {e}')
                         continue
@@ -1588,8 +1615,11 @@ async def place_axis(bot, mcData, pathfinder, Vec3, item_name, pos, axis=None):
                                 bot.blockAt(Vec3(pos[0] + x, pos[1] + y, pos[2] + z))['name'] != 'air':
                             # # bot.chat('#can not move to the position is not air')
                             continue
-                        move_success = move_to(pathfinder, bot, Vec3, GoalRange,
-                                               Vec3(pos[0] + x, pos[1] + y, pos[2] + z))
+                        target = Vec3(pos[0] + x, pos[1] + y, pos[2] + z)
+                        move_success = (
+                            (await movement_runner(target, max(GoalRange, 1.0))).success
+                            if movement_runner else move_to(pathfinder, bot, Vec3, GoalRange, target)[0]
+                        )
                         msg, done = equip(bot, item_name, 'hand')
                         if not move_success:
                             # # bot.chat('can not reach the position')
@@ -1605,6 +1635,8 @@ async def place_axis(bot, mcData, pathfinder, Vec3, item_name, pos, axis=None):
                         if not flag:
                             # # bot.chat('can not place block')
                             continue
+                    except CooperativeMovementError:
+                        raise
                     except Exception as e:
                         # # bot.chat(f'can not place block: {e}')
                         continue
@@ -1673,9 +1705,40 @@ def distanceTo(pos1, pos2):
 
 
 def dig_at(bot, pathfinder, Vec3, pos):
+    """Synchronous compatibility path used by the standard bridge."""
     max_retry = 2
     while max_retry > 0:
         flag, msg = move_to(pathfinder, bot, Vec3, 2, Vec3(pos[0], pos[1], pos[2]))
+        if not flag:
+            return f"dig failed, cannot reach to {pos}", False
+        try:
+            target = bot.blockAt(Vec3(pos[0], pos[1], pos[2]))
+            tag, msg = dig_check(bot, target.name)
+            if target and tag:
+                bot.dig(target)
+                return f" dig at {pos}", True
+            if not tag:
+                return f"cannot dig {target.name} at position{pos}, because {msg}", False
+            if target:
+                return f"cannot dig {target.name} at position{pos}", False
+            return f"cannot dig, no block at {pos}", False
+        except Exception as e:
+            if len(str(e)) < 200:
+                bot.chat(f'dig_at error: {e}')
+            max_retry -= 1
+            random_offset = [random.randint(-4, 4), random.randint(-4, 4)]
+            move_to(pathfinder, bot, Vec3, 2, Vec3(
+                pos[0] + random_offset[0], pos[1], pos[2] + random_offset[1],
+            ))
+    return "dig failed, might be api wrong", False
+
+
+async def dig_at_cooperative(bot, pathfinder, Vec3, pos, movement_runner):
+    max_retry = 2
+    while max_retry > 0:
+        target = Vec3(pos[0], pos[1], pos[2])
+        movement = await movement_runner(target, 2)
+        flag, msg = movement.success, movement.message
         if not flag:
             return f"dig failed, cannot reach to {pos}", False
         try:
@@ -1699,7 +1762,8 @@ def dig_at(bot, pathfinder, Vec3, pos):
                 bot.chat(f'dig_at error: {e}')
             max_retry -= 1
             random_offset = [random.randint(-4, 4), random.randint(-4, 4)]
-            move_to(pathfinder, bot, Vec3, 2, Vec3(pos[0] + random_offset[0], pos[1], pos[2] + random_offset[1]))
+            retry_target = Vec3(pos[0] + random_offset[0], pos[1], pos[2] + random_offset[1])
+            await movement_runner(retry_target, 2)
     return "dig failed, might be api wrong", False
 
 async def attack(bot, envs_info, mcData, mobName=None):
@@ -1834,7 +1898,8 @@ async def attack(bot, envs_info, mcData, mobName=None):
 
 
 async def interact_nearest(pathfinder, bot,  Vec3, envs_info, mcData, RANGE_GOAL, name, get_item_name=None, count=1,
-                           repair_item_name=None, fuel_item_name=None, target_position=None):
+                           repair_item_name=None, fuel_item_name=None, target_position=None,
+                           movement_runner=None):
     # [DEBUG] print('interact nearest',name,bot.heldItem)
     if bot.heldItem and name == bot.heldItem.name:
         # [DEBUG] print('interact with held item')
@@ -1873,37 +1938,39 @@ async def interact_nearest(pathfinder, bot,  Vec3, envs_info, mcData, RANGE_GOAL
         if name == "" or "crafting" in raw_name or "container" in raw_name or "chest" in raw_name or "furnace" in raw_name:
             name = raw_name
 
-    mv_config = pathfinder.Movements(bot)
-    mv_config.canDig = False # 决定是否可以挖掘
-    mv_config.allow1by1towers = False 
-    mv_config.canOpenDoors = True
+    if movement_runner is not None:
+        movement = await movement_runner(pos, RANGE_GOAL)
+        if not movement.success:
+            return movement.message, False, []
+    else:
+        mv_config = pathfinder.Movements(bot)
+        mv_config.canDig = False # 决定是否可以挖掘
+        mv_config.allow1by1towers = False
+        mv_config.canOpenDoors = True
 
-    max_tries = 3
-    while max_tries > 0:
-        try:
-            bot.pathfinder.setMovements(mv_config)
-            bot.pathfinder.setGoal(pathfinder.goals.GoalNear(pos.x, pos.y, pos.z, RANGE_GOAL))
-            break
-        except Exception as e:
-            max_tries -= 1
-            pass
-    max_steps = int(distanceTo(bot.entity.position, pos))
-    if max_steps > 20:
-        return f"cannot reach {name}, or there is no {name}", False, []
-    
-    while distanceTo(bot.entity.position, pos) > RANGE_GOAL and max_steps > 0:
-        # bot.chat(f'#distance to {name} {distanceTo(bot.entity.position,pos)}')
-        try:
-            bot.pathfinder.setMovements(mv_config)
-            bot.pathfinder.setGoal(pathfinder.goals.GoalNear(pos.x, pos.y, pos.z, 1))
-        except Exception as e:
-            pass
-        time.sleep(1)
-        max_steps -= 1
+        max_tries = 3
+        while max_tries > 0:
+            try:
+                bot.pathfinder.setMovements(mv_config)
+                bot.pathfinder.setGoal(pathfinder.goals.GoalNear(pos.x, pos.y, pos.z, RANGE_GOAL))
+                break
+            except Exception:
+                max_tries -= 1
+        max_steps = int(distanceTo(bot.entity.position, pos))
+        if max_steps > 20:
+            return f"cannot reach {name}, or there is no {name}", False, []
 
-    if max_steps <= 0 and distanceTo(bot.entity.position, pos) > RANGE_GOAL:
-        # bot.chat(f'can not reach {pos}')
-        return f'can not reach {pos.x} {pos.y} {pos.z}', False, []
+        while distanceTo(bot.entity.position, pos) > RANGE_GOAL and max_steps > 0:
+            try:
+                bot.pathfinder.setMovements(mv_config)
+                bot.pathfinder.setGoal(pathfinder.goals.GoalNear(pos.x, pos.y, pos.z, 1))
+            except Exception:
+                pass
+            time.sleep(1)
+            max_steps -= 1
+
+        if max_steps <= 0 and distanceTo(bot.entity.position, pos) > RANGE_GOAL:
+            return f'can not reach {pos.x} {pos.y} {pos.z}', False, []
 
     if 'crafting' in name:
         recipe_data = []
@@ -2368,7 +2435,8 @@ def useOnBlock(bot, Vec3, pathfinder, item_name, x, y, z):
         bot.chat(f'unable to use: {e}')
         return f"unable to use {item_name} {e}", False
 
-def useOnNearest(bot, Vec3, pathfinder, envs_info, mcData, blocks, item_name, name):
+def useOnNearest(bot, Vec3, pathfinder, envs_info, mcData, blocks, item_name, name,
+                 allow_movement=True):
     msg, tag = equip(bot, item_name)
     # #[DEBUG] print(msg,tag)
     if not tag and (not bot.heldItem or bot.heldItem.name != item_name):
@@ -2382,6 +2450,8 @@ def useOnNearest(bot, Vec3, pathfinder, envs_info, mcData, blocks, item_name, na
                     pos = Vec3(block["position"][0], block["position"][1], block["position"][2])
                     distance = distanceTo(bot.entity.position, pos)
                     if distance > 3:
+                        if not allow_movement:
+                            return f"cannot reach {name}", False
                         move_to(pathfinder=pathfinder, bot=bot, Vec3=Vec3, RANGE_GOAL=2, pos=pos)
                     bot.lookAt(pos)
                     msg, tag = equip(bot, item_name)
@@ -2399,6 +2469,8 @@ def useOnNearest(bot, Vec3, pathfinder, envs_info, mcData, blocks, item_name, na
             bot.chat(f'#used {item_name} on entity {entity.name}')
             distance = distanceTo(bot.entity.position, entity["position"])
             if distance > 3:
+                if not allow_movement:
+                    return f"cannot reach {name}", False
                 move_to(pathfinder=pathfinder, bot=bot, Vec3=Vec3, RANGE_GOAL=2, pos=entity["position"])
             bot.lookAt(entity["position"])
             msg, tag = equip(bot, item_name)

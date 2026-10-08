@@ -38,6 +38,19 @@ def test_start_execution_group_creates_one_future_per_agent():
     assert controller.executor.submitted_agents == ["Alice", "Bob"]
 
 
+def test_start_execution_group_fans_independent_tokens_to_simultaneous_agents():
+    controller, task, agents = _controller_with_task(["Alice", "Bob"], required=2)
+    controller.execute_assignments([{"task_instance": task, "agent_instances": agents}])
+    controller.executor = _ExecutorStub()
+
+    controller.start_execution_group(controller.task_queue.pop(0))
+    group = controller.result_queue[0]
+
+    assert set(group.cancellation_tokens) == {"Alice", "Bob"}
+    assert group.cancellation_tokens["Alice"] is not group.cancellation_tokens["Bob"]
+    assert all(token.is_set() is False for token in group.cancellation_tokens.values())
+
+
 def test_terminal_observation_rejects_direct_group_start():
     controller, task, agents = _controller_with_task(["Alice"], required=1)
     controller.env = _terminal_env()
@@ -327,15 +340,17 @@ def test_cancellation_acknowledgement_releases_assignments_and_fails_once():
         "timeout_detected": True,
         "shutdown_escalated": False,
         "cancellation_requested": True,
-        "cancellation_acknowledged": True,
-        "cancellation_forced": False,
-    }
+            "cancellation_acknowledged": True,
+            "cancellation_forced": False,
+            "phase": "unknown",
+        }
     assert controller.finalize_execution_group(group) is True
     assert len(controller.task_manager.status_updates) == 1
 
 
 def test_non_cooperative_timeout_stops_controller_and_retains_assignment():
     controller, task, agents = _controller_with_task(["Alice"], required=1)
+    agents[0].cooperative_cancellation = False
     controller.cancellation_grace_period = 0.5
     group = _started_group(controller, task, agents, pending_agent="Alice")
     group.futures["Alice"].set_running_or_notify_cancel()
@@ -399,7 +414,7 @@ def test_completion_racing_with_grace_snapshot_does_not_escalate():
     assert controller.finalize_execution_group(group, now=timeout_at + 0.5) is True
 
     assert group.timeout_detected == {"Alice"}
-    assert group.cancellation_requested == set()
+    assert group.cancellation_requested == {"Alice"}
     assert group.shutdown_escalated == set()
     assert controller.shutdown_event.is_set() is False
 
@@ -524,7 +539,7 @@ class _AgentStub:
         self.step_detail = f"{name} detail"
         self.reflect_success = True
         self.reflect_calls = 0
-        self.cooperative_cancellation = False
+        self.cooperative_cancellation = True
 
     def supports_cooperative_cancellation(self):
         return self.cooperative_cancellation
